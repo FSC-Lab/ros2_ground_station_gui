@@ -58,13 +58,13 @@ class SingleDroneRosNode(Node, QObject):
         )
         
         # Define subscribers
-        self.imu_sub = self.create_subscription(VehicleAttitude, 'fmu/out/vehicle_attitude', self.imu_callback, self.px4_qos_profile)
-        self.pos_global_sub = self.create_subscription(VehicleGlobalPosition, 'fmu/out/vehicle_global_position', self.pos_global_callback, self.px4_qos_profile)
-        self.pos_local_adjusted_sub = self.create_subscription(Odometry, 'state_estimator/local_position/odom/UAV0', self.pos_local_callback, 10)
-        self.vel_sub = self.create_subscription(Odometry, 'state_estimator/local_position/odom/UAV0', self.vel_callback, 10)
-        self.bat_sub = self.create_subscription(BatteryStatus, 'fmu/out/battery_status', self.bat_callback, self.px4_qos_profile)
-        self.status_sub = self.create_subscription(VehicleStatus, 'fmu/out/vehicle_status', self.status_callback, self.px4_qos_profile)
-        self.commanded_attitude_sub = self.create_subscription(VehicleAttitudeSetpoint, '/fmu/in/vehicle_attitude_setpoint', self.commanded_attitude_callback, self.px4_qos_profile)
+        self.imu_sub = self.create_subscription(VehicleAttitude, '/uav_0/fmu/out/vehicle_attitude', self.imu_callback, self.px4_qos_profile)
+        self.pos_global_sub = self.create_subscription(VehicleGlobalPosition, '/uav_0/fmu/out/vehicle_global_position', self.pos_global_callback, self.px4_qos_profile)
+        self.pos_local_adjusted_sub = self.create_subscription(Odometry, '/uav_0/state_estimator/local_position/odom', self.pos_local_callback, 10)
+        self.vel_sub = self.create_subscription(Odometry, '/uav_0/state_estimator/local_position/odom', self.vel_callback, 10)
+        self.bat_sub = self.create_subscription(BatteryStatus, '/uav_0/fmu/out/battery_status', self.bat_callback, self.px4_qos_profile)
+        self.status_sub = self.create_subscription(VehicleStatus, '/uav_0/fmu/out/vehicle_status', self.status_callback, self.px4_qos_profile)
+        self.commanded_attitude_sub = self.create_subscription(VehicleAttitudeSetpoint, '/uav_0/fmu/in/vehicle_attitude_setpoint', self.commanded_attitude_callback, self.px4_qos_profile)
         self.estimator_type_sub = self.create_subscription(Bool, '/estimator_type', self.estimator_type_callback, 10)
 
         # Define publishers / services

@@ -27,7 +27,7 @@ from scipy.spatial.transform import Rotation
 from px4_msgs.msg import VehicleStatus
 
 import ROS_Node.ros_common as ros_common
-
+import numpy as np
 
 class CommonData(): # store the data from the ROS nodes
     def __init__(self):
@@ -133,7 +133,7 @@ class CommonData(): # store the data from the ROS nodes
     
     def quat_to_euler(self, x, y, z, w):
         # NED to ENU conversion
-        quat_enu = [y, x, -z, w]
+        quat_enu = self.ned_to_enu(x, y, z, w)
         nrm = abs(sum(q**2 for q in quat_enu) - 1.0)
         quat = [0, 0, 0, 1] if nrm > 1e-5 else quat_enu
         r = Rotation.from_quat(quat)
@@ -145,6 +145,39 @@ class CommonData(): # store the data from the ROS nodes
 
         return euler
     
+    def ned_to_enu(self, x, y, z,w):
+        q_FLU_to_ENU = Rotation.from_quat([w,x,y,z],scalar_first = True)
+        # ---- Fixed transforms
+        # ENU -> NED
+        R_ENU_to_NED = np.array([
+            [0, 1, 0],
+            [1, 0, 0],
+            [0, 0, -1]
+        ])
+        
+        # FLU -> FRD  
+        R_FLU_to_FRD = np.array([
+            [1,  0,  0],
+            [0, -1,  0],
+            [0,  0, -1]
+        ])
+        
+        # Get conjugate and rotation matrix
+        q_ENU_to_FLU = q_FLU_to_ENU.inv()  # conjugate/inverse for unit quaternions
+        R_ENU_to_FLU = q_ENU_to_FLU.as_matrix()
+        
+        # Transpose to get NED to ENU
+        R_NED_to_ENU = R_ENU_to_NED.T
+        
+        # R(NED→FRD) = R(FLU→FRD) * R(ENU→FLU) * R(NED→ENU)
+        R_NED_to_FRD = R_FLU_to_FRD @ R_ENU_to_FLU @ R_NED_to_ENU
+        
+        # Convert rotation matrix back to quaternion
+        q_NED_to_FRD = Rotation.from_matrix(R_NED_to_FRD)
+
+        return q_NED_to_FRD.as_quat()
+
+
     def update_estimator_type(self, indoor_mode):
         if not self.lock.tryLock():
             return
