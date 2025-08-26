@@ -59,3 +59,4 @@ class AttitudeTarget:
         self.pitch = pitch
         self.yaw = yaw
         self.thrust = thrust
+

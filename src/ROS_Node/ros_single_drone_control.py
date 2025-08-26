@@ -26,10 +26,11 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from PyQt5.QtCore import QObject, pyqtSignal, QThread
+from PyQt5.QtCore import QObject, pyqtSignal, QThread, QDateTime
 from PyQt5.QtWidgets import QMessageBox
 import Common
 from geometry_msgs.msg import Point
+from std_msgs.msg import String
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
 from px4_msgs.msg import VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus
 # from mavros_msgs.msg import State, AttitudeTarget
@@ -70,6 +71,7 @@ class SingleDroneRosNode(Node, QObject):
         # Define publishers / services
         # self.coords_pub = self.create_publisher(TrackingReference, 'position_controller/target', 10)
         self.geofence_pub = self.create_publisher(Marker, 'tracking_controller/geofence', 10)
+        self.controller_mode_pub = self.create_publisher(String, '/uav_0/controller_mode', 10)
 
         self.set_home_override_service = self.create_client(Empty, 'state_estimator/override_set_home')
         # self.set_home_service = self.create_client(CommandHome, 'mavros/cmd/set_home')
@@ -119,6 +121,7 @@ class SingleDroneRosNode(Node, QObject):
 
     def estimator_type_callback(self, msg):
         self.data_struct.update_estimator_type(msg.data)
+    
 
     ### define publish functions to ros topics ###
     def publish_coordinates(self, x, y, z, yaw):
@@ -128,7 +131,7 @@ class SingleDroneRosNode(Node, QObject):
         # point.pose.position.y = y
         # point.pose.position.z = z
         # point.yaw = yaw
-        print(f"Publishing coordinates: {x}, {y}, {z}, {yaw}")
+        self.get_logger().info(f"Publishing coordinates: {x}, {y}, {z}, {yaw}")
         # self.coords_pub.publish(point)
 
     def publish_geofence(self, x, y, z):
@@ -163,12 +166,22 @@ class SingleDroneRosNode(Node, QObject):
             marker.points.append(point_start)
             marker.points.append(point_end)
 
-        print("Geofence published")
+        self.get_logger().info("Geofence published")
         self.geofence_pub.publish(marker)
+
+    def publish_controller_mode(self, is_baseline):
+        msg = String()
+        if is_baseline:
+            msg.data = "Baseline"
+        else:
+            msg.data = "MPC"
+        self.controller_mode_pub.publish(msg)
 
     # Timer callback for main loop
     def timer_callback(self):
         self.update_data.emit(0)
+        # Continuously publish controller mode
+        self.publish_controller_mode(self.data_struct.baseline_mode)
     
     # main loop of ros node (for compatibility with thread)
     def run(self):
@@ -211,10 +224,16 @@ class SingleDroneRosThread:
         #     print("Waiting for Rviz to connect to geofence publisher")
         #     rate.sleep()
         # self.ros_object.publish_geofence(int(self.ros_object.config[0]), int(self.ros_object.config[1]), int(self.ros_object.config[2]))
-
+        self.ros_object.publish_controller_mode(self.ros_object.data_struct.baseline_mode)
 
     def start(self):
         self.thread.start()
+    
+    def log_message(self, message):
+        """Add timestamped message to GUI logging widget"""
+        timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
+        formatted_message = f"[{timestamp}] {message}"
+        self.ui.Logging.append(formatted_message)
 
     # define the signal-slot combination of ros and pyqt GUI
     def set_ros_callbacks(self):
@@ -226,6 +245,7 @@ class SingleDroneRosThread:
         self.ui.SimulationMode.stateChanged.connect(self.toggle_simulation_mode)
         self.ui.SendPositionUAV.clicked.connect(self.send_coordinates)
         self.ui.GetCurrentPositionUAV.clicked.connect(self.get_coordinates)
+        self.ui.SwitchController.clicked.connect(self.toggle_controller_mode)
 
         self.ui.ARM.clicked.connect(lambda: self.send_arming_request(True, 0))
         self.ui.DISARM.clicked.connect(lambda: self.send_arming_request(False, 0))
@@ -251,6 +271,8 @@ class SingleDroneRosThread:
         state_msg = self.ros_object.data_struct.current_state
         alttitude_targ_msg = self.ros_object.data_struct.current_attitude_target
         indoor_mode = self.ros_object.data_struct.indoor_mode
+        # baseline_mode = self.ros_object.data_struct.baseline_mode
+
         self.lock.unlock()
 
         # accelerometer data
@@ -325,7 +347,7 @@ class SingleDroneRosThread:
     ### callback functions for modifying GUI elements ###
     def toggle_simulation_mode(self, state):
         if state == 2:
-            print("Simulation controls available")
+            self.log_message("Simulation controls available")
             self.ui.ARM.setEnabled(True)
             self.ui.DISARM.setEnabled(True)
             self.ui.Takeoff.setEnabled(True)
@@ -336,7 +358,7 @@ class SingleDroneRosThread:
             self.ui.POSCTL.setEnabled(True)
 
         else:
-            print("Simulation controls disabled")
+            self.log_message("Simulation controls disabled")
             self.ui.ARM.setEnabled(False)
             self.ui.DISARM.setEnabled(False)
             self.ui.Takeoff.setEnabled(False)
@@ -346,13 +368,26 @@ class SingleDroneRosThread:
             self.ui.OFFBOARD.setEnabled(False)
             self.ui.POSCTL.setEnabled(False)
     
+    def toggle_controller_mode(self):
+        if self.ros_object.data_struct.baseline_mode:
+            # Switching FROM baseline TO MPC
+            self.ros_object.data_struct.baseline_mode = False
+            self.ui.ControllerMode.setText("Controller: MPC")
+            self.log_message("Switching controller mode: MPC")
+        else:
+            # Switching FROM MPC TO baseline
+            self.ros_object.data_struct.baseline_mode = True
+            self.ui.ControllerMode.setText("Controller: Baseline")
+            self.log_message("Switching controller mode: BASELINE")
+
+
     def send_set_home_request(self):
         if self.ros_object.set_home_override_service.wait_for_service(timeout_sec=1.0):
             request = Empty.Request()
             future = self.ros_object.set_home_override_service.call_async(request)
-            print("Set home override request sent")
+            self.log_message("Set home override request sent")
         else:
-            print("Set home override service not available")
+            self.log_message("Set home override service not available")
         
         # home_position = CommandHomeRequest()
         # home_position.latitude = self.global_pos_msg.latitude
@@ -414,7 +449,7 @@ class SingleDroneRosThread:
         # else:
         #     print("Arming service not available")
         #     return False
-        print(f"Arming request: {arm}, param2: {param2}")
+        self.log_message(f"Arming request: {arm}, param2: {param2}")
         return True
 
     def send_takeoff_request(self, req_altitude):
@@ -422,7 +457,7 @@ class SingleDroneRosThread:
         # if armed takeoff
         if arm_response.result == 0:
             self.ros_object.publish_coordinates(0, 0, req_altitude)
-            print(f"Takeoff request sent at {req_altitude} meters")
+            self.log_message(f"Takeoff request sent at {req_altitude} meters")
 
     def send_land_request(self):
         # if self.ros_object.land_service.wait_for_service(timeout_sec=1.0):
@@ -436,7 +471,7 @@ class SingleDroneRosThread:
         # else:
         #     print("Land service not available")
         self.ros_object.publish_coordinates(self.ros_object.data_struct.current_local_pos.x, self.ros_object.data_struct.current_local_pos.y, 0, 0)
-        print("Land request sent")
+        self.log_message("Land request sent")
 
     def switch_mode(self, mode):
         # if self.ros_object.set_mode_service.wait_for_service(timeout_sec=1.0):
@@ -446,9 +481,9 @@ class SingleDroneRosThread:
         #     print(f"Mode switch request sent: {mode}")
         # else:
         #     print("Set mode service not available")
-        print(f"Mode switch request: {mode}")
+        self.log_message(f"Mode switch request: {mode}")
 
     def hold(self):
         self.ros_object.publish_coordinates(self.ros_object.data_struct.current_local_pos.x, self.ros_object.data_struct.current_local_pos.y, 2, self.ros_object.data_struct.current_imu.yaw)
-        print("Hold position command sent")
+        self.log_message("Hold position command sent")
 

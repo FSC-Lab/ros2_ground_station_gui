@@ -45,6 +45,7 @@ class CommonData(): # store the data from the ROS nodes
         self.current_state = ros_common.StateInfo()
         self.current_attitude_target = ros_common.AttitudeTarget()
         self.indoor_mode = False
+        self.baseline_mode = True
 
         # water sampling
         self.encoder_raw = ros_common.Vector3()
@@ -204,8 +205,14 @@ class CommonData(): # store the data from the ROS nodes
         self.payload_pos.z = z
         self.lock.unlock()
         return
-        
-    
+
+    def update_controller_mode(self, mode):
+        if not self.lock.tryLock():
+            return
+        self.current_controller_mode.mode = mode
+        self.lock.unlock()
+        return
+
     def decode_mode(self, mode):
         mode_dict = {
             0: 'STATE_MANUAL',
