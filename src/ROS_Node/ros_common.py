@@ -60,3 +60,19 @@ class AttitudeTarget:
         self.yaw = yaw
         self.thrust = thrust
 
+class ControllerStatus:
+    def __init__(self, baseline=True, node_active = False, mpc_start = False) -> None:
+        self.baseline_mode = baseline
+        self.node_active = node_active
+        self.mpc_start = mpc_start
+        self.solver_active = False
+        self.last_heartbeat_sequence = 0
+        self.heartbeat_timeout = False
+        self.last_heartbeat_time = 0
+        self.heartbeat_ever_received = False  # Track if we've ever received a heartbeat
+        # Solver status tracking
+        self.solver_feasible = True
+        self.solver_status_text = "UNKNOWN"
+        # Control results
+        self.last_thrust_cmd = 0.0
+        self.last_rate_cmd = Vector3(0.0, 0.0, 0.0)  

@@ -693,19 +693,6 @@
      <property name="sizeConstraint">
       <enum>QLayout::SetMinimumSize</enum>
      </property>
-     <item row="1" column="1">
-      <widget class="QPushButton" name="SetHome">
-       <property name="sizePolicy">
-        <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
-         <horstretch>0</horstretch>
-         <verstretch>0</verstretch>
-        </sizepolicy>
-       </property>
-       <property name="text">
-        <string>Set Home</string>
-       </property>
-      </widget>
-     </item>
      <item row="1" column="0">
       <widget class="QPushButton" name="HOLD">
        <property name="sizePolicy">
@@ -740,6 +727,19 @@
        </property>
       </widget>
      </item>
+     <item row="1" column="1">
+      <widget class="QPushButton" name="SetHome">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="text">
+        <string>Set Home</string>
+       </property>
+      </widget>
+     </item>
     </layout>
    </widget>
    <widget class="QTabWidget" name="Additional_Function">
@@ -748,7 +748,7 @@
       <x>860</x>
       <y>30</y>
       <width>451</width>
-      <height>491</height>
+      <height>341</height>
      </rect>
     </property>
     <property name="currentIndex">
@@ -764,7 +764,7 @@
         <x>20</x>
         <y>30</y>
         <width>401</width>
-        <height>411</height>
+        <height>271</height>
        </rect>
       </property>
      </widget>
@@ -779,7 +779,7 @@
         <x>20</x>
         <y>30</y>
         <width>401</width>
-        <height>411</height>
+        <height>271</height>
        </rect>
       </property>
      </widget>
@@ -812,22 +812,7 @@
       </property>
       <layout class="QVBoxLayout" name="DesiredFlightLayout">
        <item>
-        <layout class="QHBoxLayout" name="horizontalLayout_2">
-         <item>
-          <widget class="QPushButton" name="SwitchController">
-           <property name="text">
-            <string>Switch Controller</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QLabel" name="ControllerMode">
-           <property name="text">
-            <string>Controller: Baseline</string>
-           </property>
-          </widget>
-         </item>
-        </layout>
+        <layout class="QHBoxLayout" name="horizontalLayout_2"/>
        </item>
        <item>
         <widget class="QLabel" name="DesiredFlightCoordinates">
@@ -937,127 +922,7 @@
      <string>Back to ENU</string>
     </property>
    </widget>
-   <widget class="QWidget" name="gridLayoutWidget_3">
-    <property name="geometry">
-     <rect>
-      <x>860</x>
-      <y>550</y>
-      <width>451</width>
-      <height>149</height>
-     </rect>
-    </property>
-    <layout class="QGridLayout" name="gridLayout_2">
-     <property name="sizeConstraint">
-      <enum>QLayout::SetNoConstraint</enum>
-     </property>
-     <item row="3" column="1">
-      <widget class="QLineEdit" name="TakeoffHeight">
-       <property name="sizePolicy">
-        <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
-         <horstretch>0</horstretch>
-         <verstretch>0</verstretch>
-        </sizepolicy>
-       </property>
-       <property name="text">
-        <string>2.0</string>
-       </property>
-      </widget>
-     </item>
-     <item row="2" column="1">
-      <widget class="QPushButton" name="DISARM">
-       <property name="enabled">
-        <bool>false</bool>
-       </property>
-       <property name="text">
-        <string>Disarm</string>
-       </property>
-      </widget>
-     </item>
-     <item row="0" column="0">
-      <widget class="QCheckBox" name="SimulationMode">
-       <property name="text">
-        <string>Simulation Mode</string>
-       </property>
-       <property name="checked">
-        <bool>false</bool>
-       </property>
-      </widget>
-     </item>
-     <item row="4" column="0" colspan="2">
-      <widget class="QPushButton" name="Land">
-       <property name="enabled">
-        <bool>false</bool>
-       </property>
-       <property name="sizePolicy">
-        <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
-         <horstretch>0</horstretch>
-         <verstretch>0</verstretch>
-        </sizepolicy>
-       </property>
-       <property name="text">
-        <string>Land</string>
-       </property>
-      </widget>
-     </item>
-     <item row="3" column="0">
-      <widget class="QPushButton" name="Takeoff">
-       <property name="enabled">
-        <bool>false</bool>
-       </property>
-       <property name="text">
-        <string>Takeoff</string>
-       </property>
-      </widget>
-     </item>
-     <item row="2" column="0">
-      <widget class="QPushButton" name="ARM">
-       <property name="enabled">
-        <bool>false</bool>
-       </property>
-       <property name="text">
-        <string>Arm</string>
-       </property>
-      </widget>
-     </item>
-     <item row="5" column="0">
-      <widget class="QPushButton" name="OFFBOARD">
-       <property name="enabled">
-        <bool>false</bool>
-       </property>
-       <property name="text">
-        <string>OFFBOARD</string>
-       </property>
-      </widget>
-     </item>
-     <item row="5" column="1">
-      <widget class="QPushButton" name="POSCTL">
-       <property name="enabled">
-        <bool>false</bool>
-       </property>
-       <property name="text">
-        <string>POSCTL</string>
-       </property>
-      </widget>
-     </item>
-    </layout>
-   </widget>
    <widget class="QPushButton" name="EmergencyStop">
-    <property name="enabled">
-     <bool>false</bool>
-    </property>
-    <property name="geometry">
-     <rect>
-      <x>860</x>
-      <y>700</y>
-      <width>451</width>
-      <height>81</height>
-     </rect>
-    </property>
-    <property name="text">
-     <string>Emergency Stop</string>
-    </property>
-   </widget>
-   <widget class="QPushButton" name="EmergencyStop_2">
     <property name="geometry">
      <rect>
       <x>520</x>
@@ -1080,6 +945,151 @@
      </rect>
     </property>
     <layout class="QGridLayout" name="gridLayout"/>
+   </widget>
+   <widget class="QWidget" name="gridLayoutWidget_5">
+    <property name="geometry">
+     <rect>
+      <x>890</x>
+      <y>720</y>
+      <width>391</width>
+      <height>81</height>
+     </rect>
+    </property>
+    <layout class="QGridLayout" name="gridLayout_4">
+     <property name="sizeConstraint">
+      <enum>QLayout::SetMinimumSize</enum>
+     </property>
+     <item row="1" column="1">
+      <widget class="QPushButton" name="SwitchMPC">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="text">
+        <string>Switch to MPC</string>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="0">
+      <widget class="QPushButton" name="SwitchBaseline">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="text">
+        <string>Switch to Baseline</string>
+       </property>
+       <property name="iconSize">
+        <size>
+         <width>16</width>
+         <height>16</height>
+        </size>
+       </property>
+       <property name="shortcut">
+        <string>Esc</string>
+       </property>
+       <property name="checkable">
+        <bool>false</bool>
+       </property>
+       <property name="autoDefault">
+        <bool>false</bool>
+       </property>
+       <property name="default">
+        <bool>false</bool>
+       </property>
+       <property name="flat">
+        <bool>false</bool>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QTabWidget" name="Additional_Function_2">
+    <property name="geometry">
+     <rect>
+      <x>860</x>
+      <y>380</y>
+      <width>451</width>
+      <height>231</height>
+     </rect>
+    </property>
+    <property name="currentIndex">
+     <number>0</number>
+    </property>
+    <widget class="QWidget" name="tab_4">
+     <attribute name="title">
+      <string>MPC Logging</string>
+     </attribute>
+     <widget class="QTextBrowser" name="MpcLogging">
+      <property name="geometry">
+       <rect>
+        <x>20</x>
+        <y>30</y>
+        <width>401</width>
+        <height>151</height>
+       </rect>
+      </property>
+     </widget>
+    </widget>
+   </widget>
+   <widget class="QWidget" name="layoutWidget">
+    <property name="geometry">
+     <rect>
+      <x>890</x>
+      <y>630</y>
+      <width>391</width>
+      <height>81</height>
+     </rect>
+    </property>
+    <layout class="QGridLayout" name="gridLayout_2">
+     <item row="0" column="0">
+      <widget class="QLabel" name="DesiredFlightCoordinates_2">
+       <property name="text">
+        <string>Controller Status</string>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignBottom|Qt::AlignHCenter</set>
+       </property>
+      </widget>
+     </item>
+     <item row="0" column="1">
+      <widget class="QLabel" name="DesiredFlightCoordinates_3">
+       <property name="text">
+        <string>Solver Status</string>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignBottom|Qt::AlignHCenter</set>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="0">
+      <widget class="QLineEdit" name="ControllerMode">
+       <property name="text">
+        <string>Baseline</string>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignCenter</set>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="1">
+      <widget class="QLineEdit" name="SolverMode">
+       <property name="text">
+        <string>Inactive</string>
+       </property>
+       <property name="maxLength">
+        <number>32766</number>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignCenter</set>
+       </property>
+      </widget>
+     </item>
+    </layout>
    </widget>
   </widget>
  </widget>

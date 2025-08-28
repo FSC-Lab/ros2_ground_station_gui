@@ -45,7 +45,7 @@ class CommonData(): # store the data from the ROS nodes
         self.current_state = ros_common.StateInfo()
         self.current_attitude_target = ros_common.AttitudeTarget()
         self.indoor_mode = False
-        self.baseline_mode = True
+        self.controller_status = ros_common.ControllerStatus()  # controller status
 
         # water sampling
         self.encoder_raw = ros_common.Vector3()
@@ -206,10 +206,87 @@ class CommonData(): # store the data from the ROS nodes
         self.lock.unlock()
         return
 
-    def update_controller_mode(self, mode):
+    def update_mpc_node_status(self, torch_loaded, acados_loaded, data_available, mpc_active, solver_status, control_norm, heartbeat_seq, current_time):
         if not self.lock.tryLock():
             return
-        self.current_controller_mode.mode = mode
+        
+        # Check heartbeat sequence for missed messages
+        expected_sequence = self.controller_status.last_heartbeat_sequence + 1
+        if (self.controller_status.last_heartbeat_sequence > 0 and 
+            heartbeat_seq != expected_sequence and 
+            heartbeat_seq > self.controller_status.last_heartbeat_sequence):
+            # Note: logging should be done by caller since this is data-only
+            pass
+        
+        # Update heartbeat tracking
+        self.controller_status.last_heartbeat_sequence = heartbeat_seq
+        self.controller_status.last_heartbeat_time = current_time
+        self.controller_status.heartbeat_timeout = False
+        self.controller_status.heartbeat_ever_received = True
+        
+        # Update MPC node status based on comprehensive heartbeat data
+        self.controller_status.mpc_start = (
+            torch_loaded and 
+            acados_loaded and
+            data_available
+        )
+        
+        self.controller_status.node_active = (
+            mpc_active and 
+            torch_loaded and 
+            acados_loaded and
+            data_available and
+            control_norm >= 0  # Valid control output
+        )
+        
+        # Update solver feasibility (ACADOS: 0=success, 4=infeasible, others=error)
+        self.controller_status.solver_feasible = (solver_status == 0)
+        
+        # Store additional diagnostic information
+        self.controller_status.solver_active = (solver_status == 0)
+        
+        self.lock.unlock()
+        return
+
+    def check_mpc_heartbeat_timeout(self, current_time, timeout_seconds=3.0):
+        if not self.lock.tryLock():
+            return False
+        
+        timeout_detected = False
+        if (self.controller_status.last_heartbeat_time > 0 and 
+            current_time - self.controller_status.last_heartbeat_time > timeout_seconds):
+            if not self.controller_status.heartbeat_timeout:
+                self.controller_status.heartbeat_timeout = True
+                self.controller_status.node_active = False
+                self.controller_status.mpc_start = False
+                # Reset solver status when node times out
+                self.controller_status.solver_feasible = False
+                self.controller_status.solver_status_text = "TIMEOUT"
+                self.controller_status.solver_active = False
+                # Reset control results
+                self.controller_status.last_thrust_cmd = 0.0
+                self.controller_status.last_rate_cmd.x = 0.0
+                self.controller_status.last_rate_cmd.y = 0.0
+                self.controller_status.last_rate_cmd.z = 0.0
+                timeout_detected = True
+        
+        self.lock.unlock()
+        return timeout_detected
+
+    def update_solver_status(self, status_text, thrust_cmd, rate_cmd_x, rate_cmd_y, rate_cmd_z):
+        if not self.lock.tryLock():
+            return
+        
+        # Update solver status
+        self.controller_status.solver_status_text = status_text
+        self.controller_status.solver_feasible = (status_text == "FEASIBLE")
+        
+        # Update control results
+        self.controller_status.last_thrust_cmd = thrust_cmd
+        self.controller_status.last_rate_cmd.x = rate_cmd_x
+        self.controller_status.last_rate_cmd.y = rate_cmd_y
+        self.controller_status.last_rate_cmd.z = rate_cmd_z
+        
         self.lock.unlock()
         return
 

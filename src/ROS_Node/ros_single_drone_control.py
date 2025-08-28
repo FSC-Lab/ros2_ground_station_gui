@@ -35,6 +35,7 @@ from std_msgs.msg import String
 from px4_msgs.msg import VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus
 # from mavros_msgs.msg import State, AttitudeTarget
 from visualization_msgs.msg import Marker
+from mpc_controller.msg import NodeStatus, ControllerInput
 from std_srvs.srv import Empty
 from nav_msgs.msg import Odometry
 import json
@@ -44,6 +45,7 @@ from std_msgs.msg import Bool
 class SingleDroneRosNode(Node, QObject):
     ## define signals
     update_data = pyqtSignal(int)
+    mpc_log_signal = pyqtSignal(str)
 
     def __init__(self):
         Node.__init__(self, 'single_drone_gui_node')
@@ -67,7 +69,8 @@ class SingleDroneRosNode(Node, QObject):
         self.status_sub = self.create_subscription(VehicleStatus, '/uav_0/fmu/out/vehicle_status', self.status_callback, self.px4_qos_profile)
         self.commanded_attitude_sub = self.create_subscription(VehicleAttitudeSetpoint, '/uav_0/fmu/in/vehicle_attitude_setpoint', self.commanded_attitude_callback, self.px4_qos_profile)
         self.estimator_type_sub = self.create_subscription(Bool, '/estimator_type', self.estimator_type_callback, 10)
-
+        self.mpc_node_status_sub = self.create_subscription(NodeStatus, '/uav_0/mpc/heartbeat', self.mpc_node_status_callback, 10)
+        self.solver_status_sub = self.create_subscription(ControllerInput, '/uav_0/mpc/solver_res', self.solver_status_callback, 10)
         # Define publishers / services
         # self.coords_pub = self.create_publisher(TrackingReference, 'position_controller/target', 10)
         self.geofence_pub = self.create_publisher(Marker, 'tracking_controller/geofence', 10)
@@ -94,6 +97,9 @@ class SingleDroneRosNode(Node, QObject):
     ### define signal connections to / from gui ###
     def connect_update_gui(self, callback):
         self.update_data.connect(callback)
+    
+    def connect_mpc_log(self, callback):
+        self.mpc_log_signal.connect(callback)
 
     ### define callback functions from ros topics ###
     def imu_callback(self, msg): 
@@ -121,7 +127,64 @@ class SingleDroneRosNode(Node, QObject):
 
     def estimator_type_callback(self, msg):
         self.data_struct.update_estimator_type(msg.data)
-    
+
+    def mpc_node_status_callback(self, msg):
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        
+        # Check for missed heartbeat messages
+        expected_sequence = self.data_struct.controller_status.last_heartbeat_sequence + 1
+        if (self.data_struct.controller_status.last_heartbeat_sequence > 0 and 
+            msg.heartbeat_sequence != expected_sequence and 
+            msg.heartbeat_sequence > self.data_struct.controller_status.last_heartbeat_sequence):
+            missed_count = msg.heartbeat_sequence - expected_sequence
+            self.get_logger().warn(f"Missed {missed_count} heartbeat messages (got {msg.heartbeat_sequence}, expected {expected_sequence})")
+        
+        # Update MPC status following established pattern
+        self.data_struct.update_mpc_node_status(
+            msg.torch_model_loaded, 
+            msg.acados_solver_loaded, 
+            msg.data_available, 
+            msg.mpc_active, 
+            msg.solver_status, 
+            msg.last_control_norm, 
+            msg.heartbeat_sequence, 
+            current_time
+        )
+        
+        # Log status changes for debugging
+        self.get_logger().debug(
+            f"MPC Heartbeat #{msg.heartbeat_sequence} - Start: {self.data_struct.controller_status.mpc_start}, "
+            f"Active: {self.data_struct.controller_status.node_active}, "
+            f"Torch: {msg.torch_model_loaded}, ACADOS: {msg.acados_solver_loaded}, "
+            f"Data: {msg.data_available}, MPC: {msg.mpc_active}, "
+            f"Solver: {msg.solver_status}, Control: {msg.last_control_norm:.3f}"
+        )
+
+    def solver_status_callback(self, msg):
+        self.data_struct.update_solver_status(
+            msg.status.data,
+            msg.thrust_cmd,
+            msg.rate_cmd.x,
+            msg.rate_cmd.y,
+            msg.rate_cmd.z
+        )
+        
+        # Log solver results for MPC monitoring
+        status_text = msg.status.data
+        if status_text == "INFEASIBLE":
+            self.get_logger().warn(f"MPC Solver INFEASIBLE - no valid solution found")
+        
+        self.get_logger().debug(
+            f"MPC Control - Status: {status_text}, "
+            f"Thrust: {msg.thrust_cmd:.3f}, "
+            f"Rates: [{msg.rate_cmd.x:.3f}, {msg.rate_cmd.y:.3f}, {msg.rate_cmd.z:.3f}]"
+        )
+        
+        # Emit signal for GUI MPC logging
+        log_message = (f"Solver: {status_text} | "
+                      f"Thrust: {msg.thrust_cmd:.3f} | "
+                      f"Rates: [{msg.rate_cmd.x:.3f}, {msg.rate_cmd.y:.3f}, {msg.rate_cmd.z:.3f}]")
+        self.mpc_log_signal.emit(log_message)
 
     ### define publish functions to ros topics ###
     def publish_coordinates(self, x, y, z, yaw):
@@ -179,9 +242,19 @@ class SingleDroneRosNode(Node, QObject):
 
     # Timer callback for main loop
     def timer_callback(self):
+        # Check for heartbeat timeout (MPC controller sends at 1Hz, timeout after 3 seconds)
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        timeout_detected = self.data_struct.check_mpc_heartbeat_timeout(current_time)
+        
+        if timeout_detected:
+            self.get_logger().warn("MPC heartbeat timeout detected")
+            # Also emit to MPC logging widget
+            self.mpc_log_signal.emit("MPC node stopped - heartbeat timeout detected")
+            self.data_struct.controller_status.baseline_mode = True
+        
         self.update_data.emit(0)
         # Continuously publish controller mode
-        self.publish_controller_mode(self.data_struct.baseline_mode)
+        self.publish_controller_mode(self.data_struct.controller_status.baseline_mode)
     
     # main loop of ros node (for compatibility with thread)
     def run(self):
@@ -224,7 +297,6 @@ class SingleDroneRosThread:
         #     print("Waiting for Rviz to connect to geofence publisher")
         #     rate.sleep()
         # self.ros_object.publish_geofence(int(self.ros_object.config[0]), int(self.ros_object.config[1]), int(self.ros_object.config[2]))
-        self.ros_object.publish_controller_mode(self.ros_object.data_struct.baseline_mode)
 
     def start(self):
         self.thread.start()
@@ -235,27 +307,27 @@ class SingleDroneRosThread:
         formatted_message = f"[{timestamp}] {message}"
         self.ui.Logging.append(formatted_message)
 
+    def mpc_log_message(self, message):
+        """Add timestamped message to GUI logging widget"""
+        timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
+        formatted_message = f"[{timestamp}] {message}"
+        self.ui.MpcLogging.append(formatted_message)
+    
+
     # define the signal-slot combination of ros and pyqt GUI
     def set_ros_callbacks(self):
         # feedbacks from ros
         self.ros_object.connect_update_gui(self.update_gui_data)
+        self.ros_object.mpc_log_signal.connect(self.mpc_log_message)
 
         # callbacks from GUI
         self.ui.SetHome.clicked.connect(self.send_set_home_request)
-        self.ui.SimulationMode.stateChanged.connect(self.toggle_simulation_mode)
+        self.ui.SwitchBaseline.clicked.connect(self.switch_baseline)
+        self.ui.SwitchMPC.clicked.connect(self.switch_mpc)
         self.ui.SendPositionUAV.clicked.connect(self.send_coordinates)
         self.ui.GetCurrentPositionUAV.clicked.connect(self.get_coordinates)
-        self.ui.SwitchController.clicked.connect(self.toggle_controller_mode)
 
-        self.ui.ARM.clicked.connect(lambda: self.send_arming_request(True, 0))
-        self.ui.DISARM.clicked.connect(lambda: self.send_arming_request(False, 0))
-        self.ui.Takeoff.clicked.connect(lambda: self.send_takeoff_request(float(self.ui.TakeoffHeight.text())))
-        self.ui.Land.clicked.connect(lambda: self.send_land_request())
         self.ui.EmergencyStop.clicked.connect(lambda: self.send_arming_request(False, 21196))
-
-        self.ui.OFFBOARD.clicked.connect(lambda: self.switch_mode("OFFBOARD"))
-        self.ui.POSCTL.clicked.connect(lambda: self.switch_mode("POSCTL"))
-        self.ui.HOLD.clicked.connect(self.hold)
 
     # update GUI data
     def update_gui_data(self):
@@ -271,7 +343,7 @@ class SingleDroneRosThread:
         state_msg = self.ros_object.data_struct.current_state
         alttitude_targ_msg = self.ros_object.data_struct.current_attitude_target
         indoor_mode = self.ros_object.data_struct.indoor_mode
-        # baseline_mode = self.ros_object.data_struct.baseline_mode
+        controller_status_msg = self.ros_object.data_struct.controller_status
 
         self.lock.unlock()
 
@@ -342,44 +414,67 @@ class SingleDroneRosThread:
             if self.armed_seconds >= 60:
                 self.ui.Min_DISP.display("{}".format(int(self.ui.Min_DISP.value() + 1), 1))
                 self.last_time = state_msg.seconds
-        
 
-    ### callback functions for modifying GUI elements ###
-    def toggle_simulation_mode(self, state):
-        if state == 2:
-            self.log_message("Simulation controls available")
-            self.ui.ARM.setEnabled(True)
-            self.ui.DISARM.setEnabled(True)
-            self.ui.Takeoff.setEnabled(True)
-            self.ui.Land.setEnabled(True)
-            self.ui.TakeoffHeight.setEnabled(True)
-            self.ui.EmergencyStop.setEnabled(True)
-            self.ui.OFFBOARD.setEnabled(True)
-            self.ui.POSCTL.setEnabled(True)
-
-        else:
-            self.log_message("Simulation controls disabled")
-            self.ui.ARM.setEnabled(False)
-            self.ui.DISARM.setEnabled(False)
-            self.ui.Takeoff.setEnabled(False)
-            self.ui.Land.setEnabled(False)
-            self.ui.TakeoffHeight.setEnabled(False)
-            self.ui.EmergencyStop.setEnabled(False)
-            self.ui.OFFBOARD.setEnabled(False)
-            self.ui.POSCTL.setEnabled(False)
-    
-    def toggle_controller_mode(self):
-        if self.ros_object.data_struct.baseline_mode:
-            # Switching FROM baseline TO MPC
-            self.ros_object.data_struct.baseline_mode = False
-            self.ui.ControllerMode.setText("Controller: MPC")
-            self.log_message("Switching controller mode: MPC")
-        else:
-            # Switching FROM MPC TO baseline
-            self.ros_object.data_struct.baseline_mode = True
+        # Update Controller Mode display
+        if controller_status_msg.baseline_mode:
             self.ui.ControllerMode.setText("Controller: Baseline")
+        else:
+            self.ui.ControllerMode.setText("Controller: MPC")
+
+        # Update Solver Mode display based on MPC status
+        if not controller_status_msg.heartbeat_ever_received:
+            # No heartbeat ever received - node not started
+            self.ui.SolverMode.setText("Not Started")
+        elif controller_status_msg.heartbeat_timeout:
+            # Heartbeat was received before but now timed out - node stopped
+            self.ui.SolverMode.setText("Timeout")
+        elif not controller_status_msg.mpc_start:
+            # Heartbeat received but components not ready - missing components
+            self.ui.SolverMode.setText("Not Ready") 
+        else:
+            if controller_status_msg.node_active:
+                # Check solver feasibility
+                if not controller_status_msg.solver_feasible:
+                    self.ui.SolverMode.setText("Active, Infeasible")
+                else:
+                    self.ui.SolverMode.setText("Active, Feasible")
+            else:
+                # MPC node is ready but not actively controlling
+                self.ui.SolverMode.setText("Ready, Inactive")
+
+
+    def switch_baseline(self):
+        if self.ros_object.data_struct.controller_status.baseline_mode:
+            self.log_message("Current controller is baseline, switching failed")
+        else:
+            self.ros_object.data_struct.controller_status.baseline_mode = True
             self.log_message("Switching controller mode: BASELINE")
 
+    def switch_mpc(self):
+        # Check if MPC is available before switching
+        if not self.ros_object.data_struct.controller_status.heartbeat_ever_received:
+            self.log_message("MPC switch failed - MPC node not started")
+        elif self.ros_object.data_struct.controller_status.heartbeat_timeout:
+            self.log_message("MPC switch failed - MPC node timeout")
+        elif not self.ros_object.data_struct.controller_status.mpc_start:
+            self.log_message("MPC switch failed - MPC node not ready (missing components)")
+        else:
+            # MPC node is available - switch to MPC mode
+            self.ros_object.data_struct.controller_status.baseline_mode = False
+            if self.ros_object.data_struct.controller_status.mpc_start:
+                self.log_message("Current controller is MPC, switching failed")
+            else:
+                self.log_message("Switching controller mode: MPC")
+                
+                # Log current MPC status
+                if self.ros_object.data_struct.controller_status.node_active:
+                    if not self.ros_object.data_struct.controller_status.solver_feasible:
+                        self.log_message("MPC controller active but solver INFEASIBLE")
+                        self.mpc_log_message("WARNING: Solver returning infeasible solutions")
+                    else:
+                        self.log_message("MPC controller active and feasible")
+                else:
+                    self.log_message("MPC node ready but inactive")
 
     def send_set_home_request(self):
         if self.ros_object.set_home_override_service.wait_for_service(timeout_sec=1.0):
