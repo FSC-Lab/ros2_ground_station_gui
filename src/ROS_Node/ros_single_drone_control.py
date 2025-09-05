@@ -32,8 +32,8 @@ import Common
 from geometry_msgs.msg import Point
 from std_msgs.msg import String
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
-from px4_msgs.msg import VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus
-# from mavros_msgs.msg import State, AttitudeTarget
+from px4_msgs.msg import VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus, TrajectorySetpoint
+from fsc_autopilot_ros2_msgs.msg import PositionControllerReference
 from visualization_msgs.msg import Marker
 from mpc_controller.msg import NodeStatus, ControllerInput
 from std_srvs.srv import Empty
@@ -66,7 +66,7 @@ class SingleDroneRosNode(Node, QObject):
         self.pos_local_adjusted_sub = self.create_subscription(Odometry, '/uav_0/state_estimator/local_position/odom', self.pos_local_callback, 10)
         self.vel_sub = self.create_subscription(Odometry, '/uav_0/state_estimator/local_position/odom', self.vel_callback, 10)
         self.bat_sub = self.create_subscription(BatteryStatus, '/uav_0/fmu/out/battery_status', self.bat_callback, self.px4_qos_profile)
-        self.status_sub = self.create_subscription(VehicleStatus, '/uav_0/fmu/out/vehicle_status', self.status_callback, self.px4_qos_profile)
+        self.status_sub = self.create_subscription(VehicleStatus, '/uav_0/fmu/out/vehicle_status_v1', self.status_callback, self.px4_qos_profile)
         self.commanded_attitude_sub = self.create_subscription(VehicleAttitudeSetpoint, '/uav_0/fmu/in/vehicle_attitude_setpoint', self.commanded_attitude_callback, self.px4_qos_profile)
         self.estimator_type_sub = self.create_subscription(Bool, '/estimator_type', self.estimator_type_callback, 10)
         self.mpc_node_status_sub = self.create_subscription(NodeStatus, '/uav_0/mpc/heartbeat', self.mpc_node_status_callback, 10)
@@ -75,7 +75,8 @@ class SingleDroneRosNode(Node, QObject):
         # self.coords_pub = self.create_publisher(TrackingReference, 'position_controller/target', 10)
         self.geofence_pub = self.create_publisher(Marker, 'tracking_controller/geofence', 10)
         self.controller_mode_pub = self.create_publisher(String, '/uav_0/controller_mode', 10)
-
+        self.position_com_pub = self.create_publisher(
+            PositionControllerReference, '/uav_0/fsc_autopilot_ros2/position_controller/reference', 10)
         self.set_home_override_service = self.create_client(Empty, 'state_estimator/override_set_home')
         # self.set_home_service = self.create_client(CommandHome, 'mavros/cmd/set_home')
 
@@ -188,12 +189,16 @@ class SingleDroneRosNode(Node, QObject):
 
     ### define publish functions to ros topics ###
     def publish_coordinates(self, x, y, z, yaw):
-        # point = TrackingReference()
-        # point.header.stamp = self.get_clock().now().to_msg()
-        # point.pose.position.x = x
-        # point.pose.position.y = y
-        # point.pose.position.z = z
-        # point.yaw = yaw
+        msg = PositionControllerReference()
+        now = self.get_clock().now().to_msg()  # builtin_interfaces/Time
+        msg.header.stamp = now
+        msg.header.frame_id = "ground"
+        msg.position.x = x
+        msg.position.y = y
+        msg.position.z = z
+        msg.yaw = yaw
+        msg.yaw_unit = PositionControllerReference.DEGREES
+        self.position_com_pub.publish(msg)
         self.get_logger().info(f"Publishing coordinates: {x}, {y}, {z}, {yaw}")
         # self.coords_pub.publish(point)
 
@@ -509,7 +514,6 @@ class SingleDroneRosThread:
             msg.setStandardButtons(QMessageBox.Ok)
             msg.exec_()
             return
-        
         # if values are not within 5 meters of current position warn user
         if abs(x) > int(self.ros_object.config[0]) or abs(y) > int(self.ros_object.config[1]) or abs(z) > int(self.ros_object.config[2]) or z <= 0:
             ## pop up dialog 
@@ -522,6 +526,7 @@ class SingleDroneRosThread:
             return
 
         self.ros_object.publish_coordinates(x, y, z, yaw)
+        self.log_message(f"Position command sent: {x}, {y}, {z}, {yaw}")
 
     def get_coordinates(self):
         # get current relative position
