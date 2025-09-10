@@ -551,41 +551,6 @@
      </item>
     </layout>
    </widget>
-   <widget class="QWidget" name="gridLayoutWidget">
-    <property name="geometry">
-     <rect>
-      <x>440</x>
-      <y>410</y>
-      <width>161</width>
-      <height>71</height>
-     </rect>
-    </property>
-    <layout class="QGridLayout" name="BatLayout">
-     <item row="1" column="0" colspan="2">
-      <widget class="QProgressBar" name="BatInd">
-       <property name="value">
-        <number>20</number>
-       </property>
-       <property name="textVisible">
-        <bool>false</bool>
-       </property>
-      </widget>
-     </item>
-     <item row="0" column="0">
-      <widget class="QLabel" name="Voltage_Label">
-       <property name="text">
-        <string>Voltage:</string>
-       </property>
-       <property name="alignment">
-        <set>Qt::AlignCenter</set>
-       </property>
-      </widget>
-     </item>
-     <item row="0" column="1">
-      <widget class="QLCDNumber" name="VOLT_DISP"/>
-     </item>
-    </layout>
-   </widget>
    <widget class="QWidget" name="verticalLayoutWidget_3">
     <property name="geometry">
      <rect>
@@ -727,74 +692,6 @@
           <number>4</number>
          </property>
         </widget>
-       </item>
-      </layout>
-     </item>
-    </layout>
-   </widget>
-   <widget class="QWidget" name="verticalLayoutWidget_20">
-    <property name="geometry">
-     <rect>
-      <x>110</x>
-      <y>390</y>
-      <width>217</width>
-      <height>91</height>
-     </rect>
-    </property>
-    <layout class="QVBoxLayout" name="GPSDataLayout_6">
-     <item>
-      <widget class="QLabel" name="GPSLabel_7">
-       <property name="text">
-        <string>Commanded Attitude (°) </string>
-       </property>
-       <property name="alignment">
-        <set>Qt::AlignBottom|Qt::AlignHCenter</set>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <layout class="QHBoxLayout" name="GPS_DISP_6">
-       <item>
-        <widget class="QLCDNumber" name="TargROLL_DISP"/>
-       </item>
-       <item>
-        <widget class="QLCDNumber" name="TargPITCH_DISP"/>
-       </item>
-       <item>
-        <widget class="QLCDNumber" name="TargYAW_DISP">
-         <property name="digitCount">
-          <number>6</number>
-         </property>
-        </widget>
-       </item>
-      </layout>
-     </item>
-    </layout>
-   </widget>
-   <widget class="QWidget" name="verticalLayoutWidget_21">
-    <property name="geometry">
-     <rect>
-      <x>350</x>
-      <y>390</y>
-      <width>71</width>
-      <height>91</height>
-     </rect>
-    </property>
-    <layout class="QVBoxLayout" name="GPSDataLayout_7">
-     <item>
-      <widget class="QLabel" name="GPSLabel_9">
-       <property name="text">
-        <string>Thrust (N)</string>
-       </property>
-       <property name="alignment">
-        <set>Qt::AlignBottom|Qt::AlignHCenter</set>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <layout class="QHBoxLayout" name="GPS_DISP_7">
-       <item>
-        <widget class="QLCDNumber" name="TargTHRUST_DISP"/>
        </item>
       </layout>
      </item>
@@ -1852,6 +1749,159 @@
     <property name="text">
      <string>Controller: Baseline</string>
     </property>
+   </widget>
+   <widget class="QSplitter" name="splitter">
+    <property name="geometry">
+     <rect>
+      <x>30</x>
+      <y>390</y>
+      <width>811</width>
+      <height>71</height>
+     </rect>
+    </property>
+    <property name="orientation">
+     <enum>Qt::Horizontal</enum>
+    </property>
+    <widget class="QWidget" name="verticalLayoutWidget_28">
+     <layout class="QVBoxLayout" name="verticalLayout_2">
+      <item>
+       <widget class="QLabel" name="GPSLabel_11">
+        <property name="text">
+         <string>Control Mode</string>
+        </property>
+        <property name="textFormat">
+         <enum>Qt::AutoText</enum>
+        </property>
+        <property name="alignment">
+         <set>Qt::AlignBottom|Qt::AlignHCenter</set>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLineEdit" name="ControlMode">
+        <property name="text">
+         <string/>
+        </property>
+        <property name="alignment">
+         <set>Qt::AlignCenter</set>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+    <widget class="QWidget" name="verticalLayoutWidget_20">
+     <layout class="QVBoxLayout" name="GPSDataLayout_6">
+      <item>
+       <widget class="QLabel" name="GPSLabel_7">
+        <property name="text">
+         <string>Commanded Attitude (°, NED) </string>
+        </property>
+        <property name="alignment">
+         <set>Qt::AlignBottom|Qt::AlignHCenter</set>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <layout class="QHBoxLayout" name="GPS_DISP_6">
+        <item>
+         <widget class="QLCDNumber" name="TargROLL_DISP"/>
+        </item>
+        <item>
+         <widget class="QLCDNumber" name="TargPITCH_DISP"/>
+        </item>
+        <item>
+         <widget class="QLCDNumber" name="TargYAW_DISP">
+          <property name="digitCount">
+           <number>6</number>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+     </layout>
+    </widget>
+    <widget class="QWidget" name="verticalLayoutWidget_32">
+     <layout class="QVBoxLayout" name="GPSDataLayout_17">
+      <item>
+       <widget class="QLabel" name="GPSLabel_14">
+        <property name="text">
+         <string>Commanded Bodyrate (rad/s) </string>
+        </property>
+        <property name="alignment">
+         <set>Qt::AlignBottom|Qt::AlignHCenter</set>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <layout class="QHBoxLayout" name="GPS_DISP_17">
+        <item>
+         <widget class="QLCDNumber" name="TargROLL_RATE_DISP"/>
+        </item>
+        <item>
+         <widget class="QLCDNumber" name="TargPITCH_RATE_DISP"/>
+        </item>
+        <item>
+         <widget class="QLCDNumber" name="TargYAW_RATE_DISP">
+          <property name="digitCount">
+           <number>6</number>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+     </layout>
+    </widget>
+    <widget class="QWidget" name="verticalLayoutWidget_21">
+     <layout class="QVBoxLayout" name="GPSDataLayout_7">
+      <item>
+       <widget class="QLabel" name="GPSLabel_9">
+        <property name="text">
+         <string>Thrust (ratio)</string>
+        </property>
+        <property name="alignment">
+         <set>Qt::AlignBottom|Qt::AlignHCenter</set>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <layout class="QHBoxLayout" name="GPS_DISP_7">
+        <item>
+         <widget class="QLCDNumber" name="TargTHRUST_DISP"/>
+        </item>
+       </layout>
+      </item>
+     </layout>
+    </widget>
+    <widget class="QWidget" name="gridLayoutWidget">
+     <layout class="QGridLayout" name="BatLayout">
+      <item row="0" column="0">
+       <widget class="QLabel" name="Voltage_Label">
+        <property name="text">
+         <string>Voltage:</string>
+        </property>
+        <property name="alignment">
+         <set>Qt::AlignCenter</set>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QLCDNumber" name="VOLT_DISP"/>
+      </item>
+      <item row="1" column="0" colspan="2">
+       <widget class="QProgressBar" name="BatInd">
+        <property name="value">
+         <number>20</number>
+        </property>
+        <property name="textVisible">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
    </widget>
   </widget>
   <widget class="QWidget" name="tab">

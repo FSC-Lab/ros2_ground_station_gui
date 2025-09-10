@@ -127,7 +127,26 @@ class CommonData(): # store the data from the ROS nodes
         self.current_attitude_target.roll = euler[0]
         self.current_attitude_target.pitch = euler[1]
         self.current_attitude_target.yaw = euler[2]
-        self.current_attitude_target.thrust = thrust
+        self.current_attitude_target.thrust = -thrust
+        self.current_attitude_target.roll_rate = 0
+        self.current_attitude_target.pitch_rate = 0
+        self.current_attitude_target.yaw_rate = 0
+        self.current_attitude_target.mode = 1 # set to the mode with attitude control
+        self.lock.unlock()
+        return
+    
+    def update_body_rate_target(self, roll, pitch, yaw, thrust):
+        if not self.lock.tryLock():
+            return
+        self.current_attitude_target.roll = 0
+        self.current_attitude_target.pitch = 0
+        self.current_attitude_target.yaw = 0
+        self.current_attitude_target.thrust = -thrust
+        self.current_attitude_target.roll_rate = roll
+        self.current_attitude_target.pitch_rate = pitch
+        self.current_attitude_target.yaw_rate = yaw
+        self.current_attitude_target.mode = 2 # set to the mode with body rate control
+
         self.lock.unlock()
         return
     
@@ -146,34 +165,24 @@ class CommonData(): # store the data from the ROS nodes
         return euler
     
     def ned_to_enu(self, x, y, z,w):
-        q_FLU_to_ENU = Rotation.from_quat([w,x,y,z],scalar_first = True)
+        q = Rotation.from_quat([w,x,y,z],scalar_first = True)
         # ---- Fixed transforms
         # ENU -> NED
-        R_ENU_to_NED = np.array([
+        Rie = np.array([
             [0, 1, 0],
             [1, 0, 0],
             [0, 0, -1]
         ])
         
         # FLU -> FRD  
-        R_FLU_to_FRD = np.array([
+        Rbv = np.array([
             [1,  0,  0],
             [0, -1,  0],
             [0,  0, -1]
         ])
         
-        # Get conjugate and rotation matrix
-        q_ENU_to_FLU = q_FLU_to_ENU.inv()  # conjugate/inverse for unit quaternions
-        R_ENU_to_FLU = q_ENU_to_FLU.as_matrix()
-        
-        # Transpose to get NED to ENU
-        R_NED_to_ENU = R_ENU_to_NED.T
-        
-        # R(NED→FRD) = R(FLU→FRD) * R(ENU→FLU) * R(NED→ENU)
-        R_NED_to_FRD = R_FLU_to_FRD @ R_ENU_to_FLU @ R_NED_to_ENU
-        
-        # Convert rotation matrix back to quaternion
-        q_NED_to_FRD = Rotation.from_matrix(R_NED_to_FRD)
+        # ned -> enu conversion
+        q_NED_to_FRD = Rotation.from_matrix(Rie) * q * Rotation.from_matrix(Rbv)
 
         return q_NED_to_FRD.as_quat()
 
