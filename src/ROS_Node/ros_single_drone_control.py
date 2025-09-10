@@ -32,7 +32,7 @@ import Common
 from geometry_msgs.msg import Point
 from std_msgs.msg import String
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
-from px4_msgs.msg import VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus, TrajectorySetpoint
+from px4_msgs.msg import VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus, VehicleRatesSetpoint
 from fsc_autopilot_ros2_msgs.msg import PositionControllerReference
 from visualization_msgs.msg import Marker
 from mpc_controller.msg import NodeStatus, ControllerInput
@@ -60,6 +60,14 @@ class SingleDroneRosNode(Node, QObject):
             depth=5
         )
         
+        # Define QoS profile for PX4 input topics (commands to PX4)
+        self.px4_input_qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5
+        )
+        
         # Define subscribers
         self.imu_sub = self.create_subscription(VehicleAttitude, '/uav_0/fmu/out/vehicle_attitude', self.imu_callback, self.px4_qos_profile)
         self.pos_global_sub = self.create_subscription(VehicleGlobalPosition, '/uav_0/fmu/out/vehicle_global_position', self.pos_global_callback, self.px4_qos_profile)
@@ -67,7 +75,8 @@ class SingleDroneRosNode(Node, QObject):
         self.vel_sub = self.create_subscription(Odometry, '/uav_0/state_estimator/local_position/odom', self.vel_callback, 10)
         self.bat_sub = self.create_subscription(BatteryStatus, '/uav_0/fmu/out/battery_status', self.bat_callback, self.px4_qos_profile)
         self.status_sub = self.create_subscription(VehicleStatus, '/uav_0/fmu/out/vehicle_status_v1', self.status_callback, self.px4_qos_profile)
-        self.commanded_attitude_sub = self.create_subscription(VehicleAttitudeSetpoint, '/uav_0/fmu/in/vehicle_attitude_setpoint', self.commanded_attitude_callback, self.px4_qos_profile)
+        self.commanded_attitude_sub = self.create_subscription(VehicleAttitudeSetpoint, '/uav_0/fmu/in/vehicle_attitude_setpoint', self.commanded_attitude_callback, self.px4_input_qos_profile)
+        self.commanded_bodyrate_callback = self.create_subscription(VehicleRatesSetpoint, '/uav_0/fmu/in/vehicle_rates_setpoint', self.commanded_bodyrate_callback, self.px4_input_qos_profile)
         self.estimator_type_sub = self.create_subscription(Bool, '/estimator_type', self.estimator_type_callback, 10)
         self.mpc_node_status_sub = self.create_subscription(NodeStatus, '/uav_0/mpc/heartbeat', self.mpc_node_status_callback, 10)
         self.solver_status_sub = self.create_subscription(ControllerInput, '/uav_0/mpc/solver_res', self.solver_status_callback, 10)
@@ -124,7 +133,11 @@ class SingleDroneRosNode(Node, QObject):
         self.data_struct.update_state(msg.pre_flight_checks_pass,msg.arming_state, msg.nav_state, (msg.timestamp-msg.armed_time))
 
     def commanded_attitude_callback(self, msg):
-        self.data_struct.update_attitude_target(msg.q_d[1], msg.q_d[2], msg.q_d[3], msg.q_d[0], msg.thrust[2])
+        # the attitude setpoint received from px4 
+        self.data_struct.update_attitude_target(msg.q_d[1], msg.q_d[2], msg.q_d[3], msg.q_d[0], msg.thrust_body[2])
+
+    def commanded_bodyrate_callback(self, msg):
+        self.data_struct.update_body_rate_target(msg.roll, msg.pitch, msg.yaw, msg.thrust_body[2])
 
     def estimator_type_callback(self, msg):
         self.data_struct.update_estimator_type(msg.data)
@@ -362,6 +375,10 @@ class SingleDroneRosThread:
         self.ui.TargYAW_DISP.display("{:.2f}".format(alttitude_targ_msg.yaw, 2))
         self.ui.TargTHRUST_DISP.display("{:.2f}".format(alttitude_targ_msg.thrust, 2))
 
+        self.ui.TargROLL_RATE_DISP.display("{:.2f}".format(alttitude_targ_msg.roll_rate, 2))
+        self.ui.TargPITCH_RATE_DISP.display("{:.2f}".format(alttitude_targ_msg.pitch_rate, 2))
+        self.ui.TargYAW_RATE_DISP.display("{:.2f}".format(alttitude_targ_msg.yaw_rate, 2))
+
         # global & local position data
         self.ui.LatGPS_DISP.display("{:.2f}".format(self.global_pos_msg.latitude, 2))
         self.ui.LongGPS_DISP.display("{:.2f}".format(self.global_pos_msg.longitude, 2))
@@ -447,6 +464,15 @@ class SingleDroneRosThread:
                 # MPC node is ready but not actively controlling
                 self.ui.SolverMode.setText("Ready, Inactive")
 
+        # update the control mode
+        if alttitude_targ_msg.mode == 0:
+            self.ui.ControlMode.setText("Not Started")
+        elif alttitude_targ_msg.mode == 1:
+            self.ui.ControlMode.setText("Attitude")
+        elif alttitude_targ_msg.mode == 2:
+            self.ui.ControlMode.setText("Bodyrate")
+
+    
 
     def switch_baseline(self):
         if self.ros_object.data_struct.controller_status.baseline_mode:
