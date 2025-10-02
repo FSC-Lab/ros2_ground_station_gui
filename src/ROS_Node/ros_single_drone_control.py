@@ -324,7 +324,10 @@ class SingleDroneRosThread:
         timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
         formatted_message = f"[{timestamp}] {message}"
         self.ui.Logging.append(formatted_message)
+        self.ui.TrajFlightLogging.append(formatted_message)
 
+
+    
     def mpc_log_message(self, message):
         """Add timestamped message to GUI logging widget"""
         timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
@@ -344,7 +347,17 @@ class SingleDroneRosThread:
         self.ui.SwitchMPC.clicked.connect(self.switch_mpc)
         self.ui.SendPositionUAV.clicked.connect(self.send_coordinates)
         self.ui.GetCurrentPositionUAV.clicked.connect(self.get_coordinates)
+        self.ui.GetCurrentPositionUAV_Traj.clicked.connect(self.get_coordinates)
+        
 
+        self.ui.GenerateLineTraj.clicked.connect(lambda: self.generate_trajectory("line"))
+        self.ui.GenerateEightTraj.clicked.connect(lambda: self.generate_trajectory("eight"))
+        self.ui.GenerateCircleTraj.clicked.connect(lambda: self.generate_trajectory("circle"))  
+        self.ui.GenerateEllipsoidTraj.clicked.connect(lambda: self.generate_trajectory("ellipsoid"))
+
+        self.ui.StartTrackingButton.clicked.connect(self.send_trajectory)
+        self.ui.StopTrackingButton.clicked.connect(self.send_stop_request)
+        self.ui.SaveDataButton.clicked.connect(self.send_save_data_request)
         self.ui.EmergencyStop.clicked.connect(lambda: self.send_arming_request(False, 21196))
 
     # update GUI data
@@ -362,6 +375,7 @@ class SingleDroneRosThread:
         alttitude_targ_msg = self.ros_object.data_struct.current_attitude_target
         indoor_mode = self.ros_object.data_struct.indoor_mode
         controller_status_msg = self.ros_object.data_struct.controller_status
+        trajectory_msg = self.ros_object.data_struct.current_planner
 
         self.lock.unlock()
 
@@ -560,6 +574,54 @@ class SingleDroneRosThread:
         self.ui.YPositionUAV.setText("{:.2f}".format(self.local_pos_msg.y, 2))
         self.ui.ZPositionUAV.setText("{:.2f}".format(self.local_pos_msg.z, 2))
         self.ui.YAWUAV.setText("{:.2f}".format(self.imu_msg.yaw, 2))
+        self.ui.XPositionUAV_Traj.setText("{:.2f}".format(self.local_pos_msg.x, 2))
+        self.ui.YPositionUAV_Traj.setText("{:.2f}".format(self.local_pos_msg.y, 2))
+        self.ui.ZPositionUAV_Traj.setText("{:.2f}".format(self.local_pos_msg.z, 2))
+        self.ui.YAWUAV_Traj.setText("{:.2f}".format(self.imu_msg.yaw, 2))
+
+    def send_trajectory(self):
+        return None
+
+    def send_stop_request(self):
+        # hold position
+        self.log_message("Stopping trajectory tracking, holding position")
+        # clear the trajectory
+        self.ros_object.data_struct.current_planner.current_trajectory = None
+        self.hold()
+        return None
+    
+    def send_save_data_request(self):
+        return None
+
+    def generate_trajectory(self, traj_type):
+        try:
+            if traj_type not in self.ros_object.data_struct.current_planner.trajectories:
+                self.log_message(f"Unknown trajectory type: {traj_type}")
+                return
+            cfg = self.ros_object.data_struct.current_planner.trajectories[traj_type]
+
+            # Enable trajectory
+            setattr(self.ros_object.data_struct.current_planner, cfg["enabled_attr"], True)
+            self.ros_object.data_struct.current_planner.current_trajectory = traj_type
+            # Extract parameters from UI
+            params = {
+                key: float(getattr(self.ui, widget_name).text())
+                for key, widget_name in cfg["ui_fields"].items()
+            }
+            self.log_message(cfg["log"].format(**params))
+            getattr(self.ros_object.data_struct.current_planner, cfg["params_attr"]).update(params)
+            # Log parameters
+            self.log_message(f"Generating {traj_type} trajectory")
+            self.log_message(cfg["log"].format(**params))
+
+        except ValueError:
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Warning)
+            msg.setText("Invalid input, make sure values are numbers")
+            msg.setWindowTitle("Warning")
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.exec_()
+            return
 
     ### define publish / service functions to ros topics ###
     def send_arming_request(self, arm, param2):

@@ -14,7 +14,7 @@
    <string>TabWidget</string>
   </property>
   <property name="currentIndex">
-   <number>1</number>
+   <number>2</number>
   </property>
   <widget class="QWidget" name="Initialization_Tab">
    <property name="font">
@@ -649,7 +649,7 @@
      </rect>
     </property>
     <property name="currentIndex">
-     <number>1</number>
+     <number>0</number>
     </property>
     <widget class="QWidget" name="Flight_Graph">
      <attribute name="title">
@@ -1138,6 +1138,495 @@
        </layout>
       </widget>
      </widget>
+    </widget>
+   </widget>
+  </widget>
+  <widget class="QWidget" name="tab">
+   <attribute name="title">
+    <string>Trajectoy Tracking</string>
+   </attribute>
+   <widget class="QTabWidget" name="Additional_Function_3">
+    <property name="geometry">
+     <rect>
+      <x>860</x>
+      <y>470</y>
+      <width>451</width>
+      <height>321</height>
+     </rect>
+    </property>
+    <property name="currentIndex">
+     <number>0</number>
+    </property>
+    <widget class="QWidget" name="tab_5">
+     <attribute name="title">
+      <string>Tracking Logging</string>
+     </attribute>
+     <widget class="QTextBrowser" name="TrajFlightLogging">
+      <property name="geometry">
+       <rect>
+        <x>20</x>
+        <y>30</y>
+        <width>401</width>
+        <height>241</height>
+       </rect>
+      </property>
+     </widget>
+    </widget>
+   </widget>
+   <widget class="QTabWidget" name="Additional_Function_4">
+    <property name="geometry">
+     <rect>
+      <x>860</x>
+      <y>30</y>
+      <width>451</width>
+      <height>421</height>
+     </rect>
+    </property>
+    <property name="currentIndex">
+     <number>0</number>
+    </property>
+    <widget class="QWidget" name="Flight_Graph_2">
+     <attribute name="title">
+      <string>Flight Graph</string>
+     </attribute>
+     <widget class="QWidget" name="TrajPlotWidget" native="true">
+      <property name="geometry">
+       <rect>
+        <x>20</x>
+        <y>30</y>
+        <width>401</width>
+        <height>331</height>
+       </rect>
+      </property>
+     </widget>
+    </widget>
+   </widget>
+   <widget class="QLabel" name="AutonomousTitle_2">
+    <property name="geometry">
+     <rect>
+      <x>30</x>
+      <y>30</y>
+      <width>601</width>
+      <height>61</height>
+     </rect>
+    </property>
+    <property name="font">
+     <font>
+      <pointsize>24</pointsize>
+      <weight>75</weight>
+      <bold>true</bold>
+     </font>
+    </property>
+    <property name="text">
+     <string>Trajectoy Tracking</string>
+    </property>
+   </widget>
+   <widget class="QTabWidget" name="tabWidget_2">
+    <property name="geometry">
+     <rect>
+      <x>30</x>
+      <y>490</y>
+      <width>471</width>
+      <height>291</height>
+     </rect>
+    </property>
+    <property name="currentIndex">
+     <number>0</number>
+    </property>
+    <widget class="QWidget" name="tab_6">
+     <attribute name="title">
+      <string>Move ENU</string>
+     </attribute>
+     <widget class="QWidget" name="verticalLayoutWidget_16">
+      <property name="geometry">
+       <rect>
+        <x>0</x>
+        <y>20</y>
+        <width>431</width>
+        <height>221</height>
+       </rect>
+      </property>
+      <layout class="QVBoxLayout" name="DesiredFlightLayout_2">
+       <item>
+        <widget class="QLabel" name="DesiredFlightCoordinates_4">
+         <property name="text">
+          <string>Current Flight Coordinates</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignBottom|Qt::AlignHCenter</set>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="FlightHLayout_2">
+         <item>
+          <widget class="QLabel" name="XLabel1_2">
+           <property name="text">
+            <string>X (m)</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="YLabel1_2">
+           <property name="text">
+            <string>Y (m)</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="ZLabel1_2">
+           <property name="text">
+            <string>Z (m)</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="ZLabel1_4">
+           <property name="text">
+            <string>Yaw (deg)</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="FlightHLayout1_2">
+         <item>
+          <widget class="QLineEdit" name="XPositionUAV_Traj">
+           <property name="text">
+            <string/>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLineEdit" name="YPositionUAV_Traj"/>
+         </item>
+         <item>
+          <widget class="QLineEdit" name="ZPositionUAV_Traj"/>
+         </item>
+         <item>
+          <widget class="QLineEdit" name="YAWUAV_Traj"/>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_4">
+         <item>
+          <widget class="QPushButton" name="GetCurrentPositionUAV_Traj">
+           <property name="text">
+            <string>Get Current Position</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
+    </widget>
+   </widget>
+   <widget class="QWidget" name="verticalLayoutWidget_17">
+    <property name="geometry">
+     <rect>
+      <x>30</x>
+      <y>120</y>
+      <width>431</width>
+      <height>161</height>
+     </rect>
+    </property>
+    <layout class="QVBoxLayout" name="DesiredFlightLayout_3">
+     <item>
+      <layout class="QHBoxLayout" name="FlightHLayout_3">
+       <item>
+        <widget class="QLabel" name="XLabel1_3">
+         <property name="text">
+          <string>Desired X (m)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="YLabel1_3">
+         <property name="text">
+          <string>Desired Y (m)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="ZLabel1_5">
+         <property name="text">
+          <string>Desired Z (m)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="ZLabel1_6">
+         <property name="text">
+          <string>Duration (s)</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="FlightHLayout1_3">
+       <item>
+        <widget class="QLineEdit" name="LineX">
+         <property name="text">
+          <string/>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="LineY"/>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="LineZ"/>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="LineDuration"/>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <widget class="QPushButton" name="GenerateLineTraj">
+       <property name="text">
+        <string>Generate Line Trajectory</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QWidget" name="verticalLayoutWidget_18">
+    <property name="geometry">
+     <rect>
+      <x>480</x>
+      <y>120</y>
+      <width>351</width>
+      <height>161</height>
+     </rect>
+    </property>
+    <layout class="QVBoxLayout" name="DesiredFlightLayout_8">
+     <item>
+      <layout class="QHBoxLayout" name="FlightHLayout_8">
+       <item>
+        <widget class="QLabel" name="XLabel1_8">
+         <property name="text">
+          <string>Radius (m)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="YLabel1_8">
+         <property name="text">
+          <string>Height (m)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="ZLabel1_16">
+         <property name="text">
+          <string>Duration (s)</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="FlightHLayout1_8">
+       <item>
+        <widget class="QLineEdit" name="CircleRadius">
+         <property name="text">
+          <string/>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="CircleHeight"/>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="CircleDuration"/>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <widget class="QPushButton" name="GenerateCircleTraj">
+       <property name="text">
+        <string>Generate Circle Trajectory</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QWidget" name="verticalLayoutWidget_22">
+    <property name="geometry">
+     <rect>
+      <x>30</x>
+      <y>310</y>
+      <width>431</width>
+      <height>161</height>
+     </rect>
+    </property>
+    <layout class="QVBoxLayout" name="DesiredFlightLayout_9">
+     <item>
+      <layout class="QHBoxLayout" name="FlightHLayout_9">
+       <item>
+        <widget class="QLabel" name="XLabel1_9">
+         <property name="text">
+          <string>RX (m)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="YLabel1_9">
+         <property name="text">
+          <string>RY (m)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="ZLabel1_15">
+         <property name="text">
+          <string>RZ (m)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="Duration">
+         <property name="text">
+          <string>Duration (s)</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="FlightHLayout1_9">
+       <item>
+        <widget class="QLineEdit" name="EllipsoidRX">
+         <property name="text">
+          <string/>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="EllipsoidRY"/>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="EllipsoidRZ"/>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="EllipsoidDuration"/>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <widget class="QPushButton" name="GenerateEllipsoidTraj">
+       <property name="text">
+        <string>Generate Ellipsoid Trajectory</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QWidget" name="verticalLayoutWidget_24">
+    <property name="geometry">
+     <rect>
+      <x>480</x>
+      <y>310</y>
+      <width>351</width>
+      <height>161</height>
+     </rect>
+    </property>
+    <layout class="QVBoxLayout" name="DesiredFlightLayout_12">
+     <item>
+      <layout class="QHBoxLayout" name="FlightHLayout_12">
+       <item>
+        <widget class="QLabel" name="XLabel1_12">
+         <property name="text">
+          <string>Radius (m)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="YLabel1_12">
+         <property name="text">
+          <string>Height (m)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="EightEnableDuration">
+         <property name="text">
+          <string>Duration (s)</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="FlightHLayout1_12">
+       <item>
+        <widget class="QLineEdit" name="EightRadius">
+         <property name="text">
+          <string/>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="EightHeight"/>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="EightDuration"/>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <widget class="QPushButton" name="GenerateEightTraj">
+       <property name="text">
+        <string>Generate Eight Trajectory</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QLabel" name="XLabel1_13">
+    <property name="geometry">
+     <rect>
+      <x>30</x>
+      <y>90</y>
+      <width>411</width>
+      <height>21</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>All trajectories will start from the current position</string>
+    </property>
+   </widget>
+   <widget class="QSplitter" name="splitter_4">
+    <property name="geometry">
+     <rect>
+      <x>510</x>
+      <y>520</y>
+      <width>321</width>
+      <height>251</height>
+     </rect>
+    </property>
+    <property name="orientation">
+     <enum>Qt::Vertical</enum>
+    </property>
+    <widget class="QPushButton" name="StartTrackingButton">
+     <property name="text">
+      <string>Start Tracking</string>
+     </property>
+    </widget>
+    <widget class="QPushButton" name="StopTrackingButton">
+     <property name="text">
+      <string>Stop Tracking</string>
+     </property>
+    </widget>
+    <widget class="QPushButton" name="SaveDataButton">
+     <property name="text">
+      <string>Save Data</string>
+     </property>
     </widget>
    </widget>
   </widget>

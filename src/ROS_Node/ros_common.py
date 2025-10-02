@@ -80,3 +80,81 @@ class ControllerStatus:
         # Control results
         self.last_thrust_cmd = 0.0
         self.last_rate_cmd = Vector3(0.0, 0.0, 0.0)  
+
+class TrajectoryPlanner:
+    def __init__(self):
+        self.line_traj_enabled = False
+        self.circle_traj_enabled = False
+        self.eight_traj_enabled = False
+        self.ellipsoid_traj_enabled = False
+        self.current_trajectory = None
+
+        self.line_traj_params = {
+            "xr": 0.0,
+            "yr": 0.0,
+            "zr": 0.0,
+            "duration": 5.0,
+        }
+        self.circle_traj_params = {
+            "radius": 1.0,
+            "zr": 3.0,
+            "duration": 5.0,
+        }
+        self.eight_traj_params = {
+            "radius": 1.0,
+            "zr": 3.0,
+            "duration": 5.0,
+        }
+        self.ellipsoid_traj_params = {
+            "rx": 3.0,
+            "ry": 1.0,
+            "rz": 1.0,
+            "duration": 10.0,
+        }
+
+        # 🔑 Centralized config
+        self.trajectories = {
+            "line": {
+                "enabled_attr": "line_traj_enabled",
+                "params_attr": "line_traj_params",
+                "ui_fields": {
+                    "xr": "LineX",
+                    "yr": "LineY",
+                    "zr": "LineZ",
+                    "duration": "LineDuration",
+                },
+                "log": "Line trajectory parameter: x: {xr:.2f}, y: {yr:.2f}, z: {zr:.2f}, duration: {duration:.2f}",
+            },
+            "circle": {
+                "enabled_attr": "circle_traj_enabled",
+                "params_attr": "circle_traj_params",
+                "ui_fields": {
+                    "radius": "CircleRadius",
+                    "zr": "CircleHeight",
+                    "duration": "CircleDuration",
+                },
+                "log": "Circle trajectory parameter: radius: {radius:.2f}, Height: {zr:.2f}, duration: {duration:.2f}",
+            },
+            "eight": {
+                "enabled_attr": "eight_traj_enabled",
+                "params_attr": "eight_traj_params",
+                "ui_fields": {
+                    "radius": "EightRadius",
+                    "zr": "EightHeight",
+                    "duration": "EightDuration",
+                },
+                "log": "Eight trajectory parameter: radius: {radius:.2f}, Height: {zr:.2f}, duration: {duration:.2f}",
+            },
+            "ellipsoid": {
+                "enabled_attr": "ellipsoid_traj_enabled",
+                "params_attr": "ellipsoid_traj_params",
+                "ui_fields": {
+                    "rx": "EllipsoidRX",
+                    "ry": "EllipsoidRY",
+                    "rz": "EllipsoidRZ",
+                    "duration": "EllipsoidDuration",
+                },
+                "log": "Ellipsoid trajectory parameter: rx: {rx:.2f}, ry: {ry:.2f}, rz: {rz:.2f}, duration: {duration:.2f}",
+            },
+        }
+

@@ -46,7 +46,7 @@ class CommonData(): # store the data from the ROS nodes
         self.current_attitude_target = ros_common.AttitudeTarget()
         self.indoor_mode = False
         self.controller_status = ros_common.ControllerStatus()  # controller status
-
+        self.current_planner = ros_common.TrajectoryPlanner()  # trajectory data for trajectory tracking
         # water sampling
         self.encoder_raw = ros_common.Vector3()
         self.payload_pos = ros_common.Vector3()
