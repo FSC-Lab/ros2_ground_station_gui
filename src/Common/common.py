@@ -23,7 +23,6 @@ SOFTWARE.
 '''
 #!/usr/bin/env python
 from PyQt5.QtCore import QMutex
-from scipy.spatial.transform import Rotation
 from px4_msgs.msg import VehicleStatus
 
 import ROS_Node.ros_common as ros_common
@@ -155,8 +154,30 @@ class CommonData(): # store the data from the ROS nodes
         quat_enu = self.ned_to_enu(x, y, z, w)
         nrm = abs(sum(q**2 for q in quat_enu) - 1.0)
         quat = [0, 0, 0, 1] if nrm > 1e-5 else quat_enu
-        r = Rotation.from_quat(quat)
-        euler = r.as_euler('xyz', degrees=True)
+
+        # Manual quaternion to Euler conversion (XYZ order)
+        # quat is [x, y, z, w] format
+        qx, qy, qz, qw = quat[0], quat[1], quat[2], quat[3]
+
+        # Roll (x-axis rotation)
+        sinr_cosp = 2 * (qw * qx + qy * qz)
+        cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
+        roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+        # Pitch (y-axis rotation)
+        sinp = 2 * (qw * qy - qz * qx)
+        if abs(sinp) >= 1:
+            pitch = np.copysign(np.pi / 2, sinp)  # use 90 degrees if out of range
+        else:
+            pitch = np.arcsin(sinp)
+
+        # Yaw (z-axis rotation)
+        siny_cosp = 2 * (qw * qz + qx * qy)
+        cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+        # Convert to degrees
+        euler = np.array([np.degrees(roll), np.degrees(pitch), np.degrees(yaw)])
 
         # convert to 360 coordinates
         if euler[2] < 0:
@@ -164,8 +185,10 @@ class CommonData(): # store the data from the ROS nodes
 
         return euler
     
-    def ned_to_enu(self, x, y, z,w):
-        q = Rotation.from_quat([w,x,y,z],scalar_first = True)
+    def ned_to_enu(self, x, y, z, w):
+        # Manual quaternion operations without scipy
+        q = [w, x, y, z]  # scalar first format
+
         # ---- Fixed transforms
         # ENU -> NED
         Rie = np.array([
@@ -173,18 +196,67 @@ class CommonData(): # store the data from the ROS nodes
             [1, 0, 0],
             [0, 0, -1]
         ])
-        
-        # FLU -> FRD  
+
+        # FLU -> FRD
         Rbv = np.array([
             [1,  0,  0],
             [0, -1,  0],
             [0,  0, -1]
         ])
-        
-        # ned -> enu conversion
-        q_NED_to_FRD = Rotation.from_matrix(Rie) * q * Rotation.from_matrix(Rbv)
 
-        return q_NED_to_FRD.as_quat()
+        # Convert rotation matrices to quaternions
+        q_rie = self._rotation_matrix_to_quat(Rie)
+        q_rbv = self._rotation_matrix_to_quat(Rbv)
+
+        # Quaternion multiplication: q_rie * q * q_rbv
+        q_temp = self._quat_multiply(q_rie, q)
+        q_result = self._quat_multiply(q_temp, q_rbv)
+
+        # Return as [x, y, z, w] format (standard format)
+        return [q_result[1], q_result[2], q_result[3], q_result[0]]
+
+    def _rotation_matrix_to_quat(self, R):
+        """Convert rotation matrix to quaternion [w, x, y, z]"""
+        trace = np.trace(R)
+
+        if trace > 0:
+            s = 0.5 / np.sqrt(trace + 1.0)
+            w = 0.25 / s
+            x = (R[2, 1] - R[1, 2]) * s
+            y = (R[0, 2] - R[2, 0]) * s
+            z = (R[1, 0] - R[0, 1]) * s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            w = (R[2, 1] - R[1, 2]) / s
+            x = 0.25 * s
+            y = (R[0, 1] + R[1, 0]) / s
+            z = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            w = (R[0, 2] - R[2, 0]) / s
+            x = (R[0, 1] + R[1, 0]) / s
+            y = 0.25 * s
+            z = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+            w = (R[1, 0] - R[0, 1]) / s
+            x = (R[0, 2] + R[2, 0]) / s
+            y = (R[1, 2] + R[2, 1]) / s
+            z = 0.25 * s
+
+        return [w, x, y, z]
+
+    def _quat_multiply(self, q1, q2):
+        """Multiply two quaternions [w, x, y, z]"""
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+
+        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+        return [w, x, y, z]
 
 
     def update_estimator_type(self, indoor_mode):
