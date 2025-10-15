@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 '''
 MIT License
 
@@ -22,32 +23,23 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 '''
 
-#!/usr/bin/env python
-
 import sys
-import subprocess
-from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import QTimer, QThread
+import signal
+
+from PyQt5 import QtCore, QtWidgets
+# from PyQt5 import QtCore, QtGui, QtWidgets
+# from PyQt5.QtCore import QTimer, QThread
 
 import rclpy
 import ROS_Node as ros_node
 import GUI as gui
 
-def start_rviz(config_file):
-    try:
-        subprocess.Popen(["rviz2", "-d", config_file])
-        print("RViz2 started:", config_file)
-    except Exception as e:
-        print("Failed to start RViz2:", str(e))
-
 if __name__ == "__main__":
     # Initialize ROS2
-    rclpy.init(args=None)
-    
-    # Start RViz2 (optional)
-    # start_rviz("src/GUI/config.rviz")
-    
+    rclpy.init(args=sys.argv)
+        
     # Create PyQt5 application
+    # QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     app = QtWidgets.QApplication(sys.argv)
     WaterSamplingGroundControlStation = QtWidgets.QTabWidget()
     ui = gui.Ui_WaterSamplingGroundControlStation()
@@ -56,13 +48,13 @@ if __name__ == "__main__":
     # Create ROS threads
     rosSingleDroneThread = ros_node.SingleDroneRosThread(ui)
     rosSingleDroneThread.start()
-    # rosWaterSampleThread = ros_node.WaterSampleRosThread(ui)
-    # rosWaterSampleThread.start()
     
     # Show the window
     WaterSamplingGroundControlStation.show()
-    print("System Started")
+    print("Groundstation started...")
     
+    # ---- Clean shutdown ----
+
     try:
         sys.exit(app.exec_())
     finally:
