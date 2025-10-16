@@ -39,24 +39,44 @@ if __name__ == "__main__":
     rclpy.init(args=sys.argv)
         
     # Create PyQt5 application
-    # QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     app = QtWidgets.QApplication(sys.argv)
     WaterSamplingGroundControlStation = QtWidgets.QTabWidget()
     ui = gui.Ui_WaterSamplingGroundControlStation()
     ui.setupUi(WaterSamplingGroundControlStation)
     
     # Create ROS threads
-    rosSingleDroneThread = ros_node.SingleDroneRosThread(ui)
-    rosSingleDroneThread.start()
+    ros_single_drone = ros_node.SingleDroneRosThread(ui)
+    ros_single_drone.start()
     
     # Show the window
     WaterSamplingGroundControlStation.show()
     print("Groundstation started...")
     
     # ---- Clean shutdown ----
+    def on_quit():
+            print("Shutting down...")
+            try:
+                if hasattr(ros_single_drone, "stop"):
+                    ros_single_drone.stop()
+            except Exception:
+                pass
+            try:
+                ros_single_drone.wait(1500)
+            except Exception:
+                pass
+            try:
+                if rclpy.ok():
+                    rclpy.shutdown()
+            except Exception:
+                pass
+    
+    # Handle both window close and Ctrl+C
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    app.aboutToQuit.connect(on_quit)
 
+    # ---- Run main loop ----
     try:
         sys.exit(app.exec_())
     finally:
-        # Cleanup ROS2
-        rclpy.shutdown()
+        on_quit()
