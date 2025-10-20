@@ -114,7 +114,8 @@ class SingleDroneRosNode(Node, QObject):
     ### define callback functions from ros topics ###
     def imu_callback(self, msg): 
         # get orientation and convert to euler angles
-        # note that uses PX4 [w, x, y, z] 
+        # note that uses PX4 [w, x, y, z]
+        # IMU from px4 is in NED frame, need to convert to ENU frame 
         self.data_struct.update_imu(msg.q[1], msg.q[2], msg.q[3], msg.q[0]) 
         
     def pos_global_callback(self, msg):
@@ -144,61 +145,80 @@ class SingleDroneRosNode(Node, QObject):
 
     def mpc_node_status_callback(self, msg):
         current_time = self.get_clock().now().nanoseconds / 1e9
-        
+
         # Check for missed heartbeat messages
         expected_sequence = self.data_struct.controller_status.last_heartbeat_sequence + 1
-        if (self.data_struct.controller_status.last_heartbeat_sequence > 0 and 
-            msg.heartbeat_sequence != expected_sequence and 
+        if (self.data_struct.controller_status.last_heartbeat_sequence > 0 and
+            msg.heartbeat_sequence != expected_sequence and
             msg.heartbeat_sequence > self.data_struct.controller_status.last_heartbeat_sequence):
             missed_count = msg.heartbeat_sequence - expected_sequence
-            self.get_logger().warn(f"Missed {missed_count} heartbeat messages (got {msg.heartbeat_sequence}, expected {expected_sequence})")
-        
-        # Update MPC status following established pattern
+            self.get_logger().warn(
+                f"Missed {missed_count} heartbeat messages "
+                f"(got {msg.heartbeat_sequence}, expected {expected_sequence})")
+
+        # Update MPC status using authoritative fields from MPC node
         self.data_struct.update_mpc_node_status(
-            msg.torch_model_loaded, 
-            msg.acados_solver_loaded, 
-            msg.data_available, 
-            msg.mpc_active, 
-            msg.solver_status, 
-            msg.last_control_norm, 
-            msg.heartbeat_sequence, 
+            msg.torch_model_loaded,
+            msg.acados_solver_loaded,
+            msg.data_available,
+            msg.mpc_active,  # Mode selection flag
+            msg.fully_activated,  # Complete activation status
+            msg.activation_status_detail,  # Detailed reason
+            msg.solver_status,
+            msg.last_control_norm,
+            msg.heartbeat_sequence,
             current_time
         )
-        
-        # Log status changes for debugging
+
+        # Log detailed status for debugging
         self.get_logger().debug(
-            f"MPC Heartbeat #{msg.heartbeat_sequence} - Start: {self.data_struct.controller_status.mpc_start}, "
-            f"Active: {self.data_struct.controller_status.node_active}, "
-            f"Torch: {msg.torch_model_loaded}, ACADOS: {msg.acados_solver_loaded}, "
-            f"Data: {msg.data_available}, MPC: {msg.mpc_active}, "
-            f"Solver: {msg.solver_status}, Control: {msg.last_control_norm:.3f}"
+            f"MPC Heartbeat #{msg.heartbeat_sequence} - "
+            f"Fully Activated: {msg.fully_activated}, "
+            f"Status: {msg.activation_status_detail}, "
+            f"Solver: {msg.solver_status}, Control Norm: {msg.last_control_norm:.3f}"
         )
 
     def solver_status_callback(self, msg):
         self.data_struct.update_solver_status(
-            msg.status.data,
+            msg.solver_status.data,  # Updated field name
+            msg.mpc_active,  # Explicit activation flag
             msg.thrust_cmd,
             msg.rate_cmd.x,
             msg.rate_cmd.y,
             msg.rate_cmd.z
         )
-        
+
         # Log solver results for MPC monitoring
-        status_text = msg.status.data
-        if status_text == "INFEASIBLE":
-            self.get_logger().warn(f"MPC Solver INFEASIBLE - no valid solution found")
-        
-        self.get_logger().debug(
-            f"MPC Control - Status: {status_text}, "
-            f"Thrust: {msg.thrust_cmd:.3f}, "
-            f"Rates: [{msg.rate_cmd.x:.3f}, {msg.rate_cmd.y:.3f}, {msg.rate_cmd.z:.3f}]"
-        )
-        
-        # Emit signal for GUI MPC logging
-        log_message = (f"Solver: {status_text} | "
-                      f"Thrust: {msg.thrust_cmd:.3f} | "
-                      f"Rates: [{msg.rate_cmd.x:.3f}, {msg.rate_cmd.y:.3f}, {msg.rate_cmd.z:.3f}]")
-        self.mpc_log_signal.emit(log_message)
+        status_text = msg.solver_status.data
+
+        # Only log detailed info if MPC is actually active
+        if msg.mpc_active:
+            if status_text == "INFEASIBLE":
+                self.get_logger().warn(
+                    "MPC Solver INFEASIBLE - no valid solution found")
+
+            self.get_logger().debug(
+                f"MPC ACTIVE - Status: {status_text}, "
+                f"Thrust: {msg.thrust_cmd:.3f}, "
+                f"Rates: [{msg.rate_cmd.x:.3f}, {msg.rate_cmd.y:.3f}, "
+                f"{msg.rate_cmd.z:.3f}]"
+            )
+
+            # Emit signal for GUI MPC logging
+            log_message = (
+                f"MPC ACTIVE | Solver: {status_text} | "
+                f"Thrust: {msg.thrust_cmd:.3f} | "
+                f"Rates: [{msg.rate_cmd.x:.3f}, {msg.rate_cmd.y:.3f}, "
+                f"{msg.rate_cmd.z:.3f}]")
+            self.mpc_log_signal.emit(log_message)
+        else:
+            # MPC computed but not active - log reason
+            self.get_logger().debug(
+                f"MPC INACTIVE - Solver: {status_text}, "
+                f"Control computed but not applied")
+            self.mpc_log_signal.emit(
+                f"MPC INACTIVE | Solver: {status_text} | "
+                "Control not applied")
 
     ### define publish functions to ros topics ###
     def publish_coordinates(self, x, y, z, yaw):
@@ -450,19 +470,15 @@ class SingleDroneRosThread:
         elif controller_status_msg.heartbeat_timeout:
             # Heartbeat was received before but now timed out - node stopped
             self.ui.SolverMode.setText("Timeout")
-        elif not controller_status_msg.mpc_start:
-            # Heartbeat received but components not ready - missing components
-            self.ui.SolverMode.setText("Not Ready") 
+        elif not controller_status_msg.fully_activated:
+            # Show the detailed reason from MPC node
+            self.ui.SolverMode.setText(controller_status_msg.activation_detail)
         else:
-            if controller_status_msg.node_active:
-                # Check solver feasibility
-                if not controller_status_msg.solver_feasible:
-                    self.ui.SolverMode.setText("Active, Infeasible")
-                else:
-                    self.ui.SolverMode.setText("Active, Feasible")
+            # Fully activated - show solver status
+            if controller_status_msg.solver_feasible:
+                self.ui.SolverMode.setText("Active & Feasible")
             else:
-                # MPC node is ready but not actively controlling
-                self.ui.SolverMode.setText("Ready, Inactive")
+                self.ui.SolverMode.setText("Active but INFEASIBLE")
 
         # update the control mode
         if alttitude_targ_msg.mode == 0:
@@ -483,29 +499,38 @@ class SingleDroneRosThread:
 
     def switch_mpc(self):
         # Check if MPC is available before switching
-        if not self.ros_object.data_struct.controller_status.heartbeat_ever_received:
+        controller_status = self.ros_object.data_struct.controller_status
+
+        if not controller_status.heartbeat_ever_received:
             self.log_message("MPC switch failed - MPC node not started")
-        elif self.ros_object.data_struct.controller_status.heartbeat_timeout:
+        elif controller_status.heartbeat_timeout:
             self.log_message("MPC switch failed - MPC node timeout")
-        elif not self.ros_object.data_struct.controller_status.mpc_start:
-            self.log_message("MPC switch failed - MPC node not ready (missing components)")
+        elif not controller_status.mpc_start:
+            # Components not ready
+            self.log_message(
+                f"MPC switch failed - Components not ready: "
+                f"{controller_status.activation_detail}")
+        elif controller_status.baseline_mode is False:
+            # Already in MPC mode
+            self.log_message("Already in MPC mode")
         else:
-            # MPC node is available - switch to MPC mode
+            # Switch to MPC mode
             self.ros_object.data_struct.controller_status.baseline_mode = False
-            if self.ros_object.data_struct.controller_status.mpc_start:
-                self.log_message("Current controller is MPC, switching failed")
-            else:
-                self.log_message("Switching controller mode: MPC")
-                
-                # Log current MPC status
-                if self.ros_object.data_struct.controller_status.node_active:
-                    if not self.ros_object.data_struct.controller_status.solver_feasible:
-                        self.log_message("MPC controller active but solver INFEASIBLE")
-                        self.mpc_log_message("WARNING: Solver returning infeasible solutions")
-                    else:
-                        self.log_message("MPC controller active and feasible")
+            self.log_message("Switching controller mode: MPC")
+
+            # Log current activation status
+            if controller_status.fully_activated:
+                if controller_status.solver_feasible:
+                    self.log_message("MPC fully activated and feasible")
                 else:
-                    self.log_message("MPC node ready but inactive")
+                    self.log_message(
+                        "MPC fully activated but solver INFEASIBLE")
+                    self.mpc_log_message(
+                        "WARNING: Solver returning infeasible solutions")
+            else:
+                self.log_message(
+                    f"MPC mode selected but not fully active: "
+                    f"{controller_status.activation_detail}")
 
     def send_set_home_request(self):
         if self.ros_object.set_home_override_service.wait_for_service(timeout_sec=1.0):

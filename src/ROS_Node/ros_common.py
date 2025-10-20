@@ -74,9 +74,14 @@ class ControllerStatus:
         self.heartbeat_timeout = False
         self.last_heartbeat_time = 0
         self.heartbeat_ever_received = False  # Track if we've ever received a heartbeat
+        # New authoritative activation status from MPC node
+        self.fully_activated = False  # Complete activation status
+        self.activation_detail = "Not Started"  # Detailed status string
+        self.mpc_mode_selected = False  # Mode selection flag only
         # Solver status tracking
         self.solver_feasible = True
         self.solver_status_text = "UNKNOWN"
         # Control results
         self.last_thrust_cmd = 0.0
-        self.last_rate_cmd = Vector3(0.0, 0.0, 0.0)  
+        self.last_rate_cmd = Vector3(0.0, 0.0, 0.0)
+        self.control_mpc_active = False  # mpc_active flag from ControllerInput message

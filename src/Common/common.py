@@ -215,45 +215,48 @@ class CommonData(): # store the data from the ROS nodes
         self.lock.unlock()
         return
 
-    def update_mpc_node_status(self, torch_loaded, acados_loaded, data_available, mpc_active, solver_status, control_norm, heartbeat_seq, current_time):
+    def update_mpc_node_status(self, torch_loaded, acados_loaded,
+                               data_available, mpc_mode_selected,
+                               fully_activated, activation_detail,
+                               solver_status, control_norm,
+                               heartbeat_seq, current_time):
         if not self.lock.tryLock():
             return
-        
+
         # Check heartbeat sequence for missed messages
         expected_sequence = self.controller_status.last_heartbeat_sequence + 1
-        if (self.controller_status.last_heartbeat_sequence > 0 and 
-            heartbeat_seq != expected_sequence and 
+        if (self.controller_status.last_heartbeat_sequence > 0 and
+            heartbeat_seq != expected_sequence and
             heartbeat_seq > self.controller_status.last_heartbeat_sequence):
             # Note: logging should be done by caller since this is data-only
             pass
-        
+
         # Update heartbeat tracking
         self.controller_status.last_heartbeat_sequence = heartbeat_seq
         self.controller_status.last_heartbeat_time = current_time
         self.controller_status.heartbeat_timeout = False
         self.controller_status.heartbeat_ever_received = True
-        
-        # Update MPC node status based on comprehensive heartbeat data
+
+        # Use authoritative activation status from MPC node
+        self.controller_status.fully_activated = fully_activated
+        self.controller_status.activation_detail = activation_detail
+        self.controller_status.mpc_mode_selected = mpc_mode_selected
+
+        # Derive other statuses for backward compatibility and GUI display
         self.controller_status.mpc_start = (
-            torch_loaded and 
+            torch_loaded and
             acados_loaded and
             data_available
         )
-        
-        self.controller_status.node_active = (
-            mpc_active and 
-            torch_loaded and 
-            acados_loaded and
-            data_available and
-            control_norm >= 0  # Valid control output
-        )
-        
-        # Update solver feasibility (ACADOS: 0=success, 4=infeasible, others=error)
+
+        # node_active now means fully controlling (not just components ready)
+        self.controller_status.node_active = fully_activated
+
+        # Update solver feasibility
+        # (ACADOS: 0=success, 4=infeasible, others=error)
         self.controller_status.solver_feasible = (solver_status == 0)
-        
-        # Store additional diagnostic information
         self.controller_status.solver_active = (solver_status == 0)
-        
+
         self.lock.unlock()
         return
 
@@ -282,20 +285,25 @@ class CommonData(): # store the data from the ROS nodes
         self.lock.unlock()
         return timeout_detected
 
-    def update_solver_status(self, status_text, thrust_cmd, rate_cmd_x, rate_cmd_y, rate_cmd_z):
+    def update_solver_status(self, status_text, mpc_active,
+                             thrust_cmd, rate_cmd_x, rate_cmd_y, rate_cmd_z):
         if not self.lock.tryLock():
             return
-        
+
         # Update solver status
         self.controller_status.solver_status_text = status_text
         self.controller_status.solver_feasible = (status_text == "FEASIBLE")
-        
+
+        # Store the mpc_active flag from ControllerInput message
+        # This tells us if MPC is actually controlling at 10Hz rate
+        self.controller_status.control_mpc_active = mpc_active
+
         # Update control results
         self.controller_status.last_thrust_cmd = thrust_cmd
         self.controller_status.last_rate_cmd.x = rate_cmd_x
         self.controller_status.last_rate_cmd.y = rate_cmd_y
         self.controller_status.last_rate_cmd.z = rate_cmd_z
-        
+
         self.lock.unlock()
         return
 
