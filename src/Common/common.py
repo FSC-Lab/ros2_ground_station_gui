@@ -215,94 +215,133 @@ class CommonData(): # store the data from the ROS nodes
         self.lock.unlock()
         return
 
-    def update_mpc_node_status(self, torch_loaded, acados_loaded,
-                               data_available, mpc_mode_selected,
-                               fully_activated, activation_detail,
-                               solver_status, control_norm,
-                               heartbeat_seq, current_time):
+    def update_mpc_heartbeat(self, is_active, current_time):
+        """Update MPC heartbeat status (std_msgs/Bool)
+
+        Args:
+            is_active: True if MPC is fully activated, False otherwise
+            current_time: Current timestamp in seconds
+        """
         if not self.lock.tryLock():
             return
 
-        # Check heartbeat sequence for missed messages
-        expected_sequence = self.controller_status.last_heartbeat_sequence + 1
-        if (self.controller_status.last_heartbeat_sequence > 0 and
-            heartbeat_seq != expected_sequence and
-            heartbeat_seq > self.controller_status.last_heartbeat_sequence):
-            # Note: logging should be done by caller since this is data-only
-            pass
-
-        # Update heartbeat tracking
-        self.controller_status.last_heartbeat_sequence = heartbeat_seq
+        self.controller_status.mpc_active = is_active
         self.controller_status.last_heartbeat_time = current_time
-        self.controller_status.heartbeat_timeout = False
         self.controller_status.heartbeat_ever_received = True
+        self.controller_status.heartbeat_timeout = False  # Reset timeout flag
 
-        # Use authoritative activation status from MPC node
-        self.controller_status.fully_activated = fully_activated
-        self.controller_status.activation_detail = activation_detail
-        self.controller_status.mpc_mode_selected = mpc_mode_selected
+        self.lock.unlock()
+        return
 
-        # Derive other statuses for backward compatibility and GUI display
-        self.controller_status.mpc_start = (
-            torch_loaded and
-            acados_loaded and
-            data_available
-        )
+    def update_mpc_commands(self, thrust, roll_rate, pitch_rate, yaw_rate, current_time):
+        """Store MPC body rate commands (px4_msgs/VehicleRatesSetpoint)
 
-        # node_active now means fully controlling (not just components ready)
-        self.controller_status.node_active = fully_activated
+        Args:
+            thrust: Normalized thrust [0, 1]
+            roll_rate: Roll rate command (rad/s)
+            pitch_rate: Pitch rate command (rad/s)
+            yaw_rate: Yaw rate command (rad/s)
+            current_time: Current timestamp in seconds
+        """
+        if not self.lock.tryLock():
+            return
 
-        # Update solver feasibility
-        # (ACADOS: 0=success, 4=infeasible, others=error)
-        self.controller_status.solver_feasible = (solver_status == 0)
-        self.controller_status.solver_active = (solver_status == 0)
+        self.controller_status.mpc_thrust = thrust
+        self.controller_status.mpc_roll_rate = roll_rate
+        self.controller_status.mpc_pitch_rate = pitch_rate
+        self.controller_status.mpc_yaw_rate = yaw_rate
+        self.controller_status.last_solver_res_time = current_time
+
+        self.lock.unlock()
+        return
+
+    def update_mpc_solver_status(self, solver_ok, current_time):
+        """Update MPC solver status (std_msgs/Int32)
+
+        Args:
+            solver_ok: True if solver succeeded (status==0), False otherwise
+            current_time: Current timestamp in seconds
+        """
+        if not self.lock.tryLock():
+            return
+
+        self.controller_status.solver_ok = solver_ok
+        self.controller_status.last_solver_status_time = current_time
+        self.controller_status.solver_ever_received = True
+        self.controller_status.solver_timeout = False  # Reset timeout flag
 
         self.lock.unlock()
         return
 
     def check_mpc_heartbeat_timeout(self, current_time, timeout_seconds=3.0):
+        """Check if MPC heartbeat has timed out
+
+        Args:
+            current_time: Current timestamp in seconds
+            timeout_seconds: Timeout threshold (default: 3 seconds)
+
+        Returns:
+            True if timeout detected, False otherwise
+        """
         if not self.lock.tryLock():
             return False
-        
+
         timeout_detected = False
-        if (self.controller_status.last_heartbeat_time > 0 and 
-            current_time - self.controller_status.last_heartbeat_time > timeout_seconds):
+        if not self.controller_status.heartbeat_ever_received:
+            # Never received heartbeat, no timeout
+            self.lock.unlock()
+            return False
+
+        time_since_last = current_time - self.controller_status.last_heartbeat_time
+        if time_since_last > timeout_seconds:
             if not self.controller_status.heartbeat_timeout:
+                # First time detecting timeout
                 self.controller_status.heartbeat_timeout = True
-                self.controller_status.node_active = False
-                self.controller_status.mpc_start = False
-                # Reset solver status when node times out
-                self.controller_status.solver_feasible = False
-                self.controller_status.solver_status_text = "TIMEOUT"
-                self.controller_status.solver_active = False
-                # Reset control results
-                self.controller_status.last_thrust_cmd = 0.0
-                self.controller_status.last_rate_cmd.x = 0.0
-                self.controller_status.last_rate_cmd.y = 0.0
-                self.controller_status.last_rate_cmd.z = 0.0
+                self.controller_status.mpc_active = False
                 timeout_detected = True
-        
+
         self.lock.unlock()
         return timeout_detected
 
-    def update_solver_status(self, status_text, mpc_active,
-                             thrust_cmd, rate_cmd_x, rate_cmd_y, rate_cmd_z):
+    def check_mpc_solver_timeout(self, current_time, timeout_seconds=1.0):
+        """Check if MPC solver status has timed out
+
+        Args:
+            current_time: Current timestamp in seconds
+            timeout_seconds: Timeout threshold (default: 1 second)
+
+        Returns:
+            True if timeout detected, False otherwise
+        """
+        if not self.lock.tryLock():
+            return False
+
+        timeout_detected = False
+        if not self.controller_status.solver_ever_received:
+            # Never received solver status, no timeout
+            self.lock.unlock()
+            return False
+
+        time_since_last = current_time - self.controller_status.last_solver_status_time
+        if time_since_last > timeout_seconds:
+            if not self.controller_status.solver_timeout:
+                # First time detecting timeout
+                self.controller_status.solver_timeout = True
+                timeout_detected = True
+
+        self.lock.unlock()
+        return timeout_detected
+
+    def update_controller_mode(self, mode_string):
+        """Update actual controller mode from autopilot (std_msgs/String)
+
+        Args:
+            mode_string: "Baseline" or "MPC" - the actual active controller
+        """
         if not self.lock.tryLock():
             return
 
-        # Update solver status
-        self.controller_status.solver_status_text = status_text
-        self.controller_status.solver_feasible = (status_text == "FEASIBLE")
-
-        # Store the mpc_active flag from ControllerInput message
-        # This tells us if MPC is actually controlling at 10Hz rate
-        self.controller_status.control_mpc_active = mpc_active
-
-        # Update control results
-        self.controller_status.last_thrust_cmd = thrust_cmd
-        self.controller_status.last_rate_cmd.x = rate_cmd_x
-        self.controller_status.last_rate_cmd.y = rate_cmd_y
-        self.controller_status.last_rate_cmd.z = rate_cmd_z
+        self.controller_status.actual_controller_mode = mode_string
 
         self.lock.unlock()
         return
