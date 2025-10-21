@@ -69,7 +69,7 @@ class ControllerStatus:
         self.baseline_mode = baseline
 
         # Actual controller mode from autopilot (ground truth)
-        self.actual_controller_mode = None  # "Baseline" or "MPC" or None if not received yet
+        self.actual_controller_mode = None  # "baseline" or "mpc" (lowercase) or None if not received yet
 
         # Heartbeat tracking (std_msgs/Bool @ 1-10Hz)
         self.mpc_active = False  # True if MPC fully activated

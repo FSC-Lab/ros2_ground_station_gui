@@ -336,7 +336,7 @@ class CommonData(): # store the data from the ROS nodes
         """Update actual controller mode from autopilot (std_msgs/String)
 
         Args:
-            mode_string: "Baseline" or "MPC" - the actual active controller
+            mode_string: "baseline" or "mpc" (lowercase) - the actual active controller
         """
         if not self.lock.tryLock():
             return
