@@ -33,34 +33,27 @@ import rclpy
 import ROS_Node as ros_node
 import GUI as gui
 
-def start_rviz(config_file):
-    try:
-        subprocess.Popen(["rviz2", "-d", config_file])
-        print("RViz2 started:", config_file)
-    except Exception as e:
-        print("Failed to start RViz2:", str(e))
 
 if __name__ == "__main__":
     # Initialize ROS2
     rclpy.init(args=None)
     
-    # Start RViz2 (optional)
-    # start_rviz("src/GUI/config.rviz")
-    
     # Create PyQt5 application
     app = QtWidgets.QApplication(sys.argv)
-    WaterSamplingGroundControlStation = QtWidgets.QTabWidget()
-    ui = gui.Ui_WaterSamplingGroundControlStation()
-    ui.setupUi(WaterSamplingGroundControlStation)
+    MultiDroneGroundControlStation = QtWidgets.QTabWidget()
+    ui = gui.Ui_MultiDroneGroundControlStation()
+    ui.setupUi(MultiDroneGroundControlStation)
     
     # Create ROS threads
-    rosSingleDroneThread = ros_node.SingleDroneRosThread(ui)
-    rosSingleDroneThread.start()
+    # rosSingleDroneThread = ros_node.SingleDroneRosThread(ui)
+    # rosSingleDroneThread.start()
+    rosMultiDroneThread = ros_node.MultiDroneRosThread(ui, [0,1,2])
+    rosMultiDroneThread.start()
     # rosWaterSampleThread = ros_node.WaterSampleRosThread(ui)
     # rosWaterSampleThread.start()
     
     # Show the window
-    WaterSamplingGroundControlStation.show()
+    MultiDroneGroundControlStation.show()
     print("System Started")
     
     try:
