@@ -53,7 +53,6 @@ class MultiDroneRosNode(Node, QObject):
 
         # store list of drone ids (ints)
         self.drone_ids = list(drone_ids)
-
         # per-drone data structs
         self.data_structs = {i: Common.CommonData() for i in self.drone_ids}
         
@@ -136,6 +135,27 @@ class MultiDroneRosNode(Node, QObject):
                 10
             )
             self.geofence_pubs[i] = self.create_publisher(Marker, f'/uav_{i}/tracking_controller/geofence', 10)
+        
+        # Create pub/sub on CCM and ENU flags, and CCM status
+        self.flag = False
+        self.CCM_flag_pubs = self.create_publisher(Bool, f'/uav_0/ground_station/CCM_flag', 10)
+        msg = Bool()
+        msg.data = False
+        self.CCM_flag_pubs.publish(msg)
+
+        self.ENU_flag_pubs = self.create_publisher(Bool, f'/uav_0/ground_station/ENU_flag', 10)
+        msg = Bool()
+        msg.data = False
+        self.ENU_flag_pubs.publish(msg)
+        
+        self.CCM_active = False
+        self.CCM_status_sub = self.create_subscription(
+            Bool,
+            f'/uav_0/fsc_autopilot_ros2/CCM_activated',
+            self.ccm_activated_callback,
+            10
+        )
+
 
         self.set_home_override_service = self.create_client(Empty, 'state_estimator/override_set_home')
         # self.set_home_service = self.create_client(CommandHome, 'mavros/cmd/set_home')
@@ -203,6 +223,20 @@ class MultiDroneRosNode(Node, QObject):
         self.position_com_pubs[drone_id].publish(msg)
         self.get_logger().info(f"Publishing coordinates uav_{drone_id}: {x}, {y}, {z}, {yaw}")
 
+    def publish_CCM_Flag(self, flag):
+        msg = Bool()
+        msg.data = flag
+        self.CCM_flag_pubs.publish(msg)
+        self.get_logger().info(f"Publishing CCM Flag: {flag}")
+
+    def publish_ENU_Flag(self, flag):
+        msg = Bool()
+        msg.data = flag
+        self.ENU_flag_pubs.publish(msg)
+        self.get_logger().info(f"Publishing ENU Flag: {flag}")
+
+    def ccm_activated_callback(self, msg):
+        self.CCM_active = msg.data
 
     def publish_geofence(self, drone_id, x, y, z):
         marker = Marker()
@@ -302,6 +336,14 @@ class MultiDroneRosThread:
             get_btn = getattr(self.ui, f"GetCurrentPositionUAV_UAV{i}", None)
             if get_btn:
                 get_btn.clicked.connect(functools.partial(self.get_coordinates, i))
+
+        CCM_activate_btn = getattr(self.ui, "CCMFlag_UAV0", None)
+        if CCM_activate_btn:
+            CCM_activate_btn.clicked.connect(lambda: self.ros_object.publish_CCM_Flag(True))
+        
+        ENU_activate_btn = getattr(self.ui, "ENUFlag_UAV0", None)
+        if ENU_activate_btn:
+            ENU_activate_btn.clicked.connect(lambda: self.ros_object.publish_ENU_Flag(True))
         # self.ui.SendPositionUAV.clicked.connect(self.send_coordinates)       
         # self.ui.GetCurrentPositionUAV.clicked.connect(self.get_coordinates)
 
@@ -452,6 +494,11 @@ class MultiDroneRosThread:
             self.ui.ControlMode.setText("Attitude")
         elif alttitude_targ_msg.mode == 2:
             self.ui.ControlMode.setText("Bodyrate")
+        
+        if getattr(self.ui, "StateCCM_UAV0", None):
+            self.ui.StateCCM_UAV0.setText("Active" if self.ros_object.CCM_active else "Inactive")
+            self.ui.StateCCM_UAV0.setStyleSheet("color: green" if self.ros_object.CCM_active else "color: red")
+
 
     ### callback functions for modifying GUI elements ###
     def toggle_simulation_mode(self, state):
