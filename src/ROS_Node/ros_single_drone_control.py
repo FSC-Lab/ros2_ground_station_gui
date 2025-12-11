@@ -233,18 +233,9 @@ class SingleDroneRosNode(Node, QObject):
         actual_mode = msg.data
         self.data_struct.update_controller_mode(actual_mode)
 
-        # Detect mode mismatch (GUI thinks one thing, autopilot doing another)
-        expected_baseline = self.data_struct.controller_status.baseline_mode
-        actual_baseline = (actual_mode.lower() == "baseline")
-
-        if expected_baseline != actual_baseline:
-            self.get_logger().warn(
-                f"Controller mode mismatch! GUI expected: {'Baseline' if expected_baseline else 'MPC'}, "
-                f"Autopilot actual: {actual_mode}"
-            )
-            # Sync GUI state to match reality
-            self.data_struct.controller_status.baseline_mode = actual_baseline
-            self.get_logger().info(f"GUI state synchronized to match autopilot: {actual_mode}")
+        # Note: Do NOT automatically sync GUI state to autopilot here.
+        # The autopilot will eventually converge to the GUI's commanded state.
+        # Syncing here causes oscillation when commands are in flight.
 
     ### define publish functions to ros topics ###
     def publish_coordinates(self, x, y, z, yaw):
