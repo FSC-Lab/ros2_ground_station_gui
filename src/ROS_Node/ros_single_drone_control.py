@@ -84,7 +84,16 @@ class SingleDroneRosNode(Node, QObject):
         # Define publishers / services
         # self.coords_pub = self.create_publisher(TrackingReference, 'position_controller/target', 10)
         self.geofence_pub = self.create_publisher(Marker, 'tracking_controller/geofence', 10)
-        self.controller_mode_pub = self.create_publisher(String, '/uav_0/fsc_autopilot_ros2/controller_mode_cmd', 10)
+
+        # Create QoS profile with TransientLocal for controller mode command
+        # This ensures late-joining subscribers (like MPC node) receive the last command
+        controller_mode_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.BEST_EFFORT
+        )
+        self.controller_mode_pub = self.create_publisher(
+            String, '/uav_0/fsc_autopilot_ros2/controller_mode_cmd', controller_mode_qos)
         
         self.position_com_pub = self.create_publisher(
             PositionControllerReference, '/uav_0/fsc_autopilot_ros2/position_controller/reference', 10)
@@ -218,24 +227,15 @@ class SingleDroneRosNode(Node, QObject):
     def controller_mode_callback(self, msg):
         """Callback for actual controller mode from autopilot (std_msgs/String)
 
-        msg.data = "Baseline" or "MPC"
+        msg.data = "baseline" or "mpc" (lowercase)
         This provides ground truth of which controller is actually active in the autopilot.
         """
         actual_mode = msg.data
         self.data_struct.update_controller_mode(actual_mode)
 
-        # Detect mode mismatch (GUI thinks one thing, autopilot doing another)
-        expected_baseline = self.data_struct.controller_status.baseline_mode
-        actual_baseline = (actual_mode == "baseline")
-
-        if expected_baseline != actual_baseline:
-            self.get_logger().warn(
-                f"Controller mode mismatch! GUI expected: {'Baseline' if expected_baseline else 'MPC'}, "
-                f"Autopilot actual: {actual_mode}"
-            )
-            # Sync GUI state to match reality
-            self.data_struct.controller_status.baseline_mode = actual_baseline
-            self.get_logger().info(f"GUI state synchronized to match autopilot: {actual_mode}")
+        # Note: Do NOT automatically sync GUI state to autopilot here.
+        # The autopilot will eventually converge to the GUI's commanded state.
+        # Syncing here causes oscillation when commands are in flight.
 
     ### define publish functions to ros topics ###
     def publish_coordinates(self, x, y, z, yaw):
@@ -290,9 +290,10 @@ class SingleDroneRosNode(Node, QObject):
     def publish_controller_mode(self, is_baseline):
         msg = String()
         if is_baseline:
-            msg.data = "Baseline"
+            msg.data = "baseline"
         else:
-            msg.data = "MPC"
+            msg.data = "mpc"
+        self.get_logger().info(f"Publishing controller mode command: {msg.data}")
         self.controller_mode_pub.publish(msg)
 
     # Timer callback for main loop
@@ -308,6 +309,7 @@ class SingleDroneRosNode(Node, QObject):
             # Auto-switch to baseline if heartbeat times out
             if not self.data_struct.controller_status.baseline_mode:
                 self.data_struct.controller_status.baseline_mode = True
+                self.publish_controller_mode(True)  # Publish baseline mode command
                 self.get_logger().warn("Auto-switching to BASELINE due to heartbeat timeout")
 
         # Check for solver status timeout (MPC solver runs at control loop rate, timeout after 1 second)
@@ -319,11 +321,10 @@ class SingleDroneRosNode(Node, QObject):
             # Auto-switch to baseline if solver times out
             if not self.data_struct.controller_status.baseline_mode:
                 self.data_struct.controller_status.baseline_mode = True
+                self.publish_controller_mode(True)  # Publish baseline mode command
                 self.get_logger().warn("Auto-switching to BASELINE due to solver timeout")
 
         self.update_data.emit(0)
-        # Continuously publish controller mode
-        self.publish_controller_mode(self.data_struct.controller_status.baseline_mode)
     
     # main loop of ros node (for compatibility with thread)
     def run(self):
@@ -490,8 +491,9 @@ class SingleDroneRosThread:
 
         # Update Controller Mode display using actual mode from autopilot
         if controller_status_msg.actual_controller_mode is not None:
-            # Use ground truth from autopilot
-            self.ui.ControllerMode.setText(f"Controller: {controller_status_msg.actual_controller_mode}")
+            # Use ground truth from autopilot, capitalize for display
+            mode_display = controller_status_msg.actual_controller_mode.upper() if controller_status_msg.actual_controller_mode == "mpc" else controller_status_msg.actual_controller_mode.capitalize()
+            self.ui.ControllerMode.setText(f"Controller: {mode_display}")
         else:
             # Fallback to GUI state if topic not received yet
             if controller_status_msg.baseline_mode:
@@ -536,28 +538,27 @@ class SingleDroneRosThread:
             self.log_message("Current controller is baseline, switching failed")
         else:
             self.ros_object.data_struct.controller_status.baseline_mode = True
+            self.ros_object.publish_controller_mode(True)  # Publish baseline mode
             self.log_message("Switching controller mode: BASELINE")
             # hold position after switching
             self.hold()
         
 
     def switch_mpc(self):
-        # Check if MPC is available before switching
+        # Check if MPC node is running (not necessarily active yet)
         controller_status = self.ros_object.data_struct.controller_status
 
         if not controller_status.heartbeat_ever_received:
             self.log_message("MPC switch failed - MPC node not started")
         elif controller_status.heartbeat_timeout:
             self.log_message("MPC switch failed - MPC node timeout")
-        elif not controller_status.mpc_active:
-            # MPC not fully activated
-            self.log_message("MPC switch failed - MPC not fully activated")
         elif controller_status.baseline_mode is False:
             # Already in MPC mode
             self.log_message("Already in MPC mode")
         else:
             # Switch to MPC mode
             self.ros_object.data_struct.controller_status.baseline_mode = False
+            self.ros_object.publish_controller_mode(False)  # Publish MPC mode
             self.log_message("Switching controller mode: MPC")
 
             # hold position after switching
