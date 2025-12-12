@@ -78,7 +78,7 @@ class SingleDroneRosNode(Node, QObject):
         self.commanded_bodyrate_callback = self.create_subscription(VehicleRatesSetpoint, '/uav_0/fmu/in/vehicle_rates_setpoint', self.commanded_bodyrate_callback, self.px4_input_qos_profile)
         self.estimator_type_sub = self.create_subscription(Bool, '/estimator_type', self.estimator_type_callback, 10)
         self.mpc_heartbeat_sub = self.create_subscription(Bool, '/uav_0/fsc_autopilot_ros2/mpc/heartbeat', self.mpc_heartbeat_callback, 10)
-        self.mpc_solver_res_sub = self.create_subscription(VehicleRatesSetpoint, '/uav_0/fsc_autopilot_ros2/mpc/solver_res', self.mpc_solver_res_callback, 10)
+        self.mpc_solver_res_sub = self.create_subscription(VehicleRatesSetpoint, '/uav_0/fsc_autopilot_ros2/mpc/rate_setpoint', self.mpc_solver_res_callback, 10)
         self.mpc_solver_status_sub = self.create_subscription(Int32, '/uav_0/fsc_autopilot_ros2/mpc/solver_status', self.mpc_solver_status_callback, 10)
         self.controller_mode_sub = self.create_subscription(String, '/uav_0/fsc_autopilot_ros2/controller_mode', self.controller_mode_callback, 10)
         # Define publishers / services
