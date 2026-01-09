@@ -48,11 +48,15 @@ class CommonData(): # store the data from the ROS nodes
         # water sampling
         self.encoder_raw = ros_common.Vector3()
         self.payload_pos = ros_common.Vector3()
+        self.payload_vel = ros_common.Vector3()
+        self.payload_orientation = ros_common.Euler()
 
         self.lock = QMutex()
 
     def update_imu(self, x, y, z, w):
-        euler = self.quat_to_euler(x, y, z, w)
+        # NED to ENU conversion
+        quat_enu = self.ned_to_enu(x, y, z, w)
+        euler = self.quat_to_euler(quat_enu[0], quat_enu[1], quat_enu[2], quat_enu[3])
     
         if not self.lock.tryLock():
             return
@@ -61,7 +65,7 @@ class CommonData(): # store the data from the ROS nodes
         self.current_imu.yaw = euler[2]
         self.lock.unlock()
         return
-  
+    
     def update_global_pos(self, latitude, longitude, altitude):
         if not self.lock.tryLock():
             return
@@ -150,8 +154,7 @@ class CommonData(): # store the data from the ROS nodes
         return
     
     def quat_to_euler(self, x, y, z, w):
-        # NED to ENU conversion
-        quat_enu = self.ned_to_enu(x, y, z, w)
+        quat_enu = [x, y, z, w]
         nrm = abs(sum(q**2 for q in quat_enu) - 1.0)
         quat = [0, 0, 0, 1] if nrm > 1e-5 else quat_enu
 
@@ -285,7 +288,26 @@ class CommonData(): # store the data from the ROS nodes
         self.payload_pos.z = z
         self.lock.unlock()
         return
-        
+    
+    def update_payload_vel(self, vx, vy, vz):
+        if not self.lock.tryLock():
+            return
+        self.payload_vel.x = vx
+        self.payload_vel.y = vy
+        self.payload_vel.z = vz
+        self.lock.unlock()
+        return    
+    
+    def update_payload_orientation(self, x, y, z, w):
+        euler = self.quat_to_euler(x, y, z, w)
+    
+        if not self.lock.tryLock():
+            return
+        self.payload_orientation.roll = euler[0]
+        self.payload_orientation.pitch = euler[1]
+        self.payload_orientation.yaw = euler[2]
+        self.lock.unlock()
+        return
     
     def decode_mode(self, mode):
         mode_dict = {

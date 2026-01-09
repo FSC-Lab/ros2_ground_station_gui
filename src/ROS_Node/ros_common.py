@@ -28,6 +28,12 @@ class IMUinfo:
         self.pitch = y
         self.yaw = z
 
+class Euler:
+    def __init__(self, x=0, y=0, z=0) -> None:
+        self.roll = x
+        self.pitch = y
+        self.yaw = z
+
 class GlobalPositionInfo:
     def __init__(self, latitude=0, longitude=0, altitude=0) -> None:
         self.latitude = latitude

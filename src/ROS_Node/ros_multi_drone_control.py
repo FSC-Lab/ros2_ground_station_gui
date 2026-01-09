@@ -31,8 +31,9 @@ from PyQt5.QtWidgets import QMessageBox
 import Common
 from geometry_msgs.msg import Point
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
-from px4_msgs.msg import VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus,VehicleRatesSetpoint
+from px4_msgs.msg import VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus, VehicleRatesSetpoint
 from fsc_autopilot_ros2_msgs.msg import PositionControllerReference
+from fsc_autopilot_ros2_msgs.msg import Mocap
 
 # from mavros_msgs.msg import State, AttitudeTarget
 from visualization_msgs.msg import Marker
@@ -42,10 +43,12 @@ import json
 # from fsc_autopilot_msgs.msg import TrackingReference
 from std_msgs.msg import Bool
 import functools
+import math
+import numpy as np
 
 class MultiDroneRosNode(Node, QObject):
     ## define signals
-    update_data = pyqtSignal(int)
+    update_data = pyqtSignal(str, int)
 
     def __init__(self, drone_ids=[0]):
         Node.__init__(self, 'multi_drone_gui_node')
@@ -54,7 +57,10 @@ class MultiDroneRosNode(Node, QObject):
         # store list of drone ids (ints)
         self.drone_ids = list(drone_ids)
         # per-drone data structs
-        self.data_structs = {i: Common.CommonData() for i in self.drone_ids}
+        self.data_structs = {
+            "uav": {i: Common.CommonData() for i in self.drone_ids},
+            "payload": {0: Common.CommonData()}
+        }
         
         # Define QoS profile for PX4 topics (best effort reliability)
         self.px4_qos_profile = QoSProfile(
@@ -155,7 +161,13 @@ class MultiDroneRosNode(Node, QObject):
             self.ccm_activated_callback,
             10
         )
-
+        
+        self.payload_mocap_sub = self.create_subscription(
+            Mocap,
+            '/payload/mocap',
+            self.payload_mocap_callback,
+            10
+        )
 
         self.set_home_override_service = self.create_client(Empty, 'state_estimator/override_set_home')
         # self.set_home_service = self.create_client(CommandHome, 'mavros/cmd/set_home')
@@ -175,6 +187,28 @@ class MultiDroneRosNode(Node, QObject):
             self.config[1] = geofence['y']
             self.config[2] = geofence['z']
         
+        with open('src/ROS_Node/slung_load.json') as sl:
+            slung_load = json.load(sl)
+            l = float(slung_load['l'])
+            theta_xy = math.radians(float(slung_load['theta_xy']))
+            theta_z = math.radians(float(slung_load['theta_z']))
+            px = float(slung_load['px'])  # payload initial position
+            py = float(slung_load['py'])  # payload initial position
+            pz = float(slung_load['pz'])  # payload initial position
+            takeoff_height = float(slung_load['takeoff_height'])
+            self.p_init = np.array([px, py, pz])
+            r0 = np.array([l*math.sin(theta_z), 0.])  # Cable 2D position
+            r1 = np.array([-l*math.sin(theta_xy)*math.sin(theta_z), l*math.sin(theta_z)*math.cos(theta_xy)])  # Cable 2D position
+            r2 = np.array([-l*math.sin(theta_xy)*math.sin(theta_z), -l*math.sin(theta_z)*math.cos(theta_xy)])  # Cable 2D position
+            self.uav_0_init_pos = np.array([0., 0., 0.])
+            self.uav_1_init_pos = np.array([0., 0., 0.])
+            self.uav_2_init_pos = np.array([0., 0., 0.])
+            self.uav_0_init_pos = np.append(r0, np.sqrt(l**2 - np.linalg.norm(r0))) + self.p_init
+            self.uav_1_init_pos = np.append(r1, np.sqrt(l**2 - np.linalg.norm(r1))) + self.p_init
+            self.uav_2_init_pos = np.append(r2, np.sqrt(l**2 - np.linalg.norm(r2))) + self.p_init
+            self.takeoff_height = takeoff_height
+
+        
     ### define signal connections to / from gui ###
     def connect_update_gui(self, callback):
         self.update_data.connect(callback)
@@ -183,32 +217,32 @@ class MultiDroneRosNode(Node, QObject):
     def imu_callback(self, drone_id, msg):
         # get orientation and convert to euler angles
         # note that uses PX4 [w, x, y, z] 
-        self.data_structs[drone_id].update_imu(msg.q[1], msg.q[2], msg.q[3], msg.q[0])
+        self.data_structs["uav"][drone_id].update_imu(msg.q[1], msg.q[2], msg.q[3], msg.q[0])
 
     def pos_global_callback(self, drone_id, msg):
-        self.data_structs[drone_id].update_global_pos(msg.lat, msg.lon, msg.alt)
+        self.data_structs["uav"][drone_id].update_global_pos(msg.lat, msg.lon, msg.alt)
 
     def pos_local_callback(self, drone_id, msg):
-        self.data_structs[drone_id].update_local_pos(msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z)
+        self.data_structs["uav"][drone_id].update_local_pos(msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z)
 
     def vel_callback(self, drone_id, msg):
-        self.data_structs[drone_id].update_vel(msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z)
+        self.data_structs["uav"][drone_id].update_vel(msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z)
 
     def bat_callback(self, drone_id, msg):
-        self.data_structs[drone_id].update_bat(msg.remaining, msg.voltage_v)
+        self.data_structs["uav"][drone_id].update_bat(msg.remaining, msg.voltage_v)
 
     def status_callback(self, drone_id, msg):
-        self.data_structs[drone_id].update_state(msg.pre_flight_checks_pass, msg.arming_state, msg.nav_state, (msg.timestamp - msg.armed_time))
+        self.data_structs["uav"][drone_id].update_state(msg.pre_flight_checks_pass, msg.arming_state, msg.nav_state, (msg.timestamp - msg.armed_time))
 
     def commanded_attitude_callback(self, drone_id, msg):
         # the attitude setpoint received from px4 
-        self.data_structs[drone_id].update_attitude_target(msg.q_d[1], msg.q_d[2], msg.q_d[3], msg.q_d[0], msg.thrust_body[2])
+        self.data_structs["uav"][drone_id].update_attitude_target(msg.q_d[1], msg.q_d[2], msg.q_d[3], msg.q_d[0], msg.thrust_body[2])
 
     def commanded_bodyrate_callback(self, drone_id, msg):
-        self.data_structs[drone_id].update_body_rate_target(msg.roll, msg.pitch, msg.yaw, msg.thrust_body[2])
+        self.data_structs["uav"][drone_id].update_body_rate_target(msg.roll, msg.pitch, msg.yaw, msg.thrust_body[2])
 
     def estimator_type_callback(self, drone_id, msg):
-        self.data_structs[drone_id].update_estimator_type(msg.data)
+        self.data_structs["uav"][drone_id].update_estimator_type(msg.data)
 
     def publish_coordinates(self, drone_id, x, y, z, yaw=0.0):
         msg = PositionControllerReference()
@@ -238,6 +272,13 @@ class MultiDroneRosNode(Node, QObject):
     def ccm_activated_callback(self, msg):
         self.CCM_active = msg.data
 
+    def payload_mocap_callback(self, msg):
+        ds = self.data_structs["payload"][0]
+        ds.update_payload_pos(msg.pose.position.x, msg.pose.position.y, msg.pose.position.z)
+        ds.update_payload_vel(msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z)
+        ds.update_payload_orientation(msg.pose.orientation.q[0], msg.pose.orientation.q[1], msg.pose.orientation.q[2], msg.pose.orientation.q[3])
+
+    
     def publish_geofence(self, drone_id, x, y, z):
         marker = Marker()
         marker.header.frame_id = "map"
@@ -268,7 +309,8 @@ class MultiDroneRosNode(Node, QObject):
     # timer emits update for every drone
     def timer_callback(self):
         for i in self.drone_ids:
-            self.update_data.emit(i)
+            self.update_data.emit("uav", i)
+        self.update_data.emit("payload", 0)
     
     # main loop of ros node (for compatibility with thread)
     def run(self):
@@ -347,6 +389,14 @@ class MultiDroneRosThread:
         # self.ui.SendPositionUAV.clicked.connect(self.send_coordinates)       
         # self.ui.GetCurrentPositionUAV.clicked.connect(self.get_coordinates)
 
+        multi_drone_takeoff_btn = getattr(self.ui, "MultiDroneTakeoff", None)
+        if multi_drone_takeoff_btn:
+            multi_drone_takeoff_btn.clicked.connect(self.multi_drone_takeoff)
+
+        multi_drone_init_btn = getattr(self.ui, "MultiDroneInitPos", None)
+        if multi_drone_init_btn:
+            multi_drone_init_btn.clicked.connect(self.multi_drone_init_pos)
+
         self.ui.ARM.clicked.connect(lambda: self.send_arming_request(True, 0))
         self.ui.DISARM.clicked.connect(lambda: self.send_arming_request(False, 0))
         self.ui.Takeoff.clicked.connect(lambda: self.send_takeoff_request(float(self.ui.TakeoffHeight.text())))
@@ -358,8 +408,15 @@ class MultiDroneRosThread:
         self.ui.HOLD.clicked.connect(self.hold)
 
     # update GUI data
-    def update_gui_data(self, drone_id):
-        ds = self.ros_object.data_structs.get(drone_id)
+    def update_gui_data(self, obj_type, obj_id):
+        if obj_type == "uav":
+            self.update_gui_data_uav(obj_id)
+        elif obj_type == "payload":
+            self.update_gui_data_payload(obj_id)
+
+    # Update GUI data for UAV
+    def update_gui_data_uav(self, drone_id):
+        ds = self.ros_object.data_structs["uav"].get(drone_id)
         if ds is None:
             return
         lock = ds.lock
@@ -499,7 +556,45 @@ class MultiDroneRosThread:
             self.ui.StateCCM_UAV0.setText("Active" if self.ros_object.CCM_active else "Inactive")
             self.ui.StateCCM_UAV0.setStyleSheet("color: green" if self.ros_object.CCM_active else "color: red")
 
+    # Update GUI data for payload
+    def update_gui_data_payload(self, payload_id = 0):
+        ds = self.ros_object.data_structs["payload"].get(payload_id)
+        if ds is None:
+            return
+        lock = ds.lock
+        if not lock.tryLock():
+            print("MultiDroneRosThread: lock failed")
+            return
+        
+        pos = ds.payload_pos
+        vel = ds.payload_vel
+        ori = ds.payload_orientation
+        lock.unlock()
 
+        # payload relative position data
+        if hasattr(self.ui, "RelX_DISP_PAY"):
+            self.ui.RelX_DISP_PAY.display("{:.2f}".format(getattr(pos, "x", 0.0)))
+        if hasattr(self.ui, "RelY_DISP_PAY"):
+            self.ui.RelY_DISP_PAY.display("{:.2f}".format(getattr(pos, "y", 0.0)))
+        if hasattr(self.ui, "AGL_DISP_PAY"):
+            self.ui.AGL_DISP_PAY.display("{:.2f}".format(getattr(pos, "z", 0.0)))
+
+        # payload velocity data
+        if hasattr(self.ui, "U_Vel_DISP_PAY"):
+            self.ui.U_Vel_DISP_PAY.display("{:.2f}".format(getattr(vel, "x", 0.0)))
+        if hasattr(self.ui, "V_Vel_DISP_PAY"):
+            self.ui.V_Vel_DISP_PAY.display("{:.2f}".format(getattr(vel, "y", 0.0)))
+        if hasattr(self.ui, "W_Vel_DISP_PAY"):
+            self.ui.W_Vel_DISP_PAY.display("{:.2f}".format(getattr(vel, "z", 0.0)))
+
+        # orientation data
+        if hasattr(self.ui, "X_DISP_PAY"):
+            self.ui.X_DISP_PAY.display("{:.2f}".format(getattr(ori, "roll", 0.0)))
+        if hasattr(self.ui, "Y_DISP_PAY"):
+            self.ui.Y_DISP_PAY.display("{:.2f}".format(getattr(ori, "pitch", 0.0)))
+        if hasattr(self.ui, "Z_DISP_PAY"):
+            self.ui.Z_DISP_PAY.display("{:.2f}".format(getattr(ori, "yaw", 0.0)))
+        
     ### callback functions for modifying GUI elements ###
     def toggle_simulation_mode(self, state):
         if state == 2:
@@ -575,7 +670,7 @@ class MultiDroneRosThread:
 
     # get current relative position
     def get_coordinates(self, drone_id):
-        ds = self.ros_object.data_structs.get(drone_id)
+        ds = self.ros_object.data_structs["uav"].get(drone_id)
         if ds is None:
             return
         lock = ds.lock
@@ -596,6 +691,32 @@ class MultiDroneRosThread:
         S("ZPositionUAV", getattr(local, "z", 0.0))
         S("YAWUAV", getattr(imu, "yaw", 0.0))
 
+    # multi-drone slung payload takeoff
+    def multi_drone_takeoff(self):
+        yaw = 0.0
+        u0 = self.ros_object.uav_0_init_pos
+        u1 = self.ros_object.uav_1_init_pos
+        u2 = self.ros_object.uav_2_init_pos
+        th = self.ros_object.takeoff_height
+
+        if th < u0[2]-self.ros_object.p_init[2]:
+            self.ros_object.publish_coordinates(0, u0[0], u0[1], th, yaw)
+            self.ros_object.publish_coordinates(1, u1[0], u1[1], th, yaw)
+            self.ros_object.publish_coordinates(2, u2[0], u2[1], th, yaw)
+            self.log_message(f"Multi-drone takeoff command sent, takeoff to {th}m.")
+        else:
+            self.log_message(f"Takeoff refused, takeoff height of {th} too large.")
+
+    # multi-drone slung payload go to initial position
+    def multi_drone_init_pos(self):
+        yaw = 0.0
+        u0 = self.ros_object.uav_0_init_pos
+        u1 = self.ros_object.uav_1_init_pos
+        u2 = self.ros_object.uav_2_init_pos
+        self.ros_object.publish_coordinates(0, u0[0], u0[1], u0[2], yaw)
+        self.ros_object.publish_coordinates(1, u1[0], u1[1], u1[2], yaw)
+        self.ros_object.publish_coordinates(2, u2[0], u2[1], u2[2], yaw)
+        
     ### define publish / service functions to ros topics ###
     def send_arming_request(self, arm, param2):
         # if self.ros_object.arming_service.wait_for_service(timeout_sec=1.0):

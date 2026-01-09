@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>1522</width>
+    <width>1802</width>
     <height>865</height>
    </rect>
   </property>
@@ -2059,7 +2059,7 @@
      <rect>
       <x>30</x>
       <y>20</y>
-      <width>601</width>
+      <width>651</width>
       <height>61</height>
      </rect>
     </property>
@@ -2071,7 +2071,7 @@
      </font>
     </property>
     <property name="text">
-     <string>Offboard Control (3 drone)</string>
+     <string>Offboard Control (3 drones with payload)</string>
     </property>
    </widget>
    <widget class="QWidget" name="verticalLayoutWidget_34">
@@ -3556,11 +3556,17 @@
    <widget class="QPushButton" name="CCMFlag_UAV0">
     <property name="geometry">
      <rect>
-      <x>360</x>
-      <y>570</y>
+      <x>1530</x>
+      <y>630</y>
       <width>111</width>
-      <height>71</height>
+      <height>131</height>
      </rect>
+    </property>
+    <property name="autoFillBackground">
+     <bool>false</bool>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">color: green</string>
     </property>
     <property name="text">
      <string>CCM Flight</string>
@@ -3569,11 +3575,14 @@
    <widget class="QPushButton" name="ENUFlag_UAV0">
     <property name="geometry">
      <rect>
-      <x>360</x>
-      <y>650</y>
+      <x>1660</x>
+      <y>630</y>
       <width>111</width>
-      <height>71</height>
+      <height>131</height>
      </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">color: red</string>
     </property>
     <property name="text">
      <string>Back to ENU</string>
@@ -3583,9 +3592,9 @@
     <property name="geometry">
      <rect>
       <x>360</x>
-      <y>530</y>
+      <y>600</y>
       <width>111</width>
-      <height>31</height>
+      <height>51</height>
      </rect>
     </property>
     <property name="font">
@@ -3613,9 +3622,9 @@
     <property name="geometry">
      <rect>
       <x>860</x>
-      <y>530</y>
+      <y>600</y>
       <width>111</width>
-      <height>31</height>
+      <height>51</height>
      </rect>
     </property>
     <property name="font">
@@ -3643,9 +3652,9 @@
     <property name="geometry">
      <rect>
       <x>1360</x>
-      <y>530</y>
+      <y>600</y>
       <width>111</width>
-      <height>31</height>
+      <height>51</height>
      </rect>
     </property>
     <property name="font">
@@ -3667,6 +3676,215 @@
     </property>
     <property name="alignment">
      <set>Qt::AlignCenter</set>
+    </property>
+   </widget>
+   <widget class="Line" name="line_4">
+    <property name="geometry">
+     <rect>
+      <x>1490</x>
+      <y>100</y>
+      <width>20</width>
+      <height>671</height>
+     </rect>
+    </property>
+    <property name="lineWidth">
+     <number>2</number>
+    </property>
+    <property name="orientation">
+     <enum>Qt::Vertical</enum>
+    </property>
+   </widget>
+   <widget class="QWidget" name="verticalLayoutWidget_80">
+    <property name="geometry">
+     <rect>
+      <x>1530</x>
+      <y>140</y>
+      <width>121</width>
+      <height>191</height>
+     </rect>
+    </property>
+    <layout class="QVBoxLayout" name="GPSDataLayout_51">
+     <item>
+      <widget class="QLabel" name="GPSLabel_41">
+       <property name="text">
+        <string>Rel. Pos.</string>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignBottom|Qt::AlignHCenter</set>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="GPSHLayout_24">
+       <item>
+        <widget class="QLabel" name="LatLabel_12">
+         <property name="text">
+          <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p align=&quot;center&quot;&gt;X Y Alt.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <widget class="QLCDNumber" name="RelX_DISP_PAY"/>
+     </item>
+     <item>
+      <widget class="QLCDNumber" name="RelY_DISP_PAY"/>
+     </item>
+     <item>
+      <widget class="QLCDNumber" name="AGL_DISP_PAY"/>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QWidget" name="verticalLayoutWidget_81">
+    <property name="geometry">
+     <rect>
+      <x>1530</x>
+      <y>340</y>
+      <width>241</width>
+      <height>121</height>
+     </rect>
+    </property>
+    <layout class="QVBoxLayout" name="IMULayout_9">
+     <item>
+      <widget class="QLabel" name="IMULabel_9">
+       <property name="text">
+        <string>Orientation (deg)</string>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignBottom|Qt::AlignHCenter</set>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="IMUHLayout_9">
+       <item>
+        <widget class="QLabel" name="XLabel0_9">
+         <property name="text">
+          <string>Roll</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="YLabel0_9">
+         <property name="text">
+          <string>Pitch</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="ZLabel0_9">
+         <property name="text">
+          <string>Yaw</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="IMU_DISP_9">
+       <item>
+        <widget class="QLCDNumber" name="X_DISP_PAY"/>
+       </item>
+       <item>
+        <widget class="QLCDNumber" name="Y_DISP_PAY"/>
+       </item>
+       <item>
+        <widget class="QLCDNumber" name="Z_DISP_PAY">
+         <property name="digitCount">
+          <number>6</number>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QWidget" name="verticalLayoutWidget_85">
+    <property name="geometry">
+     <rect>
+      <x>1660</x>
+      <y>140</y>
+      <width>111</width>
+      <height>191</height>
+     </rect>
+    </property>
+    <layout class="QVBoxLayout" name="VelVLayout_9">
+     <item>
+      <widget class="QLabel" name="VelLabel_9">
+       <property name="text">
+        <string>Velocity</string>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignBottom|Qt::AlignHCenter</set>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="VelHLabel_9">
+       <item>
+        <widget class="QLabel" name="U_VEL_Label_9">
+         <property name="text">
+          <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p align=&quot;center&quot;&gt;U V W&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <widget class="QLCDNumber" name="U_Vel_DISP_PAY"/>
+     </item>
+     <item>
+      <widget class="QLCDNumber" name="V_Vel_DISP_PAY"/>
+     </item>
+     <item>
+      <widget class="QLCDNumber" name="W_Vel_DISP_PAY"/>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QLabel" name="label_7">
+    <property name="geometry">
+     <rect>
+      <x>1590</x>
+      <y>90</y>
+      <width>121</width>
+      <height>51</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p align=&quot;center&quot;&gt;&lt;span style=&quot; font-size:20pt; font-weight:600;&quot;&gt;Payload&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+    </property>
+   </widget>
+   <widget class="QPushButton" name="MultiDroneTakeoff">
+    <property name="geometry">
+     <rect>
+      <x>1530</x>
+      <y>490</y>
+      <width>241</width>
+      <height>61</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>Multi-drone Takeoff</string>
+    </property>
+    <property name="shortcut">
+     <string>Return</string>
+    </property>
+   </widget>
+   <widget class="QPushButton" name="MultiDroneInitPos">
+    <property name="geometry">
+     <rect>
+      <x>1530</x>
+      <y>560</y>
+      <width>241</width>
+      <height>61</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>Go To Init. Pos.</string>
+    </property>
+    <property name="shortcut">
+     <string>Return</string>
     </property>
    </widget>
   </widget>
