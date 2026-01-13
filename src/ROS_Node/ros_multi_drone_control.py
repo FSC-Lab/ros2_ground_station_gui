@@ -144,15 +144,15 @@ class MultiDroneRosNode(Node, QObject):
         
         # Create pub/sub on CCM and ENU flags, and CCM status
         self.flag = False
-        self.CCM_flag_pubs = self.create_publisher(Bool, f'/uav_0/ground_station/CCM_flag', 10)
+        self.CCM_flag_pub = self.create_publisher(Bool, f'/uav_0/ground_station/CCM_flag', 10)
         msg = Bool()
         msg.data = False
-        self.CCM_flag_pubs.publish(msg)
+        self.CCM_flag_pub.publish(msg)
 
-        self.ENU_flag_pubs = self.create_publisher(Bool, f'/uav_0/ground_station/ENU_flag', 10)
+        self.ENU_flag_pub = self.create_publisher(Bool, f'/uav_0/ground_station/ENU_flag', 10)
         msg = Bool()
         msg.data = False
-        self.ENU_flag_pubs.publish(msg)
+        self.ENU_flag_pub.publish(msg)
         
         self.CCM_active = False
         self.CCM_status_sub = self.create_subscription(
@@ -260,13 +260,13 @@ class MultiDroneRosNode(Node, QObject):
     def publish_CCM_Flag(self, flag):
         msg = Bool()
         msg.data = flag
-        self.CCM_flag_pubs.publish(msg)
+        self.CCM_flag_pub.publish(msg)
         self.get_logger().info(f"Publishing CCM Flag: {flag}")
 
     def publish_ENU_Flag(self, flag):
         msg = Bool()
         msg.data = flag
-        self.ENU_flag_pubs.publish(msg)
+        self.ENU_flag_pub.publish(msg)
         self.get_logger().info(f"Publishing ENU Flag: {flag}")
 
     def ccm_activated_callback(self, msg):
@@ -276,7 +276,7 @@ class MultiDroneRosNode(Node, QObject):
         ds = self.data_structs["payload"][0]
         ds.update_payload_pos(msg.pose.position.x, msg.pose.position.y, msg.pose.position.z)
         ds.update_payload_vel(msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z)
-        ds.update_payload_orientation(msg.pose.orientation.q[0], msg.pose.orientation.q[1], msg.pose.orientation.q[2], msg.pose.orientation.q[3])
+        ds.update_payload_orientation(msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w)
 
     
     def publish_geofence(self, drone_id, x, y, z):
