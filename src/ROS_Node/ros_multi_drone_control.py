@@ -97,16 +97,10 @@ class MultiDroneRosNode(Node, QObject):
                 functools.partial(self.pos_global_callback, i),
                 self.px4_qos_profile
             )
-            self.drone_subscriptions[i]['pos_local'] = self.create_subscription(
+            self.drone_subscriptions[i]['odom'] = self.create_subscription(
                 Odometry,
                 f'/uav_{i}/state_estimator/local_position/odom',
-                functools.partial(self.pos_local_callback, i),
-                10
-            )
-            self.drone_subscriptions[i]['vel'] = self.create_subscription(
-                Odometry,
-                f'/uav_{i}/state_estimator/local_position/odom',
-                functools.partial(self.vel_callback, i),
+                functools.partial(self.odom_callback, i),
                 10
             )
             self.drone_subscriptions[i]['bat'] = self.create_subscription(
@@ -200,12 +194,9 @@ class MultiDroneRosNode(Node, QObject):
             r0 = np.array([l*math.sin(theta_z), 0.])  # Cable 2D position
             r1 = np.array([-l*math.sin(theta_xy)*math.sin(theta_z), l*math.sin(theta_z)*math.cos(theta_xy)])  # Cable 2D position
             r2 = np.array([-l*math.sin(theta_xy)*math.sin(theta_z), -l*math.sin(theta_z)*math.cos(theta_xy)])  # Cable 2D position
-            self.uav_0_init_pos = np.array([0., 0., 0.])
-            self.uav_1_init_pos = np.array([0., 0., 0.])
-            self.uav_2_init_pos = np.array([0., 0., 0.])
-            self.uav_0_init_pos = np.append(r0, np.sqrt(l**2 - np.linalg.norm(r0))) + self.p_init
-            self.uav_1_init_pos = np.append(r1, np.sqrt(l**2 - np.linalg.norm(r1))) + self.p_init
-            self.uav_2_init_pos = np.append(r2, np.sqrt(l**2 - np.linalg.norm(r2))) + self.p_init
+            self.uav_0_init_pos = np.append(r0, np.sqrt(l**2 - np.linalg.norm(r0)**2)) + self.p_init
+            self.uav_1_init_pos = np.append(r1, np.sqrt(l**2 - np.linalg.norm(r1)**2)) + self.p_init
+            self.uav_2_init_pos = np.append(r2, np.sqrt(l**2 - np.linalg.norm(r2)**2)) + self.p_init
             self.takeoff_height = takeoff_height
 
         
@@ -222,11 +213,10 @@ class MultiDroneRosNode(Node, QObject):
     def pos_global_callback(self, drone_id, msg):
         self.data_structs["uav"][drone_id].update_global_pos(msg.lat, msg.lon, msg.alt)
 
-    def pos_local_callback(self, drone_id, msg):
-        self.data_structs["uav"][drone_id].update_local_pos(msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z)
-
-    def vel_callback(self, drone_id, msg):
-        self.data_structs["uav"][drone_id].update_vel(msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z)
+    def odom_callback(self, drone_id, msg):
+        ds = self.data_structs["uav"][drone_id]
+        ds.update_local_pos(msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z)
+        ds.update_vel(msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z)
 
     def bat_callback(self, drone_id, msg):
         self.data_structs["uav"][drone_id].update_bat(msg.remaining, msg.voltage_v)
@@ -399,7 +389,7 @@ class MultiDroneRosThread:
 
         self.ui.ARM.clicked.connect(lambda: self.send_arming_request(True, 0))
         self.ui.DISARM.clicked.connect(lambda: self.send_arming_request(False, 0))
-        self.ui.Takeoff.clicked.connect(lambda: self.send_takeoff_request(float(self.ui.TakeoffHeight.text())))
+        self.ui.Takeoff.clicked.connect(lambda: self.send_takeoff_request())
         self.ui.Land.clicked.connect(lambda: self.send_land_request())
         self.ui.EmergencyStop.clicked.connect(lambda: self.send_arming_request(False, 21196))
 
@@ -514,35 +504,23 @@ class MultiDroneRosThread:
         # misc data
         batWidget = W("BatInd")
         volt = W("VOLT_DISP")
-        if bat_msg and batWidget:
-            if hasattr(batWidget, "setTextVisible") and batWidget.isTextVisible() == False:
-                batWidget.setTextVisible(True)
-            if hasattr(batWidget, "setValue"):
-                batWidget.setValue(int(float(getattr(bat_msg, "percentage", 0.0))*100))
+        if bat_msg:
+            if batWidget:
+                if hasattr(batWidget, "setTextVisible") and batWidget.isTextVisible() == False:
+                    batWidget.setTextVisible(True)
+                if hasattr(batWidget, "setValue"):
+                    batWidget.setValue(int(float(getattr(bat_msg, "percentage", 0.0))*100))
             if volt:
                 volt.display("{:.2f}".format(getattr(bat_msg, "voltage", 0.0)))
 
-        # update seconds
+        # update armed flight time (state_msg.seconds is elapsed time since arming)
         secW = W("Sec_DISP")
         minW = W("Min_DISP")
         if state_msg and secW:
-            armed_seconds_attr = f'armed_seconds_{drone_id}'
-            last_time_attr = f'last_time_{drone_id}'
-            if not hasattr(self, armed_seconds_attr):
-                setattr(self, armed_seconds_attr, 0)
-            if not hasattr(self, last_time_attr):
-                setattr(self, last_time_attr, state_msg.seconds)
-            armed_seconds = getattr(self, armed_seconds_attr)
-            last_time = getattr(self, last_time_attr)
-            if state_msg.armed:
-                armed_seconds = state_msg.seconds - last_time
-                secW.display("{}".format(armed_seconds))
-                setattr(self, armed_seconds_attr, armed_seconds)
-            else:
-                setattr(self, last_time_attr, state_msg.seconds)
-                setattr(self, armed_seconds_attr, 0)
-            if armed_seconds >= 60 and minW:
-                minW.display("{}".format(int(minW.value() + 1)))
+            armed_seconds = state_msg.seconds if state_msg.armed else 0
+            secW.display("{}".format(armed_seconds % 60))
+            if minW:
+                minW.display("{}".format(armed_seconds // 60))
         
          # update the control mode
         if alttitude_targ_msg.mode == 0:
@@ -656,7 +634,7 @@ class MultiDroneRosThread:
             return
 
         # bounds check
-        if abs(x) > int(self.ros_object.config[0]) or abs(y) > int(self.ros_object.config[1]) or abs(z) > int(self.ros_object.config[2]) or z <= 0:
+        if abs(x) > float(self.ros_object.config[0]) or abs(y) > float(self.ros_object.config[1]) or abs(z) > float(self.ros_object.config[2]) or z <= 0:
             msg = QMessageBox()
             msg.setIcon(QMessageBox.Warning)
             msg.setText("Position is not within geofence or invalid altitude")
@@ -734,12 +712,23 @@ class MultiDroneRosThread:
         self.log_message(f"Arming request: {arm}, param2: {param2}")
         return True
 
-    def send_takeoff_request(self, req_altitude):
-        arm_response = self.send_arming_request(True, 0)
-        # if armed takeoff
-        if arm_response.result == 0:
-            self.ros_object.publish_coordinates(0, 0, req_altitude)
-            self.log_message(f"Takeoff request sent at {req_altitude} meters")
+    def send_takeoff_request(self):
+        try:
+            req_altitude = float(self.ui.TakeoffHeight.text())
+        except ValueError:
+            self.log_message("Invalid takeoff height, make sure it is a number")
+            return
+        if not self.send_arming_request(True, 0):
+            return
+        # take off in place: keep the current horizontal position
+        x = y = 0.0
+        ds = self.ros_object.data_structs["uav"].get(0)
+        if ds is not None and ds.lock.tryLock():
+            x = ds.current_local_pos.x
+            y = ds.current_local_pos.y
+            ds.lock.unlock()
+        self.ros_object.publish_coordinates(0, x, y, req_altitude, 0.0)
+        self.log_message(f"Takeoff request sent at {req_altitude} meters")
 
     def send_land_request(self):
         # if self.ros_object.land_service.wait_for_service(timeout_sec=1.0):
@@ -752,7 +741,14 @@ class MultiDroneRosThread:
         #     print("Land request sent")
         # else:
         #     print("Land service not available")
-        self.ros_object.publish_coordinates(self.ros_object.data_struct.current_local_pos.x, self.ros_object.data_struct.current_local_pos.y, 0, 0)
+        for i in self.drone_ids:
+            ds = self.ros_object.data_structs["uav"].get(i)
+            if ds is None or not ds.lock.tryLock():
+                continue
+            x = ds.current_local_pos.x
+            y = ds.current_local_pos.y
+            ds.lock.unlock()
+            self.ros_object.publish_coordinates(i, x, y, 0.0, 0.0)
         self.log_message("Land request sent")
 
     def switch_mode(self, mode):
@@ -766,6 +762,15 @@ class MultiDroneRosThread:
         self.log_message(f"Mode switch request: {mode}")
 
     def hold(self):
-        self.ros_object.publish_coordinates(self.ros_object.data_struct.current_local_pos.x, self.ros_object.data_struct.current_local_pos.y, 2, self.ros_object.data_struct.current_imu.yaw)
+        for i in self.drone_ids:
+            ds = self.ros_object.data_structs["uav"].get(i)
+            if ds is None or not ds.lock.tryLock():
+                continue
+            x = ds.current_local_pos.x
+            y = ds.current_local_pos.y
+            z = ds.current_local_pos.z
+            yaw = ds.current_imu.yaw
+            ds.lock.unlock()
+            self.ros_object.publish_coordinates(i, x, y, z, yaw)
         self.log_message("Hold position command sent")
 
