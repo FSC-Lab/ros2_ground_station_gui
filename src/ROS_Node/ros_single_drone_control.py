@@ -22,21 +22,33 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 '''
 
+import time
+from collections import deque
+
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from PyQt5.QtCore import QObject, pyqtSignal, QThread, QDateTime
+from PyQt5.QtCore import QObject, pyqtSignal, QThread, QDateTime, QTimer, Qt
 from PyQt5.QtWidgets import QMessageBox
 import Common
 from geometry_msgs.msg import Point
+
+try:
+    import os
+    os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PyQt5')
+    import pyqtgraph as pg
+    _HAS_PYQTGRAPH = True
+except ImportError:
+    _HAS_PYQTGRAPH = False
+
+POSITION_PLOT_HISTORY_S = 10.0  # seconds of history shown in the X/Y/Z/Yaw plot
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
 from px4_msgs.msg import VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus,VehicleRatesSetpoint
 from fsc_autopilot_ros2_msgs.msg import PositionControllerReference
 
 # from mavros_msgs.msg import State, AttitudeTarget
 from visualization_msgs.msg import Marker
-from std_srvs.srv import Empty
 from nav_msgs.msg import Odometry
 import json
 # from fsc_autopilot_msgs.msg import TrackingReference
@@ -83,7 +95,6 @@ class SingleDroneRosNode(Node, QObject):
         self.position_com_pub = self.create_publisher(
             PositionControllerReference, '/uav_0/fsc_autopilot_ros2/position_controller/reference', 10)
 
-        self.set_home_override_service = self.create_client(Empty, 'state_estimator/override_set_home')
         # self.set_home_service = self.create_client(CommandHome, 'mavros/cmd/set_home')
 
         # self.arming_service = self.create_client(CommandLong, 'mavros/cmd/command')
@@ -192,7 +203,7 @@ class SingleDroneRosNode(Node, QObject):
     # main loop of ros node (for compatibility with thread)
     def run(self):
         # Start the timer when the thread begins
-        self.timer = self.create_timer(0.2, self.timer_callback)  # 5 Hz
+        self.timer = self.create_timer(1.0 / 30.0, self.timer_callback)  # 30 Hz
         
         # Use executor to spin in this thread
         executor = SingleThreadedExecutor()
@@ -215,6 +226,25 @@ class SingleDroneRosThread:
         # setup signals
         self.ui = ui
         self.set_ros_callbacks()
+
+        # position/yaw plot data buffers
+        self._plot_t0_pos = None
+        self._plot_t_pos = deque()
+        self._plot_x = deque()
+        self._plot_y = deque()
+        self._plot_z = deque()
+        self._plot_yaw = deque()
+        self._plot_x_cmd = deque()
+        self._plot_y_cmd = deque()
+        self._plot_z_cmd = deque()
+        self._plot_yaw_cmd = deque()
+        # last setpoint actually sent via send_coordinates(); held constant
+        # between sends so the dashed command lines stay flat until updated
+        self._last_x_cmd = 0.0
+        self._last_y_cmd = 0.0
+        self._last_z_cmd = 0.0
+        self._last_yaw_cmd = 0.0
+        self._setup_position_plot()
 
         # Move ROS node to thread and start
         self.ros_object.moveToThread(self.thread)
@@ -239,7 +269,125 @@ class SingleDroneRosThread:
         """Add timestamped message to GUI logging widget"""
         timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
         formatted_message = f"[{timestamp}] {message}"
-        self.ui.Logging.append(formatted_message)
+        self.ui.list_cmd_log.addItem(formatted_message)
+        self.ui.list_cmd_log.scrollToBottom()
+
+    # --- Real-time X/Y/Z position + yaw plot -------------------------------------
+    def _setup_position_plot(self):
+        if not _HAS_PYQTGRAPH:
+            print("[PLOT] pyqtgraph not found - position plot disabled")
+            return
+        try:
+            self._setup_position_plot_impl()
+            print("[PLOT] Position plot setup OK")
+        except Exception as e:
+            import traceback
+            print(f"[PLOT] Position plot setup failed: {e}")
+            traceback.print_exc()
+
+    def _setup_position_plot_impl(self):
+        pg.setConfigOptions(antialias=True)
+
+        # Pin the PlotWidget to the exact pixel bounds of the container widget
+        # (display_x_y_z_yaw in single_drone_flight.ui).
+        container = self.ui.display_x_y_z_yaw
+        self._pos_plot = pg.PlotWidget(parent=container)
+        self._pos_plot.move(0, 0)
+        self._pos_plot.setFixedSize(container.width(), container.height())
+        self._pos_plot.show()
+
+        self._pos_plot.setBackground('w')
+        self._pos_plot.setLabel('bottom', 'Time', units='s')
+        self._pos_plot.setLabel('left', 'Position', units='m')
+        self._pos_plot.showAxis('right')
+        self._pos_plot.setLabel('right', 'Yaw (deg)', color='#AA00AA')
+        self._pos_plot.addLegend(offset=(5, -5))
+        # Push plot content down so the top margin isn't clipped by the container edge
+        self._pos_plot.getPlotItem().layout.setContentsMargins(0, 15, 0, 0)
+
+        # Left axis - X/Y/Z position (m), solid = actual, dashed = commanded
+        dashed = Qt.DashLine
+        self._curve_x = self._pos_plot.plot(pen=pg.mkPen('#CC0000', width=2), name='X (m)')
+        self._curve_y = self._pos_plot.plot(pen=pg.mkPen('#008800', width=2), name='Y (m)')
+        self._curve_z = self._pos_plot.plot(pen=pg.mkPen('#0055AA', width=2), name='Z (m)')
+        self._curve_x_cmd = self._pos_plot.plot(
+            pen=pg.mkPen('#CC0000', width=2, style=dashed), name='X cmd (m)')
+        self._curve_y_cmd = self._pos_plot.plot(
+            pen=pg.mkPen('#008800', width=2, style=dashed), name='Y cmd (m)')
+        self._curve_z_cmd = self._pos_plot.plot(
+            pen=pg.mkPen('#0055AA', width=2, style=dashed), name='Z cmd (m)')
+
+        # Right axis - yaw (deg), separate ViewBox; solid = actual, dashed = commanded
+        self._vb_yaw = pg.ViewBox()
+        self._vb_yaw.invertY(False)  # standalone ViewBox defaults to image coords (Y-down)
+        self._pos_plot.scene().addItem(self._vb_yaw)
+        self._pos_plot.getAxis('right').linkToView(self._vb_yaw)
+        self._vb_yaw.setXLink(self._pos_plot)
+        self._curve_yaw = pg.PlotDataItem(pen=pg.mkPen('#AA00AA', width=2), name='Yaw (deg)')
+        self._curve_yaw_cmd = pg.PlotDataItem(
+            pen=pg.mkPen('#AA00AA', width=2, style=dashed), name='Yaw cmd (deg)')
+        self._vb_yaw.addItem(self._curve_yaw)
+        self._vb_yaw.addItem(self._curve_yaw_cmd)
+        self._vb_yaw.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+        self._vb_yaw.setYRange(-180, 180, padding=0)
+        self._pos_plot.getViewBox().sigResized.connect(self._sync_position_plot_views)
+
+        # Initialise the yaw ViewBox geometry after the event loop starts
+        QTimer.singleShot(0, self._sync_position_plot_views)
+
+    def _sync_position_plot_views(self):
+        self._vb_yaw.setGeometry(self._pos_plot.getViewBox().sceneBoundingRect())
+        self._vb_yaw.linkedViewChanged(self._pos_plot.getViewBox(), self._vb_yaw.XAxis)
+
+    def _append_position_plot(self):
+        if not _HAS_PYQTGRAPH or not hasattr(self, '_curve_x'):
+            return
+        now = time.monotonic()
+        if self._plot_t0_pos is None:
+            self._plot_t0_pos = now
+        t = now - self._plot_t0_pos
+
+        # current_imu.yaw is wrapped to [0, 360) (see Common.quat_to_euler);
+        # the plot's yaw axis is fixed to [-180, 180], so re-wrap to match.
+        yaw = self.imu_msg.yaw
+        if yaw > 180:
+            yaw -= 360
+
+        # Commanded X/Y/Z/Yaw: held constant at the last value actually sent
+        # via send_coordinates() (see self._last_*_cmd), not the live text field.
+        self._plot_t_pos.append(t)
+        self._plot_x.append(self.local_pos_msg.x)
+        self._plot_y.append(self.local_pos_msg.y)
+        self._plot_z.append(self.local_pos_msg.z)
+        self._plot_yaw.append(yaw)
+        self._plot_x_cmd.append(self._last_x_cmd)
+        self._plot_y_cmd.append(self._last_y_cmd)
+        self._plot_z_cmd.append(self._last_z_cmd)
+        self._plot_yaw_cmd.append(self._last_yaw_cmd)
+
+        # Trim samples outside the history window
+        cutoff = t - POSITION_PLOT_HISTORY_S
+        while self._plot_t_pos and self._plot_t_pos[0] < cutoff:
+            self._plot_t_pos.popleft()
+            self._plot_x.popleft()
+            self._plot_y.popleft()
+            self._plot_z.popleft()
+            self._plot_yaw.popleft()
+            self._plot_x_cmd.popleft()
+            self._plot_y_cmd.popleft()
+            self._plot_z_cmd.popleft()
+            self._plot_yaw_cmd.popleft()
+
+        t_list = list(self._plot_t_pos)
+        self._curve_x.setData(t_list, list(self._plot_x))
+        self._curve_y.setData(t_list, list(self._plot_y))
+        self._curve_z.setData(t_list, list(self._plot_z))
+        self._curve_yaw.setData(t_list, list(self._plot_yaw))
+        self._curve_x_cmd.setData(t_list, list(self._plot_x_cmd))
+        self._curve_y_cmd.setData(t_list, list(self._plot_y_cmd))
+        self._curve_z_cmd.setData(t_list, list(self._plot_z_cmd))
+        self._curve_yaw_cmd.setData(t_list, list(self._plot_yaw_cmd))
+        self._pos_plot.setXRange(max(0.0, t - POSITION_PLOT_HISTORY_S), t, padding=0)
 
     # define the signal-slot combination of ros and pyqt GUI
     def set_ros_callbacks(self):
@@ -247,20 +395,8 @@ class SingleDroneRosThread:
         self.ros_object.connect_update_gui(self.update_gui_data)
 
         # callbacks from GUI
-        self.ui.SetHome.clicked.connect(self.send_set_home_request)
-        self.ui.SimulationMode.stateChanged.connect(self.toggle_simulation_mode)
         self.ui.SendPositionUAV.clicked.connect(self.send_coordinates)
         self.ui.GetCurrentPositionUAV.clicked.connect(self.get_coordinates)
-
-        self.ui.ARM.clicked.connect(lambda: self.send_arming_request(True, 0))
-        self.ui.DISARM.clicked.connect(lambda: self.send_arming_request(False, 0))
-        self.ui.Takeoff.clicked.connect(lambda: self.send_takeoff_request(float(self.ui.TakeoffHeight.text())))
-        self.ui.Land.clicked.connect(lambda: self.send_land_request())
-        self.ui.EmergencyStop.clicked.connect(lambda: self.send_arming_request(False, 21196))
-
-        self.ui.OFFBOARD.clicked.connect(lambda: self.switch_mode("OFFBOARD"))
-        self.ui.POSCTL.clicked.connect(lambda: self.switch_mode("POSCTL"))
-        self.ui.HOLD.clicked.connect(self.hold)
 
     # update GUI data
     def update_gui_data(self):
@@ -269,13 +405,10 @@ class SingleDroneRosThread:
             return
         # store to local variables for fast lock release
         self.imu_msg = self.ros_object.data_struct.current_imu
-        self.global_pos_msg = self.ros_object.data_struct.current_global_pos
         self.local_pos_msg = self.ros_object.data_struct.current_local_pos
         vel_msg = self.ros_object.data_struct.current_vel
-        bat_msg = self.ros_object.data_struct.current_battery_status
         state_msg = self.ros_object.data_struct.current_state
         alttitude_targ_msg = self.ros_object.data_struct.current_attitude_target
-        indoor_mode = self.ros_object.data_struct.indoor_mode
         self.lock.unlock()
 
         # accelerometer data
@@ -286,15 +419,17 @@ class SingleDroneRosThread:
         self.ui.TargROLL_DISP.display("{:.2f}".format(alttitude_targ_msg.roll, 2))
         self.ui.TargPITCH_DISP.display("{:.2f}".format(alttitude_targ_msg.pitch, 2))
         self.ui.TargYAW_DISP.display("{:.2f}".format(alttitude_targ_msg.yaw, 2))
-        self.ui.TargTHRUST_DISP.display("{:.2f}".format(alttitude_targ_msg.thrust, 2))
 
-        # global & local position data
-        self.ui.LatGPS_DISP.display("{:.2f}".format(self.global_pos_msg.latitude, 2))
-        self.ui.LongGPS_DISP.display("{:.2f}".format(self.global_pos_msg.longitude, 2))
-        self.ui.AltGPS_DISP.display("{:.2f}".format(self.global_pos_msg.altitude, 2))
+        throttle_pct = max(0, min(100, int(alttitude_targ_msg.thrust * 100)))
+        self.ui.bar_normalized_throttle.setValue(throttle_pct)
+        self.ui.label_total_nt.setText(f"Total N/T: {throttle_pct}%")
+
+        # local position data
         self.ui.RelX_DISP.display("{:.2f}".format(self.local_pos_msg.x, 2))
         self.ui.RelY_DISP.display("{:.2f}".format(self.local_pos_msg.y, 2))
         self.ui.AGL_DISP.display("{:.2f}".format(self.local_pos_msg.z, 2))
+
+        self._append_position_plot()
 
         self.ui.TargROLL_RATE_DISP.display("{:.2f}".format(alttitude_targ_msg.roll_rate, 2))
         self.ui.TargPITCH_RATE_DISP.display("{:.2f}".format(alttitude_targ_msg.pitch_rate, 2))
@@ -317,39 +452,6 @@ class SingleDroneRosThread:
             self.ui.StateConnected.setText("Disconnected")
             self.ui.StateMode.setText("Unknown")
 
-        if indoor_mode:
-            self.ui.StateSimulation.setText("INDOOR")
-            self.ui.StateSimulation.setStyleSheet("color: green")
-            self.ui.SetHome.setEnabled(False)
-        else:
-            self.ui.StateSimulation.setText("OUTDOOR")
-            self.ui.StateSimulation.setStyleSheet("color: orange")
-            self.ui.SetHome.setEnabled(True)
-
-        # misc data
-        if bat_msg: # takes long to initialize
-            if self.ui.BatInd.isTextVisible() == False:
-                self.ui.BatInd.setTextVisible(True)
-            self.ui.BatInd.setValue(int(float(bat_msg.percentage)*100))
-            self.ui.VOLT_DISP.display("{:.2f}".format(bat_msg.voltage, 2))
-
-        # update seconds
-        if state_msg:
-            if not hasattr(self, 'armed_seconds'):
-                self.armed_seconds = 0
-            if not hasattr(self, 'last_time'):
-                self.last_time = state_msg.seconds
-            if state_msg.armed:
-                self.armed_seconds = state_msg.seconds - self.last_time # time since armed
-                self.ui.Sec_DISP.display("{}".format(self.armed_seconds, 1))
-            else:
-                self.last_time = state_msg.seconds
-                self.armed_seconds = 0
-            # update minutes
-            if self.armed_seconds >= 60:
-                self.ui.Min_DISP.display("{}".format(int(self.ui.Min_DISP.value() + 1), 1))
-                self.last_time = state_msg.seconds
-        
          # update the control mode
         if alttitude_targ_msg.mode == 0:
             self.ui.ControlMode.setText("Not Started")
@@ -359,47 +461,6 @@ class SingleDroneRosThread:
             self.ui.ControlMode.setText("Bodyrate")
 
     ### callback functions for modifying GUI elements ###
-    def toggle_simulation_mode(self, state):
-        if state == 2:
-            self.log_message("Simulation controls available")
-            self.ui.ARM.setEnabled(True)
-            self.ui.DISARM.setEnabled(True)
-            self.ui.Takeoff.setEnabled(True)
-            self.ui.Land.setEnabled(True)
-            self.ui.TakeoffHeight.setEnabled(True)
-            self.ui.EmergencyStop.setEnabled(True)
-            self.ui.OFFBOARD.setEnabled(True)
-            self.ui.POSCTL.setEnabled(True)
-
-        else:
-            self.log_message("Simulation controls disabled")
-            self.ui.ARM.setEnabled(False)
-            self.ui.DISARM.setEnabled(False)
-            self.ui.Takeoff.setEnabled(False)
-            self.ui.Land.setEnabled(False)
-            self.ui.TakeoffHeight.setEnabled(False)
-            self.ui.EmergencyStop.setEnabled(False)
-            self.ui.OFFBOARD.setEnabled(False)
-            self.ui.POSCTL.setEnabled(False)
-    
-    def send_set_home_request(self):
-        if self.ros_object.set_home_override_service.wait_for_service(timeout_sec=1.0):
-            request = Empty.Request()
-            future = self.ros_object.set_home_override_service.call_async(request)
-            self.log_message("Set home override request sent")
-        else:
-            self.log_message("Set home override service not available")
-        
-        # home_position = CommandHomeRequest()
-        # home_position.latitude = self.global_pos_msg.latitude
-        # home_position.longitude = self.global_pos_msg.longitude
-        # home_position.altitude = self.global_pos_msg.altitude
-        # if self.ros_object.set_home_service.wait_for_service(timeout_sec=1.0):
-        #     future = self.ros_object.set_home_service.call_async(home_position)
-        #     print("Set home request sent")
-        # else:
-        #     print("Set home service not available")
-
     def send_coordinates(self):
         # if text is inalid, warn user
         try :
@@ -416,12 +477,12 @@ class SingleDroneRosThread:
             msg.exec_()
             return
         
-        # if values are not within 5 meters of current position warn user
-        if abs(x) > int(self.ros_object.config[0]) or abs(y) > int(self.ros_object.config[1]) or abs(z) > int(self.ros_object.config[2]) or z <= 0:
-            ## pop up dialog 
+        # if values are outside the geofence, warn user
+        if abs(x) > float(self.ros_object.config[0]) or abs(y) > float(self.ros_object.config[1]) or abs(z) > float(self.ros_object.config[2]) or z <= 0:
+            ## pop up dialog
             msg = QMessageBox()
             msg.setIcon(QMessageBox.Warning)
-            msg.setText("Position is not within 5 meters of current position")
+            msg.setText("Position is outside the geofence bounds")
             msg.setWindowTitle("Warning")
             msg.setStandardButtons(QMessageBox.Ok)
             msg.exec_()
@@ -430,62 +491,22 @@ class SingleDroneRosThread:
         self.ros_object.publish_coordinates(x, y, z, yaw)
         self.log_message(f"Position command sent: {x}, {y}, {z}, {yaw}")
 
+        # Update the dashed command lines in the X/Y/Z/Yaw plot to the setpoint
+        # just sent. Wrap yaw to [-180, 180] to match the plot's fixed yaw axis.
+        self._last_x_cmd = x
+        self._last_y_cmd = y
+        self._last_z_cmd = z
+        yaw_wrapped = yaw
+        if yaw_wrapped > 180:
+            yaw_wrapped -= 360
+        elif yaw_wrapped < -180:
+            yaw_wrapped += 360
+        self._last_yaw_cmd = yaw_wrapped
+
     def get_coordinates(self):
         # get current relative position
         self.ui.XPositionUAV.setText("{:.2f}".format(self.local_pos_msg.x, 2))
         self.ui.YPositionUAV.setText("{:.2f}".format(self.local_pos_msg.y, 2))
         self.ui.ZPositionUAV.setText("{:.2f}".format(self.local_pos_msg.z, 2))
         self.ui.YAWUAV.setText("{:.2f}".format(self.imu_msg.yaw, 2))
-
-    ### define publish / service functions to ros topics ###
-    def send_arming_request(self, arm, param2):
-        # if self.ros_object.arming_service.wait_for_service(timeout_sec=1.0):
-        #     request = CommandLong.Request()
-        #     request.command = 400
-        #     request.confirmation = 0
-        #     request.param1 = float(arm)
-        #     request.param2 = float(param2)
-        #     future = self.ros_object.arming_service.call_async(request)
-        #     print(f"Arming request sent: {arm}")
-        #     return True
-        # else:
-        #     print("Arming service not available")
-        #     return False
-        self.log_message(f"Arming request: {arm}, param2: {param2}")
-        return True
-
-    def send_takeoff_request(self, req_altitude):
-        arm_response = self.send_arming_request(True, 0)
-        # if armed takeoff
-        if arm_response.result == 0:
-            self.ros_object.publish_coordinates(0, 0, req_altitude)
-            self.log_message(f"Takeoff request sent at {req_altitude} meters")
-
-    def send_land_request(self):
-        # if self.ros_object.land_service.wait_for_service(timeout_sec=1.0):
-        #     request = CommandLong.Request()
-        #     request.command = 21
-        #     request.confirmation = 0
-        #     request.param1 = 0.0
-        #     request.param7 = 0.0
-        #     future = self.ros_object.land_service.call_async(request)
-        #     print("Land request sent")
-        # else:
-        #     print("Land service not available")
-        self.ros_object.publish_coordinates(self.ros_object.data_struct.current_local_pos.x, self.ros_object.data_struct.current_local_pos.y, 0, 0)
-        self.log_message("Land request sent")
-
-    def switch_mode(self, mode):
-        # if self.ros_object.set_mode_service.wait_for_service(timeout_sec=1.0):
-        #     request = SetMode.Request()
-        #     request.custom_mode = mode
-        #     future = self.ros_object.set_mode_service.call_async(request)
-        #     print(f"Mode switch request sent: {mode}")
-        # else:
-        #     print("Set mode service not available")
-        self.log_message(f"Mode switch request: {mode}")
-
-    def hold(self):
-        self.ros_object.publish_coordinates(self.ros_object.data_struct.current_local_pos.x, self.ros_object.data_struct.current_local_pos.y, 2, self.ros_object.data_struct.current_imu.yaw)
-        self.log_message("Hold position command sent")
 

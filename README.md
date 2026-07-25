@@ -7,4 +7,12 @@
 ## How to use
 
 - make sure the roscore has been launched
-- run `src/GroundControl.py` to start the ground station GUI
+- run one of the following from the repository root to start the ground station GUI:
+
+```bash
+# multi-drone station (UAV IDs 0, 1, 2)
+python3 src/GroundControl.py
+
+# single-drone station (uav_0)
+python3 src/single_drone_ground_control.py
+```
