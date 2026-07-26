@@ -44,6 +44,7 @@ class CommonData(): # store the data from the ROS nodes
         self.current_state = ros_common.StateInfo()
         self.current_attitude_target = ros_common.AttitudeTarget()
         self.indoor_mode = False
+        self.current_vehicle_name = ""
 
         # water sampling
         self.encoder_raw = ros_common.Vector3()
@@ -266,6 +267,13 @@ class CommonData(): # store the data from the ROS nodes
         if not self.lock.tryLock():
             return
         self.indoor_mode = indoor_mode
+        self.lock.unlock()
+        return
+
+    def update_vehicle_name(self, vehicle_name):
+        if not self.lock.tryLock():
+            return
+        self.current_vehicle_name = vehicle_name
         self.lock.unlock()
         return
     

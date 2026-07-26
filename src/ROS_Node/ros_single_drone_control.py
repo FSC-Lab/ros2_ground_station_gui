@@ -45,7 +45,7 @@ except ImportError:
 POSITION_PLOT_HISTORY_S = 10.0  # seconds of history shown in the X/Y/Z/Yaw plot
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
 from px4_msgs.msg import VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus,VehicleRatesSetpoint
-from fsc_autopilot_ros2_msgs.msg import PositionControllerReference
+from fsc_autopilot_ros2_msgs.msg import PositionControllerReference, VehicleInfo
 
 # from mavros_msgs.msg import State, AttitudeTarget
 from visualization_msgs.msg import Marker
@@ -88,6 +88,7 @@ class SingleDroneRosNode(Node, QObject):
         self.commanded_attitude_sub = self.create_subscription(VehicleAttitudeSetpoint, '/uav_0/fsc_autopilot_ros2/attitude_setpoint_debug', self.commanded_attitude_callback, self.px4_input_qos_profile)
         self.commanded_bodyrate_callback = self.create_subscription(VehicleRatesSetpoint, '/uav_0/fsc_autopilot_ros2/rate_setpoint_debug', self.commanded_bodyrate_callback, self.px4_input_qos_profile)
         self.estimator_type_sub = self.create_subscription(Bool, '/estimator_type', self.estimator_type_callback, 10)
+        self.vehicle_info_sub = self.create_subscription(VehicleInfo, '/uav_0/fsc_autopilot_ros2/vehicle_info', self.vehicle_info_callback, 10)
 
         # Define publishers / services
         # self.coords_pub = self.create_publisher(TrackingReference, 'position_controller/target', 10)
@@ -146,6 +147,11 @@ class SingleDroneRosNode(Node, QObject):
 
     def estimator_type_callback(self, msg):
         self.data_struct.update_estimator_type(msg.data)
+
+    def vehicle_info_callback(self, msg):
+        # info[0] holds the vehicle name (see fsc_autopilot_ros2_msgs/msg/VehicleInfo)
+        if msg.info:
+            self.data_struct.update_vehicle_name(msg.info[0])
 
     def publish_coordinates(self, x, y, z, yaw):
         msg = PositionControllerReference()
@@ -409,7 +415,10 @@ class SingleDroneRosThread:
         vel_msg = self.ros_object.data_struct.current_vel
         state_msg = self.ros_object.data_struct.current_state
         alttitude_targ_msg = self.ros_object.data_struct.current_attitude_target
+        vehicle_name = self.ros_object.data_struct.current_vehicle_name
         self.lock.unlock()
+
+        self.ui.label_vehicle_type.setText(f"Vehicle Type: {vehicle_name}")
 
         # accelerometer data
         self.ui.X_DISP.display("{:.2f}".format(self.imu_msg.roll, 2))

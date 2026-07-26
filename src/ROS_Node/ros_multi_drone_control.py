@@ -305,7 +305,7 @@ class MultiDroneRosNode(Node, QObject):
     # main loop of ros node (for compatibility with thread)
     def run(self):
         # Start the timer when the thread begins
-        self.timer = self.create_timer(0.2, self.timer_callback)  # 5 Hz
+        self.timer = self.create_timer(0.02, self.timer_callback)  # 50 Hz
         
         # Use executor to spin in this thread
         executor = SingleThreadedExecutor()

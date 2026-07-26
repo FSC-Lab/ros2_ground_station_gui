@@ -43,7 +43,7 @@
    <widget class="QWidget" name="verticalLayoutWidget_4">
     <property name="geometry">
      <rect>
-      <x>230</x>
+      <x>250</x>
       <y>240</y>
       <width>217</width>
       <height>141</height>
@@ -354,23 +354,13 @@
     </property>
     <widget class="QWidget" name="Flight_Graph">
      <attribute name="title">
-      <string>Flight Graph</string>
+      <string>Flight Log</string>
      </attribute>
-     <widget class="QWidget" name="display_3d_pos" native="true">
-      <property name="geometry">
-       <rect>
-        <x>20</x>
-        <y>270</y>
-        <width>541</width>
-        <height>241</height>
-       </rect>
-      </property>
-     </widget>
      <widget class="QWidget" name="display_tracking_error" native="true">
       <property name="geometry">
        <rect>
         <x>20</x>
-        <y>530</y>
+        <y>280</y>
         <width>541</width>
         <height>191</height>
        </rect>
@@ -386,15 +376,51 @@
        </rect>
       </property>
      </widget>
+     <widget class="QWidget" name="display_quad_rotor_NT" native="true">
+      <property name="geometry">
+       <rect>
+        <x>20</x>
+        <y>510</y>
+        <width>231</width>
+        <height>211</height>
+       </rect>
+      </property>
+     </widget>
+     <widget class="QLabel" name="label_2">
+      <property name="geometry">
+       <rect>
+        <x>30</x>
+        <y>480</y>
+        <width>191</width>
+        <height>31</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>N/T for each rotor</string>
+      </property>
+      <property name="alignment">
+       <set>Qt::AlignCenter</set>
+      </property>
+     </widget>
+     <widget class="QListWidget" name="list_cmd_log">
+      <property name="geometry">
+       <rect>
+        <x>260</x>
+        <y>510</y>
+        <width>301</width>
+        <height>211</height>
+       </rect>
+      </property>
+     </widget>
     </widget>
    </widget>
    <widget class="QTabWidget" name="tabWidget">
     <property name="geometry">
      <rect>
-      <x>20</x>
-      <y>510</y>
-      <width>441</width>
-      <height>301</height>
+      <x>30</x>
+      <y>490</y>
+      <width>431</width>
+      <height>321</height>
      </rect>
     </property>
     <property name="currentIndex">
@@ -638,7 +664,7 @@
      <rect>
       <x>30</x>
       <y>390</y>
-      <width>451</width>
+      <width>491</width>
       <height>71</height>
      </rect>
     </property>
@@ -738,53 +764,17 @@
      </layout>
     </widget>
    </widget>
-   <widget class="QWidget" name="horizontalLayoutWidget">
-    <property name="geometry">
-     <rect>
-      <x>300</x>
-      <y>480</y>
-      <width>411</width>
-      <height>41</height>
-     </rect>
-    </property>
-    <layout class="QHBoxLayout" name="horizontalLayout">
-     <item>
-      <widget class="QLabel" name="label_controller_type">
-       <property name="text">
-        <string>Controller: Baseline</string>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QLabel" name="label_controller_type_2">
-       <property name="text">
-        <string>Task: Pos</string>
-       </property>
-      </widget>
-     </item>
-    </layout>
-   </widget>
    <widget class="QPushButton" name="buttom_back_to_baseline">
     <property name="geometry">
      <rect>
       <x>470</x>
-      <y>540</y>
-      <width>231</width>
+      <y>520</y>
+      <width>251</width>
       <height>81</height>
      </rect>
     </property>
     <property name="text">
      <string>Back to Baseline Control</string>
-    </property>
-   </widget>
-   <widget class="QListWidget" name="list_cmd_log">
-    <property name="geometry">
-     <rect>
-      <x>470</x>
-      <y>630</y>
-      <width>231</width>
-      <height>181</height>
-     </rect>
     </property>
    </widget>
    <widget class="QPushButton" name="buttom_reconnect">
@@ -803,10 +793,10 @@
    <widget class="QProgressBar" name="bar_normalized_throttle">
     <property name="geometry">
      <rect>
-      <x>460</x>
-      <y>270</y>
+      <x>580</x>
+      <y>280</y>
       <width>61</width>
-      <height>111</height>
+      <height>161</height>
      </rect>
     </property>
     <property name="value">
@@ -822,7 +812,7 @@
    <widget class="QLabel" name="label_total_nt">
     <property name="geometry">
      <rect>
-      <x>450</x>
+      <x>560</x>
       <y>240</y>
       <width>91</width>
       <height>31</height>
@@ -832,31 +822,38 @@
      <string>Total N/T: 0%</string>
     </property>
    </widget>
-   <widget class="QLabel" name="label_2">
+   <widget class="QWidget" name="verticalLayoutWidget">
     <property name="geometry">
      <rect>
-      <x>520</x>
-      <y>240</y>
-      <width>191</width>
-      <height>31</height>
+      <x>470</x>
+      <y>650</y>
+      <width>251</width>
+      <height>161</height>
      </rect>
     </property>
-    <property name="text">
-     <string>N/T for each rotor</string>
-    </property>
-    <property name="alignment">
-     <set>Qt::AlignCenter</set>
-    </property>
-   </widget>
-   <widget class="QWidget" name="display_quad_rotor_NT" native="true">
-    <property name="geometry">
-     <rect>
-      <x>530</x>
-      <y>280</y>
-      <width>181</width>
-      <height>171</height>
-     </rect>
-    </property>
+    <layout class="QVBoxLayout" name="verticalLayout_3">
+     <item>
+      <widget class="QLabel" name="label_controller_type">
+       <property name="text">
+        <string>Controller: Baseline</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="label_controller_type_2">
+       <property name="text">
+        <string>Task: Pos</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="label_vehicle_type">
+       <property name="text">
+        <string>Vehicle Type: </string>
+       </property>
+      </widget>
+     </item>
+    </layout>
    </widget>
   </widget>
  </widget>
