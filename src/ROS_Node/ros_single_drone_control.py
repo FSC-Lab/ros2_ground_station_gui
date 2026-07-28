@@ -23,14 +23,16 @@ SOFTWARE.
 '''
 
 import time
+import math
 from collections import deque
 
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from PyQt5.QtCore import QObject, pyqtSignal, QThread, QDateTime, QTimer, Qt
-from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtCore import QObject, pyqtSignal, QThread, QDateTime, QTimer, Qt, QPointF, QRectF
+from PyQt5.QtGui import QBrush, QColor, QFont, QPainter, QPen
+from PyQt5.QtWidgets import QMessageBox, QWidget
 import Common
 from geometry_msgs.msg import Point
 
@@ -44,7 +46,7 @@ except ImportError:
 
 POSITION_PLOT_HISTORY_S = 10.0  # seconds of history shown in the X/Y/Z/Yaw plot
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
-from px4_msgs.msg import VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus,VehicleRatesSetpoint
+from px4_msgs.msg import ActuatorMotors, VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus,VehicleRatesSetpoint, EstimatorStatusFlags
 from fsc_autopilot_ros2_msgs.msg import PositionControllerReference, VehicleInfo
 
 # from mavros_msgs.msg import State, AttitudeTarget
@@ -52,7 +54,74 @@ from visualization_msgs.msg import Marker
 from nav_msgs.msg import Odometry
 import json
 # from fsc_autopilot_msgs.msg import TrackingReference
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
+
+
+class QuadrotorThrottleWidget(QWidget):
+    """Top-down X-frame view with one normalized-throttle pie per motor."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._commands = [0.0, 0.0, 0.0, 0.0]
+
+    def set_commands(self, commands):
+        self._commands = [max(0.0, min(1.0, float(value))) for value in commands[:4]]
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        width = self.width()
+        height = self.height()
+        center = QPointF(width / 2.0, height / 2.0 - 4.0)
+        rotor_centers = [
+            QPointF(width * 0.77, height * 0.23),  # motor 1: front-right
+            QPointF(width * 0.23, height * 0.68),  # motor 2: rear-left
+            QPointF(width * 0.23, height * 0.23),  # motor 3: front-left
+            QPointF(width * 0.77, height * 0.68),  # motor 4: rear-right
+        ]
+
+        painter.setPen(QPen(QColor("#555555"), 5, Qt.SolidLine, Qt.RoundCap))
+        for rotor_center in rotor_centers:
+            painter.drawLine(center, rotor_center)
+        painter.setBrush(QBrush(QColor("#555555")))
+        painter.drawEllipse(center, 7, 7)
+
+        radius = max(18.0, min(width, height) * 0.105)
+        painter.setFont(QFont("Sans Serif", 8))
+        for index, (rotor_center, command) in enumerate(zip(rotor_centers, self._commands)):
+            rotor_rect = QRectF(
+                rotor_center.x() - radius,
+                rotor_center.y() - radius,
+                radius * 2.0,
+                radius * 2.0,
+            )
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor("#E6E6E6")))
+            painter.drawEllipse(rotor_rect)
+            painter.setBrush(QBrush(QColor("#24A148")))
+            painter.drawPie(rotor_rect, 90 * 16, -round(command * 360 * 16))
+            painter.setPen(QPen(QColor("#333333"), 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(rotor_rect)
+
+            text_rect = QRectF(
+                rotor_center.x() - 39,
+                rotor_center.y() + radius + 2,
+                78,
+                18,
+            )
+            painter.setPen(QColor("#222222"))
+            painter.drawText(
+                text_rect,
+                Qt.AlignCenter,
+                f"M{index + 1}: {command * 100:.1f}%",
+            )
+
+        painter.setPen(QColor("#555555"))
+        painter.drawText(QRectF(center.x() - 25, 2, 50, 16), Qt.AlignCenter, "FRONT")
+
 
 class SingleDroneRosNode(Node, QObject):
     ## define signals
@@ -77,6 +146,12 @@ class SingleDroneRosNode(Node, QObject):
             history=HistoryPolicy.KEEP_LAST,
             depth=5
         )
+        self.controller_type_qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
         
         # Define subscribers
         self.imu_sub = self.create_subscription(VehicleAttitude, '/uav_0/fmu/out/vehicle_attitude', self.imu_callback, self.px4_qos_profile)
@@ -89,6 +164,19 @@ class SingleDroneRosNode(Node, QObject):
         self.commanded_bodyrate_callback = self.create_subscription(VehicleRatesSetpoint, '/uav_0/fsc_autopilot_ros2/rate_setpoint_debug', self.commanded_bodyrate_callback, self.px4_input_qos_profile)
         self.estimator_type_sub = self.create_subscription(Bool, '/estimator_type', self.estimator_type_callback, 10)
         self.vehicle_info_sub = self.create_subscription(VehicleInfo, '/uav_0/fsc_autopilot_ros2/vehicle_info', self.vehicle_info_callback, 10)
+        self.estimator_status_flags_sub = self.create_subscription(EstimatorStatusFlags, '/uav_0/fmu/out/estimator_status_flags', self.estimator_status_flags_callback, self.px4_qos_profile)
+        self.controller_type_sub = self.create_subscription(
+            String,
+            '/uav_0/fsc_autopilot_ros2/controller_type',
+            self.controller_type_callback,
+            self.controller_type_qos_profile
+        )
+        self.motor_commands_sub = self.create_subscription(
+            ActuatorMotors,
+            '/uav_0/fsc_autopilot_ros2/direct_actuation/motors_debug',
+            self.motor_commands_callback,
+            10
+        )
 
         # Define publishers / services
         # self.coords_pub = self.create_publisher(TrackingReference, 'position_controller/target', 10)
@@ -152,6 +240,19 @@ class SingleDroneRosNode(Node, QObject):
         # info[0] holds the vehicle name (see fsc_autopilot_ros2_msgs/msg/VehicleInfo)
         if msg.info:
             self.data_struct.update_vehicle_name(msg.info[0])
+
+    def estimator_status_flags_callback(self, msg):
+        self.data_struct.update_yaw_align(msg.cs_yaw_align)
+
+    def controller_type_callback(self, msg):
+        self.data_struct.update_controller_type(msg.data)
+
+    def motor_commands_callback(self, msg):
+        commands = [
+            float(value) if math.isfinite(value) else 0.0
+            for value in msg.control[:4]
+        ]
+        self.data_struct.update_motor_commands(commands)
 
     def publish_coordinates(self, x, y, z, yaw):
         msg = PositionControllerReference()
@@ -233,6 +334,14 @@ class SingleDroneRosThread:
         self.ui = ui
         self.set_ros_callbacks()
 
+        # last-seen state used to detect/log transitions in update_gui_data;
+        # None means "not observed yet" so the first sample never logs a
+        # spurious transition from the CommonData defaults.
+        self._prev_armed = None
+        self._prev_mode = None
+        self._prev_yaw_align = None
+        self._yaw_align = False
+
         # position/yaw plot data buffers
         self._plot_t0_pos = None
         self._plot_t_pos = deque()
@@ -251,6 +360,7 @@ class SingleDroneRosThread:
         self._last_z_cmd = 0.0
         self._last_yaw_cmd = 0.0
         self._setup_position_plot()
+        self._setup_motor_display()
 
         # Move ROS node to thread and start
         self.ros_object.moveToThread(self.thread)
@@ -277,6 +387,13 @@ class SingleDroneRosThread:
         formatted_message = f"[{timestamp}] {message}"
         self.ui.list_cmd_log.addItem(formatted_message)
         self.ui.list_cmd_log.scrollToBottom()
+
+    def _setup_motor_display(self):
+        container = self.ui.display_quad_rotor_NT
+        self._motor_display = QuadrotorThrottleWidget(container)
+        self._motor_display.setGeometry(container.rect())
+        self._motor_display.set_commands((0.0, 0.0, 0.0, 0.0))
+        self._motor_display.show()
 
     # --- Real-time X/Y/Z position + yaw plot -------------------------------------
     def _setup_position_plot(self):
@@ -416,9 +533,15 @@ class SingleDroneRosThread:
         state_msg = self.ros_object.data_struct.current_state
         alttitude_targ_msg = self.ros_object.data_struct.current_attitude_target
         vehicle_name = self.ros_object.data_struct.current_vehicle_name
+        yaw_align = self.ros_object.data_struct.current_yaw_align
+        controller_type = self.ros_object.data_struct.current_controller_type
+        motor_commands = tuple(self.ros_object.data_struct.current_motor_commands)
         self.lock.unlock()
 
         self.ui.label_vehicle_type.setText(f"Vehicle Type: {vehicle_name}")
+        controller_type_display = controller_type or "Unknown"
+        self.ui.label_controller_type.setText(f"Controller: {controller_type_display}")
+        direct_actuation = controller_type == "Direct Actuation"
 
         # accelerometer data
         self.ui.X_DISP.display("{:.2f}".format(self.imu_msg.roll, 2))
@@ -431,7 +554,18 @@ class SingleDroneRosThread:
 
         throttle_pct = max(0, min(100, int(alttitude_targ_msg.thrust * 100)))
         self.ui.bar_normalized_throttle.setValue(throttle_pct)
-        self.ui.label_total_nt.setText(f"Total N/T: {throttle_pct}%")
+        if direct_actuation:
+            self.ui.label_total_nt.setText("Using direct\nactuation...")
+        else:
+            self.ui.label_total_nt.setText(f"Total N/T: {throttle_pct}%")
+
+        connected = bool(state_msg and state_msg.connected)
+        displayed_motor_commands = (
+            motor_commands
+            if direct_actuation and connected
+            else (0.0, 0.0, 0.0, 0.0)
+        )
+        self._motor_display.set_commands(displayed_motor_commands)
 
         # local position data
         self.ui.RelX_DISP.display("{:.2f}".format(self.local_pos_msg.x, 2))
@@ -461,8 +595,31 @@ class SingleDroneRosThread:
             self.ui.StateConnected.setText("Disconnected")
             self.ui.StateMode.setText("Unknown")
 
-         # update the control mode
-        if alttitude_targ_msg.mode == 0:
+        self.ui.StateYawAlign.setText("Yaw Align: {}".format(yaw_align))
+        self.ui.StateYawAlign.setStyleSheet("color: green" if yaw_align else "color: red")
+        self._yaw_align = bool(yaw_align)
+
+        # flight log: record arming, mode (e.g. OFFBOARD), and yaw-alignment
+        # transitions as they're observed from telemetry (send_coordinates()
+        # logs commanded positions separately)
+        if state_msg:
+            if self._prev_armed is not None and state_msg.armed != self._prev_armed:
+                self.log_message("Vehicle armed" if state_msg.armed else "Vehicle disarmed")
+            self._prev_armed = state_msg.armed
+
+            if self._prev_mode is not None and state_msg.mode != self._prev_mode:
+                self.log_message(f"Mode changed: {self._prev_mode} -> {state_msg.mode}")
+            self._prev_mode = state_msg.mode
+
+        if self._prev_yaw_align is not None and yaw_align != self._prev_yaw_align:
+            self.log_message("Yaw alignment complete" if yaw_align else "Yaw alignment lost")
+        self._prev_yaw_align = yaw_align
+
+        # Direct actuation still publishes an attitude debug setpoint, so the
+        # debug-message mode alone would incorrectly display "Attitude".
+        if direct_actuation:
+            self.ui.ControlMode.setText("Direct Actuation")
+        elif alttitude_targ_msg.mode == 0:
             self.ui.ControlMode.setText("Not Started")
         elif alttitude_targ_msg.mode == 1:
             self.ui.ControlMode.setText("Attitude")
@@ -471,6 +628,16 @@ class SingleDroneRosThread:
 
     ### callback functions for modifying GUI elements ###
     def send_coordinates(self):
+        if not self._yaw_align:
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Warning)
+            msg.setText("Yaw is not aligned. Cannot move the drone.")
+            msg.setWindowTitle("Yaw Not Aligned")
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.exec_()
+            self.log_message("Position command rejected: yaw is not aligned")
+            return
+
         # if text is inalid, warn user
         try :
             x = float(self.ui.XPositionUAV.text())
@@ -518,4 +685,3 @@ class SingleDroneRosThread:
         self.ui.YPositionUAV.setText("{:.2f}".format(self.local_pos_msg.y, 2))
         self.ui.ZPositionUAV.setText("{:.2f}".format(self.local_pos_msg.z, 2))
         self.ui.YAWUAV.setText("{:.2f}".format(self.imu_msg.yaw, 2))
-

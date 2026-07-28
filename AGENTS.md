@@ -21,6 +21,7 @@ The application is not packaged as an installable Python or ROS package. Imports
 - `src/GUI/single_drone_flight.py`: generated PyQt5 code imported by `single_drone_ground_control.py`.
 - `src/ROS_Node/geofence.json` and `slung_load.json`: runtime configuration.
 - `scripts/convert_ui.sh`: converts a `.ui` file to Python with `pyuic5`.
+- `docs/prerequisites.md`: ROS 2 Humble, Python, message-package, and sibling-workspace requirements.
 - `GUI_SamplerdotUI.py`: legacy generated file at the repository root; the active import uses the copy under `src/GUI`.
 
 ## Environment and dependencies
@@ -33,6 +34,8 @@ Use a ROS 2 environment that provides the workspace's message packages. Importan
 - `fsc_autopilot_ros2_msgs`
 - `geometry_msgs`, `nav_msgs`, `std_msgs`, `std_srvs`, and `visualization_msgs`
 - `pyqtgraph` (optional): powers the embedded real-time plots in the single-drone GUI (e.g. `display_x_y_z_yaw`). Import is guarded — the GUI runs without it, printing `[PLOT] pyqtgraph not found` and leaving that plot blank.
+
+See `docs/prerequisites.md` for the expected ROS 2 workspace layout and upstream packages. In particular, `px4_msgs` and `fsc_autopilot_ros2_msgs` must be available from the sourced workspace.
 
 Source the ROS installation and the containing workspace before running the GUI. From this repository root, launch the multi-drone station with:
 
@@ -58,18 +61,21 @@ Run from the repository root because the controllers currently open JSON configu
   ./scripts/convert_ui.sh single_drone_flight.ui
   ```
 
+- Review the generated diff after regeneration to ensure the `.ui` and Python output remain synchronized.
 - Keep Qt widget `objectName` values stable unless every corresponding reference in the ROS controller is updated.
 - Preserve the ROS/Qt threading boundary. ROS executors run in `QThread`; GUI widgets must be updated through Qt signals/slots on the GUI side.
-- Access shared `CommonData` state under its `QMutex`. Keep lock sections short, copy values locally, and always unlock on every acquired path.
+- Keep publishers, subscriptions, clients, timers, executors, and threads referenced for as long as they are needed. Shutdown must not leave an executor or worker thread running.
+- Access shared `CommonData` state under its `QMutex`. Keep lock sections short, copy values locally, always unlock on every acquired path, and preserve the existing non-blocking `tryLock()` behavior unless deliberately changing the concurrency model.
 - For each new UAV-specific topic, derive the namespace from the drone ID (`/uav_{i}/...`) and store subscriptions/publishers so ROS objects remain alive.
-- Match PX4 QoS behavior: telemetry uses the existing best-effort/transient-local profile, while PX4 command/setpoint topics use best-effort/volatile unless the upstream interface explicitly requires otherwise.
-- Be explicit about coordinate frames and units. PX4 data is commonly NED/FRD, while the GUI and estimator may use ENU/FLU; yaw fields may use degrees. Do not silently change a conversion or sign convention.
+- Match PX4 QoS behavior: telemetry uses best-effort/transient-local/keep-last/depth-5, while PX4 command and setpoint debug streams use best-effort/volatile/keep-last/depth-5 unless the upstream interface explicitly requires otherwise.
+- Check the sourced workspace's message definitions before changing custom message fields.
+- Be explicit about coordinate frames and units. PX4 data is commonly NED/FRD, while the GUI and estimator may use ENU/FLU; quaternion ordering differs across interfaces, and `PositionControllerReference.yaw` is published in degrees. Do not silently change axis order, quaternion order, yaw wrapping, thrust signs, frame IDs, or other conversion conventions.
 - Avoid broad cleanup of commented legacy ROS 1 (water-sampling) code unless the task specifically includes migration or removal.
 - Keep configuration JSON valid and preserve its existing schema unless all readers are updated together.
 
 ## Validation
 
-There is currently no automated test suite, formatter, linter, or dependency manifest in the repository. Use the checks appropriate to the change:
+There is currently no automated test suite, formatter, linter, or dependency manifest in the repository. Follow the surrounding style rather than reformatting entire files, and use the checks appropriate to the change:
 
 ```bash
 # Parse/compile all Python sources without starting ROS or Qt
@@ -84,7 +90,7 @@ git diff --check
 git diff --stat
 ```
 
-For GUI or ROS changes, also perform a manual smoke test in a sourced ROS 2 workspace. Confirm the window opens, the intended UAV tabs update, topic names and QoS match the running system, buttons publish/call only their intended interfaces, and shutdown does not leave the executor running.
+For GUI or ROS changes, also perform a manual smoke test in a sourced ROS 2 workspace. Confirm the window opens, the intended UAV tabs update, topic names, message fields, coordinate frames, units, and QoS match the running system, buttons publish/call only their intended interfaces, and shutdown does not leave the executor running. If `pyqtgraph` is unavailable, confirm that the single-drone application still opens and degrades gracefully.
 
 Hardware-affecting controls such as arm, disarm, takeoff, land, emergency stop, and position commands must not be exercised on a live vehicle without explicit authorization and the normal flight-safety setup. Prefer simulation for validation.
 

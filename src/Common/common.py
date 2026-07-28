@@ -45,6 +45,9 @@ class CommonData(): # store the data from the ROS nodes
         self.current_attitude_target = ros_common.AttitudeTarget()
         self.indoor_mode = False
         self.current_vehicle_name = ""
+        self.current_yaw_align = False
+        self.current_controller_type = ""
+        self.current_motor_commands = [0.0, 0.0, 0.0, 0.0]
 
         # water sampling
         self.encoder_raw = ros_common.Vector3()
@@ -274,6 +277,27 @@ class CommonData(): # store the data from the ROS nodes
         if not self.lock.tryLock():
             return
         self.current_vehicle_name = vehicle_name
+        self.lock.unlock()
+        return
+
+    def update_yaw_align(self, yaw_align):
+        if not self.lock.tryLock():
+            return
+        self.current_yaw_align = yaw_align
+        self.lock.unlock()
+        return
+
+    def update_controller_type(self, controller_type):
+        if not self.lock.tryLock():
+            return
+        self.current_controller_type = controller_type
+        self.lock.unlock()
+        return
+
+    def update_motor_commands(self, motor_commands):
+        if not self.lock.tryLock():
+            return
+        self.current_motor_commands = list(motor_commands[:4])
         self.lock.unlock()
         return
     
