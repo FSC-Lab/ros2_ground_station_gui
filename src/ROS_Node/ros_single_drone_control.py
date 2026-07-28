@@ -30,7 +30,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from PyQt5.QtCore import QObject, pyqtSignal, QThread, QDateTime, QTimer, Qt, QPointF, QRectF
+from PyQt5.QtCore import QObject, pyqtSignal, QThread, QDateTime, Qt, QPointF, QRectF
 from PyQt5.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PyQt5.QtWidgets import QMessageBox, QWidget
 import Common
@@ -44,7 +44,9 @@ try:
 except ImportError:
     _HAS_PYQTGRAPH = False
 
-POSITION_PLOT_HISTORY_S = 10.0  # seconds of history shown in the X/Y/Z/Yaw plot
+POSITION_PLOT_HISTORY_S = 10.0  # seconds of history shown in the live plots
+STEP_RESPONSE_DEFAULT_WINDOW_S = 30
+STEP_RESPONSE_MAX_WINDOW_S = 60
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
 from px4_msgs.msg import ActuatorMotors, VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus,VehicleRatesSetpoint, EstimatorStatusFlags
 from fsc_autopilot_ros2_msgs.msg import PositionControllerReference, VehicleInfo
@@ -342,24 +344,41 @@ class SingleDroneRosThread:
         self._prev_yaw_align = None
         self._yaw_align = False
 
-        # position/yaw plot data buffers
+        # inertial-position and body-angle plot data buffers
         self._plot_t0_pos = None
         self._plot_t_pos = deque()
         self._plot_x = deque()
         self._plot_y = deque()
         self._plot_z = deque()
+        self._plot_roll = deque()
+        self._plot_pitch = deque()
         self._plot_yaw = deque()
+        self._plot_yaw_cmd = deque()
         self._plot_x_cmd = deque()
         self._plot_y_cmd = deque()
         self._plot_z_cmd = deque()
-        self._plot_yaw_cmd = deque()
         # last setpoint actually sent via send_coordinates(); held constant
         # between sends so the dashed command lines stay flat until updated
         self._last_x_cmd = 0.0
         self._last_y_cmd = 0.0
         self._last_z_cmd = 0.0
         self._last_yaw_cmd = 0.0
+        self._pref_waiting = False
+        self._pref_recording = False
+        self._pref_t0 = None
+        self._pref_window_s = STEP_RESPONSE_DEFAULT_WINDOW_S
+        self._pref_command = (0.0, 0.0, 0.0)
+        self._pref_t = deque()
+        self._pref_x = deque()
+        self._pref_y = deque()
+        self._pref_z = deque()
+        self._pref_x_cmd = deque()
+        self._pref_y_cmd = deque()
+        self._pref_z_cmd = deque()
         self._setup_position_plot()
+        self._setup_body_angle_plot()
+        self._setup_step_response_plot()
+        self._setup_step_response_controls()
         self._setup_motor_display()
 
         # Move ROS node to thread and start
@@ -395,7 +414,7 @@ class SingleDroneRosThread:
         self._motor_display.set_commands((0.0, 0.0, 0.0, 0.0))
         self._motor_display.show()
 
-    # --- Real-time X/Y/Z position + yaw plot -------------------------------------
+    # --- Real-time inertial X/Y/Z position and body-angle plots ------------------
     def _setup_position_plot(self):
         if not _HAS_PYQTGRAPH:
             print("[PLOT] pyqtgraph not found - position plot disabled")
@@ -412,8 +431,8 @@ class SingleDroneRosThread:
         pg.setConfigOptions(antialias=True)
 
         # Pin the PlotWidget to the exact pixel bounds of the container widget
-        # (display_x_y_z_yaw in single_drone_flight.ui).
-        container = self.ui.display_x_y_z_yaw
+        # (display_x_y_z in single_drone_flight.ui).
+        container = self.ui.display_x_y_z
         self._pos_plot = pg.PlotWidget(parent=container)
         self._pos_plot.move(0, 0)
         self._pos_plot.setFixedSize(container.width(), container.height())
@@ -422,8 +441,6 @@ class SingleDroneRosThread:
         self._pos_plot.setBackground('w')
         self._pos_plot.setLabel('bottom', 'Time', units='s')
         self._pos_plot.setLabel('left', 'Position', units='m')
-        self._pos_plot.showAxis('right')
-        self._pos_plot.setLabel('right', 'Yaw (deg)', color='#AA00AA')
         self._pos_plot.addLegend(offset=(5, -5))
         # Push plot content down so the top margin isn't clipped by the container edge
         self._pos_plot.getPlotItem().layout.setContentsMargins(0, 15, 0, 0)
@@ -440,27 +457,28 @@ class SingleDroneRosThread:
         self._curve_z_cmd = self._pos_plot.plot(
             pen=pg.mkPen('#0055AA', width=2, style=dashed), name='Z cmd (m)')
 
-        # Right axis - yaw (deg), separate ViewBox; solid = actual, dashed = commanded
-        self._vb_yaw = pg.ViewBox()
-        self._vb_yaw.invertY(False)  # standalone ViewBox defaults to image coords (Y-down)
-        self._pos_plot.scene().addItem(self._vb_yaw)
-        self._pos_plot.getAxis('right').linkToView(self._vb_yaw)
-        self._vb_yaw.setXLink(self._pos_plot)
-        self._curve_yaw = pg.PlotDataItem(pen=pg.mkPen('#AA00AA', width=2), name='Yaw (deg)')
-        self._curve_yaw_cmd = pg.PlotDataItem(
-            pen=pg.mkPen('#AA00AA', width=2, style=dashed), name='Yaw cmd (deg)')
-        self._vb_yaw.addItem(self._curve_yaw)
-        self._vb_yaw.addItem(self._curve_yaw_cmd)
-        self._vb_yaw.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
-        self._vb_yaw.setYRange(-180, 180, padding=0)
-        self._pos_plot.getViewBox().sigResized.connect(self._sync_position_plot_views)
-
-        # Initialise the yaw ViewBox geometry after the event loop starts
-        QTimer.singleShot(0, self._sync_position_plot_views)
-
-    def _sync_position_plot_views(self):
-        self._vb_yaw.setGeometry(self._pos_plot.getViewBox().sceneBoundingRect())
-        self._vb_yaw.linkedViewChanged(self._pos_plot.getViewBox(), self._vb_yaw.XAxis)
+    def _setup_body_angle_plot(self):
+        if not _HAS_PYQTGRAPH:
+            return
+        container = self.ui.display_body_angle
+        self._angle_plot = pg.PlotWidget(parent=container)
+        self._angle_plot.setGeometry(container.rect())
+        self._angle_plot.setBackground('w')
+        self._angle_plot.setLabel('bottom', 'Time', units='s')
+        self._angle_plot.setLabel('left', 'Body angle', units='deg')
+        self._angle_plot.getAxis('left').enableAutoSIPrefix(False)
+        self._angle_plot.addLegend(offset=(5, -5))
+        self._angle_plot.getPlotItem().layout.setContentsMargins(0, 15, 0, 0)
+        self._curve_roll = self._angle_plot.plot(
+            pen=pg.mkPen('#CC0000', width=2), name='Roll (deg)')
+        self._curve_pitch = self._angle_plot.plot(
+            pen=pg.mkPen('#008800', width=2), name='Pitch (deg)')
+        self._curve_yaw = self._angle_plot.plot(
+            pen=pg.mkPen('#AA00AA', width=2), name='Yaw (deg)')
+        self._curve_yaw_cmd = self._angle_plot.plot(
+            pen=pg.mkPen('#AA00AA', width=2, style=Qt.DashLine),
+            name='Yaw cmd (deg)')
+        self._angle_plot.show()
 
     def _append_position_plot(self):
         if not _HAS_PYQTGRAPH or not hasattr(self, '_curve_x'):
@@ -470,23 +488,24 @@ class SingleDroneRosThread:
             self._plot_t0_pos = now
         t = now - self._plot_t0_pos
 
-        # current_imu.yaw is wrapped to [0, 360) (see Common.quat_to_euler);
-        # the plot's yaw axis is fixed to [-180, 180], so re-wrap to match.
+        # Show yaw continuously in the conventional signed degree range.
         yaw = self.imu_msg.yaw
         if yaw > 180:
             yaw -= 360
 
-        # Commanded X/Y/Z/Yaw: held constant at the last value actually sent
+        # Commanded X/Y/Z: held constant at the last value actually sent
         # via send_coordinates() (see self._last_*_cmd), not the live text field.
         self._plot_t_pos.append(t)
         self._plot_x.append(self.local_pos_msg.x)
         self._plot_y.append(self.local_pos_msg.y)
         self._plot_z.append(self.local_pos_msg.z)
+        self._plot_roll.append(self.imu_msg.roll)
+        self._plot_pitch.append(self.imu_msg.pitch)
         self._plot_yaw.append(yaw)
+        self._plot_yaw_cmd.append(self._last_yaw_cmd)
         self._plot_x_cmd.append(self._last_x_cmd)
         self._plot_y_cmd.append(self._last_y_cmd)
         self._plot_z_cmd.append(self._last_z_cmd)
-        self._plot_yaw_cmd.append(self._last_yaw_cmd)
 
         # Trim samples outside the history window
         cutoff = t - POSITION_PLOT_HISTORY_S
@@ -495,22 +514,134 @@ class SingleDroneRosThread:
             self._plot_x.popleft()
             self._plot_y.popleft()
             self._plot_z.popleft()
+            self._plot_roll.popleft()
+            self._plot_pitch.popleft()
             self._plot_yaw.popleft()
+            self._plot_yaw_cmd.popleft()
             self._plot_x_cmd.popleft()
             self._plot_y_cmd.popleft()
             self._plot_z_cmd.popleft()
-            self._plot_yaw_cmd.popleft()
 
         t_list = list(self._plot_t_pos)
         self._curve_x.setData(t_list, list(self._plot_x))
         self._curve_y.setData(t_list, list(self._plot_y))
         self._curve_z.setData(t_list, list(self._plot_z))
+        self._curve_roll.setData(t_list, list(self._plot_roll))
+        self._curve_pitch.setData(t_list, list(self._plot_pitch))
         self._curve_yaw.setData(t_list, list(self._plot_yaw))
+        self._curve_yaw_cmd.setData(t_list, list(self._plot_yaw_cmd))
         self._curve_x_cmd.setData(t_list, list(self._plot_x_cmd))
         self._curve_y_cmd.setData(t_list, list(self._plot_y_cmd))
         self._curve_z_cmd.setData(t_list, list(self._plot_z_cmd))
-        self._curve_yaw_cmd.setData(t_list, list(self._plot_yaw_cmd))
         self._pos_plot.setXRange(max(0.0, t - POSITION_PLOT_HISTORY_S), t, padding=0)
+        self._angle_plot.setXRange(max(0.0, t - POSITION_PLOT_HISTORY_S), t, padding=0)
+
+    # --- Position-command step response -----------------------------------------
+    def _setup_step_response_controls(self):
+        self.ui.scrollbar_pref.setMinimum(1)
+        self.ui.scrollbar_pref.setMaximum(STEP_RESPONSE_MAX_WINDOW_S)
+        self.ui.scrollbar_pref.setValue(STEP_RESPONSE_DEFAULT_WINDOW_S)
+        self.ui.scrollbar_pref.setSingleStep(1)
+        self.ui.scrollbar_pref.setPageStep(5)
+        self._update_pref_window(STEP_RESPONSE_DEFAULT_WINDOW_S)
+
+    def _setup_step_response_plot(self):
+        if not _HAS_PYQTGRAPH:
+            print("[PLOT] pyqtgraph not found - step response plot disabled")
+            return
+        container = self.ui.x_y_z_pref
+        self._pref_plot = pg.PlotWidget(parent=container)
+        self._pref_plot.setGeometry(container.rect())
+        self._pref_plot.setBackground('w')
+        self._pref_plot.setLabel('bottom', 'Time after command', units='s')
+        self._pref_plot.setLabel('left', 'Inertial position', units='m')
+        self._pref_plot.addLegend(offset=(5, -5))
+        self._pref_plot.getPlotItem().layout.setContentsMargins(0, 15, 0, 0)
+        dashed = Qt.DashLine
+        self._pref_curve_x = self._pref_plot.plot(
+            pen=pg.mkPen('#CC0000', width=2), name='X (m)')
+        self._pref_curve_y = self._pref_plot.plot(
+            pen=pg.mkPen('#008800', width=2), name='Y (m)')
+        self._pref_curve_z = self._pref_plot.plot(
+            pen=pg.mkPen('#0055AA', width=2), name='Z (m)')
+        self._pref_curve_x_cmd = self._pref_plot.plot(
+            pen=pg.mkPen('#CC0000', width=2, style=dashed), name='X cmd (m)')
+        self._pref_curve_y_cmd = self._pref_plot.plot(
+            pen=pg.mkPen('#008800', width=2, style=dashed), name='Y cmd (m)')
+        self._pref_curve_z_cmd = self._pref_plot.plot(
+            pen=pg.mkPen('#0055AA', width=2, style=dashed), name='Z cmd (m)')
+        self._pref_plot.setXRange(0, self._pref_window_s, padding=0)
+        self._pref_plot.show()
+
+    def _update_pref_window(self, seconds):
+        self._pref_window_s = int(seconds)
+        self.ui.label_pref.setText(f"Window Size: {self._pref_window_s}s")
+        if hasattr(self, '_pref_plot'):
+            self._pref_plot.setXRange(0, self._pref_window_s, padding=0)
+
+    def _clear_step_response(self):
+        for samples in (
+                self._pref_t, self._pref_x, self._pref_y, self._pref_z,
+                self._pref_x_cmd, self._pref_y_cmd, self._pref_z_cmd):
+            samples.clear()
+        if hasattr(self, '_pref_curve_x'):
+            for curve in (
+                    self._pref_curve_x, self._pref_curve_y, self._pref_curve_z,
+                    self._pref_curve_x_cmd, self._pref_curve_y_cmd,
+                    self._pref_curve_z_cmd):
+                curve.setData([], [])
+
+    def _enable_step_response(self):
+        self._clear_step_response()
+        self._pref_t0 = None
+        self._pref_recording = False
+        self._pref_waiting = True
+        self.ui.enable_pref.setText("Waiting for command")
+
+    def _reset_step_response(self):
+        self._pref_waiting = False
+        self._pref_recording = False
+        self._pref_t0 = None
+        self._clear_step_response()
+        self.ui.enable_pref.setText("Enable")
+
+    def _start_step_response(self, x, y, z):
+        if not self._pref_waiting:
+            return
+        self._clear_step_response()
+        self._pref_command = (x, y, z)
+        self._pref_t0 = time.monotonic()
+        self._pref_waiting = False
+        self._pref_recording = True
+        self.ui.enable_pref.setText("Recording")
+
+    def _append_step_response(self):
+        if not self._pref_recording or self._pref_t0 is None:
+            return
+        elapsed = time.monotonic() - self._pref_t0
+        if elapsed > self._pref_window_s:
+            self._pref_recording = False
+            self.ui.enable_pref.setText("Enable")
+            return
+
+        x_cmd, y_cmd, z_cmd = self._pref_command
+        self._pref_t.append(elapsed)
+        self._pref_x.append(self.local_pos_msg.x)
+        self._pref_y.append(self.local_pos_msg.y)
+        self._pref_z.append(self.local_pos_msg.z)
+        self._pref_x_cmd.append(x_cmd)
+        self._pref_y_cmd.append(y_cmd)
+        self._pref_z_cmd.append(z_cmd)
+
+        if not hasattr(self, '_pref_curve_x'):
+            return
+        t_values = list(self._pref_t)
+        self._pref_curve_x.setData(t_values, list(self._pref_x))
+        self._pref_curve_y.setData(t_values, list(self._pref_y))
+        self._pref_curve_z.setData(t_values, list(self._pref_z))
+        self._pref_curve_x_cmd.setData(t_values, list(self._pref_x_cmd))
+        self._pref_curve_y_cmd.setData(t_values, list(self._pref_y_cmd))
+        self._pref_curve_z_cmd.setData(t_values, list(self._pref_z_cmd))
 
     # define the signal-slot combination of ros and pyqt GUI
     def set_ros_callbacks(self):
@@ -520,6 +651,9 @@ class SingleDroneRosThread:
         # callbacks from GUI
         self.ui.SendPositionUAV.clicked.connect(self.send_coordinates)
         self.ui.GetCurrentPositionUAV.clicked.connect(self.get_coordinates)
+        self.ui.enable_pref.clicked.connect(self._enable_step_response)
+        self.ui.reset_pref.clicked.connect(self._reset_step_response)
+        self.ui.scrollbar_pref.valueChanged.connect(self._update_pref_window)
 
     # update GUI data
     def update_gui_data(self):
@@ -573,6 +707,7 @@ class SingleDroneRosThread:
         self.ui.AGL_DISP.display("{:.2f}".format(self.local_pos_msg.z, 2))
 
         self._append_position_plot()
+        self._append_step_response()
 
         self.ui.TargROLL_RATE_DISP.display("{:.2f}".format(alttitude_targ_msg.roll_rate, 2))
         self.ui.TargPITCH_RATE_DISP.display("{:.2f}".format(alttitude_targ_msg.pitch_rate, 2))
@@ -667,17 +802,12 @@ class SingleDroneRosThread:
         self.ros_object.publish_coordinates(x, y, z, yaw)
         self.log_message(f"Position command sent: {x}, {y}, {z}, {yaw}")
 
-        # Update the dashed command lines in the X/Y/Z/Yaw plot to the setpoint
-        # just sent. Wrap yaw to [-180, 180] to match the plot's fixed yaw axis.
+        # Update the dashed command lines in the X/Y/Z plot to the setpoint sent.
         self._last_x_cmd = x
         self._last_y_cmd = y
         self._last_z_cmd = z
-        yaw_wrapped = yaw
-        if yaw_wrapped > 180:
-            yaw_wrapped -= 360
-        elif yaw_wrapped < -180:
-            yaw_wrapped += 360
-        self._last_yaw_cmd = yaw_wrapped
+        self._last_yaw_cmd = ((yaw + 180.0) % 360.0) - 180.0
+        self._start_step_response(x, y, z)
 
     def get_coordinates(self):
         # get current relative position

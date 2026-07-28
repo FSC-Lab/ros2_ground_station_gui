@@ -360,13 +360,13 @@
      </rect>
     </property>
     <property name="currentIndex">
-     <number>2</number>
+     <number>0</number>
     </property>
     <widget class="QWidget" name="Flight_Graph">
      <attribute name="title">
       <string>Flight Log</string>
      </attribute>
-     <widget class="QWidget" name="display_tracking_error" native="true">
+     <widget class="QWidget" name="display_body_angle" native="true">
       <property name="geometry">
        <rect>
         <x>20</x>
@@ -376,7 +376,7 @@
        </rect>
       </property>
      </widget>
-     <widget class="QWidget" name="display_x_y_z_yaw" native="true">
+     <widget class="QWidget" name="display_x_y_z" native="true">
       <property name="geometry">
        <rect>
         <x>20</x>
@@ -391,19 +391,6 @@
      <attribute name="title">
       <string>Step Response</string>
      </attribute>
-     <widget class="QPushButton" name="buttom_pref">
-      <property name="geometry">
-       <rect>
-        <x>30</x>
-        <y>30</y>
-        <width>151</width>
-        <height>41</height>
-       </rect>
-      </property>
-      <property name="text">
-       <string>Reset</string>
-      </property>
-     </widget>
      <widget class="QScrollBar" name="scrollbar_pref">
       <property name="geometry">
        <rect>
@@ -438,6 +425,32 @@
         <width>531</width>
         <height>331</height>
        </rect>
+      </property>
+     </widget>
+     <widget class="QPushButton" name="enable_pref">
+      <property name="geometry">
+       <rect>
+        <x>30</x>
+        <y>30</y>
+        <width>151</width>
+        <height>41</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Enable</string>
+      </property>
+     </widget>
+     <widget class="QPushButton" name="reset_pref">
+      <property name="geometry">
+       <rect>
+        <x>30</x>
+        <y>80</y>
+        <width>151</width>
+        <height>41</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Reset</string>
       </property>
      </widget>
     </widget>
