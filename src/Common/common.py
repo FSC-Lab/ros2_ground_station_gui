@@ -48,6 +48,7 @@ class CommonData(): # store the data from the ROS nodes
         self.current_yaw_align = False
         self.current_controller_type = ""
         self.current_motor_commands = [0.0, 0.0, 0.0, 0.0]
+        self.current_position_error = ros_common.Vector3()
 
         # water sampling
         self.encoder_raw = ros_common.Vector3()
@@ -298,6 +299,15 @@ class CommonData(): # store the data from the ROS nodes
         if not self.lock.tryLock():
             return
         self.current_motor_commands = list(motor_commands[:4])
+        self.lock.unlock()
+        return
+
+    def update_position_error(self, x, y, z):
+        if not self.lock.tryLock():
+            return
+        self.current_position_error.x = x
+        self.current_position_error.y = y
+        self.current_position_error.z = z
         self.lock.unlock()
         return
     

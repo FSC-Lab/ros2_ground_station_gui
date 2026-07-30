@@ -73,6 +73,61 @@ Run from the repository root because the controllers currently open JSON configu
 - Avoid broad cleanup of commented legacy ROS 1 (water-sampling) code unless the task specifically includes migration or removal.
 - Keep configuration JSON valid and preserve its existing schema unless all readers are updated together.
 
+## Controller-tab design direction
+
+The single-drone GUI's Controller tab is intended to discover and activate controllers;
+it is not a fixed two-mode display:
+
+- `avaliable_controllers` displays every controller reported as available by the running
+  ROS 2 control stack. Preserve this existing widget `objectName` despite its spelling.
+- `buttom_refresh_options` sends a ROS 2 service request to query the available
+  controllers. The request must be asynchronous and have a finite timeout so an absent
+  or unresponsive service never freezes the Qt GUI. On timeout or service failure, keep
+  the previously displayed list and report the error in the command log/status UI.
+- `buttom_activate_controller` requests activation of the controller currently selected
+  in `avaliable_controllers`. Disable it when there is no valid selection, while a request
+  is pending, or when the activation service is unavailable. Report the service result
+  and confirm the active controller from ROS status feedback rather than assuming that a
+  sent request succeeded.
+- `buttom_back_to_baseline` is the dedicated control for switching back to the baseline
+  controller. It does not depend on the table selection. Keep this return path distinct
+  from `buttom_activate_controller`, and confirm the transition from ROS status feedback.
+  Preserve the existing widget `objectName` despite its spelling.
+- The interface (implemented 2026-07-30, `fsc_autopilot_ros2_msgs`):
+
+  | Purpose | Interface |
+  |---|---|
+  | Discovery | `/uav_0/fsc_autopilot_ros2/list_controllers` (`ListControllers`) |
+  | Activation | `/uav_0/fsc_autopilot_ros2/activate_controller` (`ActivateController`) |
+  | Live status | `/uav_0/fsc_autopilot_ros2/controller_type` (`std_msgs/String`, transient-local) |
+
+  `ListControllers.Response` returns `ControllerInfo[]` — a struct per mode
+  (`name`, `description`, `active`, `selectable`, `reason`), not parallel string arrays,
+  so rows carry their own meaning. `ControllerInfo.name` is what `ActivateController`
+  expects, and it matches the string published on `controller_type`, so a table row can
+  be compared against live status without a translation table.
+
+  **Scope: modes of the node that answers.** Baseline, CCM, CCM-outer and
+  direct-actuation are separate executables chosen by the launcher, so a node can only
+  report and activate what it switches into internally. Only the direct-actuation node
+  implements this today (`SAFETY` / `DIRECT`); under the baseline stack both clients stay
+  not-ready and the tab must report "unavailable" rather than erroring. Listing every
+  workspace variant would need a supervisor that starts/stops processes — that does not
+  exist, so do not present the table as if it did.
+
+  Activation is idempotent (re-requesting the active mode succeeds as a no-op) and
+  unknown names are rejected rather than defaulted. Responses always carry the true
+  `active` mode, including on failure.
+
+- The safe switch is deliberately **asymmetric**, and must stay that way: entering a mode
+  that takes control from PX4 requires explicit confirmation and a selectable row, while
+  `buttom_back_to_baseline` is one click, independent of the table selection, and is not
+  disabled by a pending activation — an abort you have to confirm is an abort you cannot
+  use. Activation timeouts must not claim the switch failed; the request may have been
+  acted on, so re-read live status instead.
+- Controller discovery/activation is separate from vehicle arm/disarm and PX4 flight-mode
+  switching. It must not implicitly arm a vehicle or request OFFBOARD mode.
+
 ## Validation
 
 There is currently no automated test suite, formatter, linter, or dependency manifest in the repository. Follow the surrounding style rather than reformatting entire files, and use the checks appropriate to the change:
