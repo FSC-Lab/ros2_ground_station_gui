@@ -88,6 +88,27 @@ Conventions that are easy to break:
   the position-error plot they fed was replaced by the body-angle plot. Harmless (they
   are still trimmed, so no unbounded growth), but do not assume they are displayed.
 
+## Single-drone step-response logging
+
+The "Step Response" tab (`single_drone_flight.ui`) plots position response to a single
+commanded step, separate from the continuous telemetry plots on "Flight Log". Recording
+does not start on every `send_coordinates()` call — it must be armed explicitly first
+(added 2026-07-31):
+
+- `buttom_enable_log` toggles `_pref_armed` via `_toggle_enable_log()`. Its label tracks
+  state: `"Enable"` when disarmed, `"Waiting..."` when armed.
+- `send_coordinates()` only calls `_start_step_response(x, y, z)` if `_pref_armed` is
+  `True` at send time; doing so clears the flag and resets the button label, so arming
+  is a single-shot latch that captures exactly one subsequent send, not a persistent
+  recording mode.
+- `buttom_pref` ("Reset") clears the currently plotted window at any time and is
+  independent of arming.
+- `_pref_waiting`/`_pref_recording` track whether a capture is in progress versus
+  finished/idle; they do not gate whether a capture starts — `_pref_armed` does.
+
+Keep the arm state single-shot when extending this workflow, so an accidental repeated
+send doesn't silently overwrite a capture the user meant to keep.
+
 ## Editing rules
 
 - Treat `src/GUI/GUI_Sampler.ui` and `src/GUI/single_drone_flight.ui` as the source of truth for GUI layout changes, for the multi-drone and single-drone stations respectively. Do not manually edit the corresponding generated `*.py` files; they contain a generated-file warning and will be overwritten.

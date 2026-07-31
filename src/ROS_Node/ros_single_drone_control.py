@@ -539,6 +539,7 @@ class SingleDroneRosThread(QObject):
         self._last_yaw_cmd = 0.0
         self._pref_waiting = True
         self._pref_recording = False
+        self._pref_armed = False
         self._pref_t0 = None
         self._pref_window_s = STEP_RESPONSE_DEFAULT_WINDOW_S
         self._pref_command = (0.0, 0.0, 0.0)
@@ -1065,6 +1066,15 @@ class SingleDroneRosThread(QObject):
         self._clear_step_response()
         self.ui.buttom_pref.setText("Reset")
 
+    def _toggle_enable_log(self):
+        self._pref_armed = not self._pref_armed
+        if self._pref_armed:
+            self.ui.buttom_enable_log.setText("Waiting...")
+            self.log_message("Step response logging armed: waiting for next position command")
+        else:
+            self.ui.buttom_enable_log.setText("Enable")
+            self.log_message("Step response logging disarmed")
+
     def _start_step_response(self, x, y, z):
         self._clear_step_response()
         self._pref_command = (x, y, z)
@@ -1114,6 +1124,7 @@ class SingleDroneRosThread(QObject):
         self.ui.GetCurrentPositionUAV.clicked.connect(self.get_coordinates)
         self.ui.buttom_pref.clicked.connect(self._reset_step_response)
         self.ui.scrollbar_pref.valueChanged.connect(self._update_pref_window)
+        self.ui.buttom_enable_log.clicked.connect(self._toggle_enable_log)
         self.ui.buttom_refresh_options.clicked.connect(self._refresh_controller_switch)
         self.ui.buttom_activate_controller.clicked.connect(self._request_controller_switch)
         # Was previously never connected, so the dedicated abort path did nothing.
@@ -1281,7 +1292,12 @@ class SingleDroneRosThread(QObject):
         self._last_y_cmd = y
         self._last_z_cmd = z
         self._last_yaw_cmd = ((yaw + 180.0) % 360.0) - 180.0
-        self._start_step_response(x, y, z)
+
+        if self._pref_armed:
+            self._pref_armed = False
+            self.ui.buttom_enable_log.setText("Enable")
+            self._start_step_response(x, y, z)
+            self.log_message("Step response logging started")
 
     def get_coordinates(self):
         # get current relative position
