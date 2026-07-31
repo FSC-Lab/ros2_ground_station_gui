@@ -33,7 +33,7 @@ Use a ROS 2 environment that provides the workspace's message packages. Importan
 - `px4_msgs`
 - `fsc_autopilot_ros2_msgs`
 - `geometry_msgs`, `nav_msgs`, `std_msgs`, `std_srvs`, and `visualization_msgs`
-- `pyqtgraph` (optional): powers the embedded real-time plots in the single-drone GUI (e.g. `display_x_y_z_yaw`). Import is guarded — the GUI runs without it, printing `[PLOT] pyqtgraph not found` and leaving that plot blank.
+- `pyqtgraph` (optional): powers the embedded real-time plots in the single-drone GUI (`display_x_y_z` and `display_body_angle` — see "Single-drone telemetry plots"). Import is guarded — the GUI runs without it, printing `[PLOT] pyqtgraph not found` and leaving those plots blank.
 
 See `docs/prerequisites.md` for the expected ROS 2 workspace layout and upstream packages. In particular, `px4_msgs` and `fsc_autopilot_ros2_msgs` must be available from the sourced workspace.
 
@@ -51,6 +51,43 @@ PYTHONPATH=src python3 src/single_drone_ground_control.py
 
 Run from the repository root because the controllers currently open JSON configuration using paths such as `src/ROS_Node/geofence.json`.
 
+## Single-drone telemetry plots
+
+Two pyqtgraph plots live on the "Flight Log" tab, each drawn into a bare `QWidget`
+container declared in `single_drone_flight.ui` and filled in at runtime by
+`ros_single_drone_control.py`. Both share one time axis and one history window
+(`POSITION_PLOT_HISTORY_S`), and both are fed from the single `_append_position_plot()`
+tick, so their sample sets stay aligned.
+
+| Container | Setup method | Curves |
+| --- | --- | --- |
+| `display_x_y_z` | `_setup_position_plot_impl()` | X/Y/Z position (m) solid, X/Y/Z command dashed |
+| `display_body_angle` | `_setup_body_angle_plot()` | Roll/Pitch/Yaw (deg) solid, Yaw command dashed |
+
+Conventions that are easy to break:
+
+- **Position and attitude are deliberately on separate plots.** Yaw previously shared
+  `display_x_y_z` on a second right-hand `ViewBox` with its own axis, which needed a
+  `sigResized` handler to keep the two viewboxes aligned. That is all gone — the
+  position plot now has a single left axis in metres. Do not reintroduce a second
+  ViewBox without also restoring the resize syncing.
+- **Only yaw has a commanded counterpart.** Roll and pitch are outputs of the position
+  controller, not operator commands, so they have no dashed line. Their setpoints would
+  have to come from a new subscription (e.g. `attitude_setpoint_debug`), not from
+  existing GUI state.
+- **Angles are already degrees** when they reach the plot: `common.py`'s
+  `quat_to_euler()` converts before storing. Roll and pitch arrive as ±180; **yaw
+  arrives wrapped to [0, 360)** and is re-normalised to ±180 in `_append_position_plot()`
+  to match `_last_yaw_cmd`, which `send_coordinates()` already stores as ±180.
+- **Label degrees as text (`'Body angle (deg)'`), never `units='deg'`.** pyqtgraph
+  SI-prefixes unit strings and will render "mdeg"/"kdeg" as the range changes.
+- The body-angle plot's Y range is **pinned to ±180** rather than autoscaled; autoscale
+  turns a level hover into apparent violent oscillation by zooming into millidegree
+  noise.
+- `_plot_err_x/y/z` are still appended and trimmed but no longer plotted anywhere —
+  the position-error plot they fed was replaced by the body-angle plot. Harmless (they
+  are still trimmed, so no unbounded growth), but do not assume they are displayed.
+
 ## Editing rules
 
 - Treat `src/GUI/GUI_Sampler.ui` and `src/GUI/single_drone_flight.ui` as the source of truth for GUI layout changes, for the multi-drone and single-drone stations respectively. Do not manually edit the corresponding generated `*.py` files; they contain a generated-file warning and will be overwritten.
@@ -62,7 +99,8 @@ Run from the repository root because the controllers currently open JSON configu
   ```
 
 - Review the generated diff after regeneration to ensure the `.ui` and Python output remain synchronized.
-- Keep Qt widget `objectName` values stable unless every corresponding reference in the ROS controller is updated.
+- Use `scripts/convert_ui.sh` rather than calling `pyuic5` by hand. The script passes `-x`, which emits the trailing `if __name__ == "__main__":` preview block; a bare `pyuic5` omits it, so a hand-run regeneration silently deletes that block and shows up as unrelated noise in the diff.
+- Keep Qt widget `objectName` values stable unless every corresponding reference in the ROS controller is updated. Renaming a container in Qt Designer does **not** fail loudly — the generated `*.py` picks up the new name while `ros_single_drone_control.py` still asks for the old one, and the GUI dies with an `AttributeError` only when that plot is first built. After any rename, grep the controller for the old name. (Precedent: `display_tracking_error` -> `display_body_angle` and `display_x_y_z_yaw` -> `display_x_y_z`, 2026-07-30.)
 - Preserve the ROS/Qt threading boundary. ROS executors run in `QThread`; GUI widgets must be updated through Qt signals/slots on the GUI side.
 - Keep publishers, subscriptions, clients, timers, executors, and threads referenced for as long as they are needed. Shutdown must not leave an executor or worker thread running.
 - Access shared `CommonData` state under its `QMutex`. Keep lock sections short, copy values locally, always unlock on every acquired path, and preserve the existing non-blocking `tryLock()` behavior unless deliberately changing the concurrency model.

@@ -366,7 +366,7 @@
      <attribute name="title">
       <string>Flight Log</string>
      </attribute>
-     <widget class="QWidget" name="display_tracking_error" native="true">
+     <widget class="QWidget" name="display_body_angle" native="true">
       <property name="geometry">
        <rect>
         <x>20</x>
@@ -376,7 +376,7 @@
        </rect>
       </property>
      </widget>
-     <widget class="QWidget" name="display_x_y_z_yaw" native="true">
+     <widget class="QWidget" name="display_x_y_z" native="true">
       <property name="geometry">
        <rect>
         <x>20</x>
@@ -467,7 +467,7 @@
      </rect>
     </property>
     <property name="currentIndex">
-     <number>1</number>
+     <number>0</number>
     </property>
     <widget class="QWidget" name="command_tab">
      <attribute name="title">

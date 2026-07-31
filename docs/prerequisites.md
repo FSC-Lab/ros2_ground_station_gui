@@ -18,7 +18,7 @@ Everything needed to run the GUI entry points in this repository
 |---|---|---|
 | PyQt5 | `sudo apt install python3-pyqt5` | GUI framework — both entry points |
 | NumPy | `sudo apt install python3-numpy` (or `pip install numpy`) | `Common/common.py` — quaternion/frame conversions |
-| pyqtgraph | `pip install pyqtgraph` | **Optional.** Powers the real-time plots in `single_drone_ground_control.py` (e.g. `display_x_y_z_yaw`). Import is guarded — the GUI runs without it, printing `[PLOT] pyqtgraph not found` and leaving those plots blank. |
+| pyqtgraph | `pip install pyqtgraph` | **Optional.** Powers the real-time plots in `single_drone_ground_control.py` (`display_x_y_z` and `display_body_angle`). Import is guarded — the GUI runs without it, printing `[PLOT] pyqtgraph not found` and leaving those plots blank. |
 
 ## 3. ROS 2 message packages
 

@@ -550,7 +550,7 @@ class SingleDroneRosThread(QObject):
         self._pref_y_cmd = deque()
         self._pref_z_cmd = deque()
         self._setup_position_plot()
-        self._setup_tracking_error_plot()
+        self._setup_body_angle_plot()
         self._setup_step_response_plot()
         self._setup_step_response_controls()
         self._setup_motor_display()
@@ -868,8 +868,8 @@ class SingleDroneRosThread(QObject):
         pg.setConfigOptions(antialias=True)
 
         # Pin the PlotWidget to the exact pixel bounds of the container widget
-        # (display_x_y_z_yaw in single_drone_flight.ui).
-        container = self.ui.display_x_y_z_yaw
+        # (display_x_y_z in single_drone_flight.ui).
+        container = self.ui.display_x_y_z
         self._pos_plot = pg.PlotWidget(parent=container)
         self._pos_plot.move(0, 0)
         self._pos_plot.setFixedSize(container.width(), container.height())
@@ -878,13 +878,14 @@ class SingleDroneRosThread(QObject):
         self._pos_plot.setBackground('w')
         self._pos_plot.setLabel('bottom', 'Time', units='s')
         self._pos_plot.setLabel('left', 'Position', units='m')
-        self._pos_plot.showAxis('right')
-        self._pos_plot.setLabel('right', 'Yaw (deg)', color='#AA00AA')
         self._pos_plot.addLegend(offset=(5, -5))
         # Push plot content down so the top margin isn't clipped by the container edge
         self._pos_plot.getPlotItem().layout.setContentsMargins(0, 15, 0, 0)
 
-        # Left axis - X/Y/Z position (m), solid = actual, dashed = commanded
+        # X/Y/Z position (m) only: solid = actual, dashed = commanded. Yaw used to
+        # share this plot on a second right-hand axis; it now lives on the body-angle
+        # plot alongside roll and pitch, so a single left axis in metres is the whole
+        # story here and the second ViewBox (and its resize syncing) is gone.
         dashed = Qt.DashLine
         self._curve_x = self._pos_plot.plot(pen=pg.mkPen('#CC0000', width=2), name='X (m)')
         self._curve_y = self._pos_plot.plot(pen=pg.mkPen('#008800', width=2), name='Y (m)')
@@ -896,45 +897,42 @@ class SingleDroneRosThread(QObject):
         self._curve_z_cmd = self._pos_plot.plot(
             pen=pg.mkPen('#0055AA', width=2, style=dashed), name='Z cmd (m)')
 
-        self._vb_yaw = pg.ViewBox()
-        self._vb_yaw.invertY(False)
-        self._pos_plot.scene().addItem(self._vb_yaw)
-        self._pos_plot.getAxis('right').linkToView(self._vb_yaw)
-        self._vb_yaw.setXLink(self._pos_plot)
-        self._curve_yaw = pg.PlotDataItem(
-            pen=pg.mkPen('#AA00AA', width=2), name='Yaw (deg)')
-        self._curve_yaw_cmd = pg.PlotDataItem(
-            pen=pg.mkPen('#AA00AA', width=2, style=dashed), name='Yaw cmd (deg)')
-        self._vb_yaw.addItem(self._curve_yaw)
-        self._vb_yaw.addItem(self._curve_yaw_cmd)
-        self._vb_yaw.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
-        self._vb_yaw.setYRange(-180, 180, padding=0)
-        self._pos_plot.getViewBox().sigResized.connect(self._sync_position_plot_views)
-        QTimer.singleShot(0, self._sync_position_plot_views)
+    def _setup_body_angle_plot(self):
+        """Body attitude in degrees: roll, pitch, yaw, plus the yaw command.
 
-    def _sync_position_plot_views(self):
-        self._vb_yaw.setGeometry(self._pos_plot.getViewBox().sceneBoundingRect())
-        self._vb_yaw.linkedViewChanged(
-            self._pos_plot.getViewBox(), self._vb_yaw.XAxis)
-
-    def _setup_tracking_error_plot(self):
+        Replaces the old position-error plot in this container. Only yaw has a
+        command to compare against — roll and pitch are not commanded directly by
+        the operator, they fall out of the position controller — so yaw is the only
+        curve with a dashed counterpart.
+        """
         if not _HAS_PYQTGRAPH:
             return
-        container = self.ui.display_tracking_error
-        self._error_plot = pg.PlotWidget(parent=container)
-        self._error_plot.setGeometry(container.rect())
-        self._error_plot.setBackground('w')
-        self._error_plot.setLabel('bottom', 'Time', units='s')
-        self._error_plot.setLabel('left', 'Position error', units='m')
-        self._error_plot.addLegend(offset=(5, -5))
-        self._error_plot.getPlotItem().layout.setContentsMargins(0, 15, 0, 0)
-        self._curve_err_x = self._error_plot.plot(
-            pen=pg.mkPen('#CC0000', width=2), name='X error (m)')
-        self._curve_err_y = self._error_plot.plot(
-            pen=pg.mkPen('#008800', width=2), name='Y error (m)')
-        self._curve_err_z = self._error_plot.plot(
-            pen=pg.mkPen('#0055AA', width=2), name='Z error (m)')
-        self._error_plot.show()
+        container = self.ui.display_body_angle
+        self._angle_plot = pg.PlotWidget(parent=container)
+        self._angle_plot.setGeometry(container.rect())
+        self._angle_plot.setBackground('w')
+        self._angle_plot.setLabel('bottom', 'Time', units='s')
+        # Degrees deliberately in the label text, not units='deg': pyqtgraph would
+        # SI-prefix a units string and render "mdeg"/"kdeg" as the range changes.
+        self._angle_plot.setLabel('left', 'Body angle (deg)')
+        self._angle_plot.addLegend(offset=(5, -5))
+        self._angle_plot.getPlotItem().layout.setContentsMargins(0, 15, 0, 0)
+
+        dashed = Qt.DashLine
+        self._curve_roll = self._angle_plot.plot(
+            pen=pg.mkPen('#CC0000', width=2), name='Roll (deg)')
+        self._curve_pitch = self._angle_plot.plot(
+            pen=pg.mkPen('#008800', width=2), name='Pitch (deg)')
+        self._curve_yaw = self._angle_plot.plot(
+            pen=pg.mkPen('#AA00AA', width=2), name='Yaw (deg)')
+        self._curve_yaw_cmd = self._angle_plot.plot(
+            pen=pg.mkPen('#AA00AA', width=2, style=dashed), name='Yaw cmd (deg)')
+
+        # Fixed range: all three angles are already normalised to +-180, and letting
+        # this autoscale makes a level hover look like violent oscillation because the
+        # view zooms into millidegree noise.
+        self._angle_plot.setYRange(-180, 180, padding=0)
+        self._angle_plot.show()
 
     def _append_position_plot(self):
         if not _HAS_PYQTGRAPH or not hasattr(self, '_curve_x'):
@@ -944,7 +942,11 @@ class SingleDroneRosThread(QObject):
             self._plot_t0_pos = now
         t = now - self._plot_t0_pos
 
-        # Show yaw continuously in the conventional signed degree range.
+        # All three angles arrive from common.py's quat_to_euler already in DEGREES;
+        # roll and pitch are already +-180, but yaw is wrapped there to [0, 360), so
+        # only yaw needs re-normalising to the signed range the plot uses.
+        roll = self.imu_msg.roll
+        pitch = self.imu_msg.pitch
         yaw = self.imu_msg.yaw
         if yaw > 180:
             yaw -= 360
@@ -955,6 +957,8 @@ class SingleDroneRosThread(QObject):
         self._plot_x.append(self.local_pos_msg.x)
         self._plot_y.append(self.local_pos_msg.y)
         self._plot_z.append(self.local_pos_msg.z)
+        self._plot_roll.append(roll)
+        self._plot_pitch.append(pitch)
         self._plot_yaw.append(yaw)
         self._plot_yaw_cmd.append(self._last_yaw_cmd)
         self._plot_x_cmd.append(self._last_x_cmd)
@@ -971,6 +975,8 @@ class SingleDroneRosThread(QObject):
             self._plot_x.popleft()
             self._plot_y.popleft()
             self._plot_z.popleft()
+            self._plot_roll.popleft()
+            self._plot_pitch.popleft()
             self._plot_yaw.popleft()
             self._plot_yaw_cmd.popleft()
             self._plot_x_cmd.popleft()
@@ -981,19 +987,20 @@ class SingleDroneRosThread(QObject):
             self._plot_err_z.popleft()
 
         t_list = list(self._plot_t_pos)
+        # Position plot: X/Y/Z and their commands, nothing else.
         self._curve_x.setData(t_list, list(self._plot_x))
         self._curve_y.setData(t_list, list(self._plot_y))
         self._curve_z.setData(t_list, list(self._plot_z))
-        self._curve_yaw.setData(t_list, list(self._plot_yaw))
-        self._curve_yaw_cmd.setData(t_list, list(self._plot_yaw_cmd))
         self._curve_x_cmd.setData(t_list, list(self._plot_x_cmd))
         self._curve_y_cmd.setData(t_list, list(self._plot_y_cmd))
         self._curve_z_cmd.setData(t_list, list(self._plot_z_cmd))
-        self._curve_err_x.setData(t_list, list(self._plot_err_x))
-        self._curve_err_y.setData(t_list, list(self._plot_err_y))
-        self._curve_err_z.setData(t_list, list(self._plot_err_z))
+        # Body-angle plot: roll/pitch/yaw in degrees, with the yaw command dashed.
+        self._curve_roll.setData(t_list, list(self._plot_roll))
+        self._curve_pitch.setData(t_list, list(self._plot_pitch))
+        self._curve_yaw.setData(t_list, list(self._plot_yaw))
+        self._curve_yaw_cmd.setData(t_list, list(self._plot_yaw_cmd))
         self._pos_plot.setXRange(max(0.0, t - POSITION_PLOT_HISTORY_S), t, padding=0)
-        self._error_plot.setXRange(max(0.0, t - POSITION_PLOT_HISTORY_S), t, padding=0)
+        self._angle_plot.setXRange(max(0.0, t - POSITION_PLOT_HISTORY_S), t, padding=0)
 
     # --- Position-command step response -----------------------------------------
     def _setup_step_response_controls(self):
