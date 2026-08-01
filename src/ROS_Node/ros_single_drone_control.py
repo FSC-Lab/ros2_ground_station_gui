@@ -24,6 +24,7 @@ SOFTWARE.
 
 import time
 import math
+import threading
 from collections import deque
 
 import rclpy
@@ -225,6 +226,18 @@ class SingleDroneRosNode(Node, QObject):
         # Timer for main loop (will be started when thread runs)
         self.timer = None
 
+        # Requests handed over from the Qt GUI thread. rclpy client objects are NOT
+        # thread-safe: calling call_async()/service_is_ready() from the GUI thread while
+        # executor.spin() drives the same client in this thread blocks the GUI on the
+        # client's internal lock for up to ~1 s. Everything rclpy-touching therefore
+        # happens in timer_callback(), which runs in the ROS thread.
+        self._pending_requests = deque()
+        self._request_lock = threading.Lock()
+        # Cached service availability, refreshed here so the GUI never queries the ROS
+        # graph from its own thread (also up to ~1 s under contention).
+        self._services_ready_cache = False
+        self._services_ready_checked = 0.0
+
         # In-flight controller service calls and their deadlines (see
         # _check_controller_deadlines).
         self._list_future = None
@@ -349,8 +362,39 @@ class SingleDroneRosNode(Node, QObject):
     CONTROLLER_SERVICE_TIMEOUT_S = 3.0
 
     def controller_services_ready(self):
-        return (self.list_controllers_client.service_is_ready()
-                and self.activate_controller_client.service_is_ready())
+        """Cached — safe to call from the Qt thread at GUI rate."""
+        return self._services_ready_cache
+
+    def _refresh_services_ready(self):
+        """ROS-thread only. Graph queries are slow and lock-contended."""
+        now = time.monotonic()
+        if now - self._services_ready_checked < 0.5:
+            return
+        self._services_ready_checked = now
+        self._services_ready_cache = (
+            self.list_controllers_client.service_is_ready()
+            and self.activate_controller_client.service_is_ready())
+
+    # -- called FROM THE QT THREAD: enqueue only, never touch rclpy ---------
+    def queue_controller_list(self):
+        with self._request_lock:
+            self._pending_requests.append(("list", None))
+
+    def queue_controller_activation(self, name):
+        with self._request_lock:
+            self._pending_requests.append(("activate", name))
+
+    def _drain_requests(self):
+        """ROS-thread only: issue whatever the GUI queued."""
+        while True:
+            with self._request_lock:
+                if not self._pending_requests:
+                    return
+                kind, arg = self._pending_requests.popleft()
+            if kind == "list":
+                self.request_controller_list()
+            elif kind == "activate":
+                self.request_controller_activation(arg)
 
     def request_controller_list(self):
         if not self.list_controllers_client.service_is_ready():
@@ -460,6 +504,10 @@ class SingleDroneRosNode(Node, QObject):
 
     # Timer callback for main loop
     def timer_callback(self):
+        # Runs in the ROS thread (created in run()), so this is the only safe place to
+        # touch rclpy clients.
+        self._refresh_services_ready()
+        self._drain_requests()
         self._check_controller_deadlines()
         self.update_data.emit(0)
     
@@ -753,7 +801,7 @@ class SingleDroneRosThread(QObject):
         # Discover once as soon as the node shows up, so the tab is populated
         # without the operator having to press Refresh first.
         if services_ready and not self._controllers and not self._controller_request_pending:
-            self.ros_object.request_controller_list()
+            self.ros_object.queue_controller_list()
 
     def _refresh_controller_switch(self):
         if not self.ros_object.controller_services_ready():
@@ -762,7 +810,7 @@ class SingleDroneRosThread(QObject):
             self._update_controller_buttons()
             return
         self.log_message("Querying available controllers...")
-        self.ros_object.request_controller_list()
+        self.ros_object.queue_controller_list()
 
     def _handle_controllers_listed(self, success, message, controllers):
         if not success:
@@ -823,7 +871,7 @@ class SingleDroneRosThread(QObject):
         self.ui.buttom_activate_controller.setEnabled(False)
         self.ui.buttom_activate_controller.setText(f"Requesting {name}...")
         self.log_message(f"Requesting controller: {name}")
-        self.ros_object.request_controller_activation(name)
+        self.ros_object.queue_controller_activation(name)
 
     def _handle_controller_activated(self, success, message, active):
         requested = self._pending_activation
@@ -842,7 +890,7 @@ class SingleDroneRosThread(QObject):
                 f"WARNING: requested '{requested}' but node reports '{active}'")
         # Re-read the list so selectable/reason reflect the new active mode.
         if self.ros_object.controller_services_ready():
-            self.ros_object.request_controller_list()
+            self.ros_object.queue_controller_list()
 
     def _handle_direct_mode_result(self, success, message):
         # Legacy SetBool path, kept so the direct-actuation runbook's
