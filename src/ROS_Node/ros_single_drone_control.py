@@ -48,6 +48,10 @@ except ImportError:
 POSITION_PLOT_HISTORY_S = 10.0  # seconds of history shown in the live plots
 STEP_RESPONSE_DEFAULT_WINDOW_S = 30
 STEP_RESPONSE_MAX_WINDOW_S = 60
+# Cap on the flight-log widget. Every entry is edge-triggered (arm/disarm, mode change,
+# yaw-align flip, operator actions), so this is not a spam guard -- it bounds growth over
+# a long session, where an unbounded QListWidget makes each scrollToBottom() slower.
+LOG_MAX_LINES = 500
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
 from px4_msgs.msg import ActuatorMotors, VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus,VehicleRatesSetpoint, EstimatorStatusFlags
 from fsc_autopilot_ros2_msgs.msg import PositionControllerReference, PositionControllerState, VehicleInfo
@@ -167,8 +171,10 @@ class SingleDroneRosNode(Node, QObject):
         # Define subscribers
         self.imu_sub = self.create_subscription(VehicleAttitude, '/uav_0/fmu/out/vehicle_attitude', self.imu_callback, self.px4_qos_profile)
         self.pos_global_sub = self.create_subscription(VehicleGlobalPosition, '/uav_0/fmu/out/vehicle_global_position', self.pos_global_callback, self.px4_qos_profile)
-        self.pos_local_adjusted_sub = self.create_subscription(Odometry, '/uav_0/state_estimator/local_position/odom', self.pos_local_callback, 10)
-        self.vel_sub = self.create_subscription(Odometry, '/uav_0/state_estimator/local_position/odom', self.vel_callback, 10)
+        # One subscription, not two. Pose and twist arrive in the same Odometry message,
+        # so subscribing twice deserialised every message twice for nothing -- 118 of the
+        # 670 callbacks/s measured in DIRECT on 2026-08-03. See docs/gui_responsiveness.md.
+        self.pos_local_adjusted_sub = self.create_subscription(Odometry, '/uav_0/state_estimator/local_position/odom', self.odom_callback, 10)
         self.bat_sub = self.create_subscription(BatteryStatus, '/uav_0/fmu/out/battery_status', self.bat_callback, self.px4_qos_profile)
         self.status_sub = self.create_subscription(VehicleStatus, '/uav_0/fmu/out/vehicle_status_v1', self.status_callback, self.px4_qos_profile)
         self.commanded_attitude_sub = self.create_subscription(VehicleAttitudeSetpoint, '/uav_0/fsc_autopilot_ros2/attitude_setpoint_debug', self.commanded_attitude_callback, self.px4_input_qos_profile)
@@ -266,10 +272,10 @@ class SingleDroneRosNode(Node, QObject):
     def pos_global_callback(self, msg):
         self.data_struct.update_global_pos(msg.lat, msg.lon, msg.alt)
     
-    def pos_local_callback(self, msg):
+    def odom_callback(self, msg):
+        # Pose and twist come from the one message; splitting this across two
+        # subscriptions doubled the deserialisation cost for identical data.
         self.data_struct.update_local_pos(msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z)
-
-    def vel_callback(self, msg):
         self.data_struct.update_vel(msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z)
 
     def bat_callback(self, msg):
@@ -384,6 +390,14 @@ class SingleDroneRosNode(Node, QObject):
         with self._request_lock:
             self._pending_requests.append(("activate", name))
 
+    def queue_coordinates(self, x, y, z, yaw):
+        # Same reason as the two above: publish_coordinates() touches the clock, a
+        # publisher and the logger, and doing that from the Qt thread while the executor
+        # spins means contending with it for the rclpy locks. The controller buttons were
+        # moved onto this queue when the switch button stalled ~1 s; this one was missed.
+        with self._request_lock:
+            self._pending_requests.append(("coords", (x, y, z, yaw)))
+
     def _drain_requests(self):
         """ROS-thread only: issue whatever the GUI queued."""
         while True:
@@ -395,6 +409,8 @@ class SingleDroneRosNode(Node, QObject):
                 self.request_controller_list()
             elif kind == "activate":
                 self.request_controller_activation(arg)
+            elif kind == "coords":
+                self.publish_coordinates(*arg)
 
     def request_controller_list(self):
         if not self.list_controllers_client.service_is_ready():
@@ -563,6 +579,17 @@ class SingleDroneRosThread(QObject):
         # what was actually asked for rather than against the current selection.
         self._pending_activation = None
 
+        # Plot redraw decimation: data is appended every GUI tick (30 Hz) so nothing is
+        # lost, but the curves are re-drawn only every Nth tick.
+        #
+        # This is NOT what fixed the lag -- measured 2026-08-04, decimating 30 -> 3 Hz
+        # changed the dropped-frame rate not at all. The fix was giving the plots a fixed
+        # relative-time x-axis (see _setup_position_plot_impl). Decimation is kept only
+        # because it cuts plot CPU ~3x for free and 10 Hz is well past what an operator
+        # can read. Do not cite it as the fix.
+        self.PLOT_REDRAW_EVERY = 3
+        self._plot_tick = 0
+
         # inertial-position and body-angle plot data buffers
         self._plot_t0_pos = None
         self._plot_t_pos = deque()
@@ -628,8 +655,14 @@ class SingleDroneRosThread(QObject):
         """Add timestamped message to GUI logging widget"""
         timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
         formatted_message = f"[{timestamp}] {message}"
-        self.ui.list_cmd_log.addItem(formatted_message)
-        self.ui.list_cmd_log.scrollToBottom()
+        widget = self.ui.list_cmd_log
+        widget.addItem(formatted_message)
+        # Drop the oldest entries past the cap. takeItem() detaches the item; deleting
+        # the reference is what actually frees it, since Qt no longer owns it.
+        while widget.count() > LOG_MAX_LINES:
+            del_item = widget.takeItem(0)
+            del del_item
+        widget.scrollToBottom()
 
     def _setup_motor_display(self):
         container = self.ui.display_quad_rotor_NT
@@ -925,7 +958,15 @@ class SingleDroneRosThread(QObject):
         self._pos_plot.show()
 
         self._pos_plot.setBackground('w')
-        self._pos_plot.setLabel('bottom', 'Time', units='s')
+        # Seconds-ago axis, fixed once here and never moved again. Profiling under real
+        # DIRECT load (2026-08-04) put setXRange at 49% of ALL GUI-thread work -- 3 ms a
+        # call, twice per redraw -- because moving the view re-runs axis layout, the SI
+        # prefix check and a setHtml label re-render every tick. Plotting against relative
+        # time keeps the view static and the data scrolling, so that whole cascade is gone.
+        # Units are in the label text, not units=, for the same reason as the angle plot.
+        self._pos_plot.setLabel('bottom', 'Time (s, relative)')
+        self._pos_plot.getAxis('bottom').enableAutoSIPrefix(False)
+        self._pos_plot.setXRange(-POSITION_PLOT_HISTORY_S, 0, padding=0)
         self._pos_plot.setLabel('left', 'Position', units='m')
         self._pos_plot.addLegend(offset=(5, -5))
         # Push plot content down so the top margin isn't clipped by the container edge
@@ -960,7 +1001,10 @@ class SingleDroneRosThread(QObject):
         self._angle_plot = pg.PlotWidget(parent=container)
         self._angle_plot.setGeometry(container.rect())
         self._angle_plot.setBackground('w')
-        self._angle_plot.setLabel('bottom', 'Time', units='s')
+        # Fixed seconds-ago axis -- see the position plot for why moving it is costly.
+        self._angle_plot.setLabel('bottom', 'Time (s, relative)')
+        self._angle_plot.getAxis('bottom').enableAutoSIPrefix(False)
+        self._angle_plot.setXRange(-POSITION_PLOT_HISTORY_S, 0, padding=0)
         # Degrees deliberately in the label text, not units='deg': pyqtgraph would
         # SI-prefix a units string and render "mdeg"/"kdeg" as the range changes.
         self._angle_plot.setLabel('left', 'Body angle (deg)')
@@ -1035,21 +1079,50 @@ class SingleDroneRosThread(QObject):
             self._plot_err_y.popleft()
             self._plot_err_z.popleft()
 
-        t_list = list(self._plot_t_pos)
-        # Position plot: X/Y/Z and their commands, nothing else.
-        self._curve_x.setData(t_list, list(self._plot_x))
-        self._curve_y.setData(t_list, list(self._plot_y))
-        self._curve_z.setData(t_list, list(self._plot_z))
-        self._curve_x_cmd.setData(t_list, list(self._plot_x_cmd))
-        self._curve_y_cmd.setData(t_list, list(self._plot_y_cmd))
-        self._curve_z_cmd.setData(t_list, list(self._plot_z_cmd))
-        # Body-angle plot: roll/pitch/yaw in degrees, with the yaw command dashed.
-        self._curve_roll.setData(t_list, list(self._plot_roll))
-        self._curve_pitch.setData(t_list, list(self._plot_pitch))
-        self._curve_yaw.setData(t_list, list(self._plot_yaw))
-        self._curve_yaw_cmd.setData(t_list, list(self._plot_yaw_cmd))
-        self._pos_plot.setXRange(max(0.0, t - POSITION_PLOT_HISTORY_S), t, padding=0)
-        self._angle_plot.setXRange(max(0.0, t - POSITION_PLOT_HISTORY_S), t, padding=0)
+        # Everything above is deque bookkeeping and costs nothing; everything below is the
+        # curve update, which used to make the ground station unusable in DIRECT flight.
+        # It was root-caused on 2026-08-04 to the per-tick setXRange this method used to
+        # end with -- 49% of all GUI-thread work. With the fixed relative-time axis that
+        # replaced it, frames over 50 ms went from 17-22% to 0.0-1.7%.
+        #
+        # Do not try to optimise the drawing itself: antialiasing, batched updates, fixed
+        # Y range, setDownsampling/setClipToView, point count (300 -> 60) and redraw
+        # decimation (30 -> 3 Hz) were each measured and none changed the dropped-frame
+        # rate. Message load is not the cause either -- with zero ROS traffic and these
+        # curves live it was just as bad. See docs/gui_responsiveness.md.
+        #
+        # Skipping the update entirely while the plots are off-screen predates the axis
+        # fix and is kept as defence in depth. The deques above keep filling, so the
+        # history is complete the instant the operator switches back.
+        pos_visible = self._pos_plot.isVisible()
+        angle_visible = self._angle_plot.isVisible()
+        if not (pos_visible or angle_visible):
+            return
+
+        # Decimated redraw; see PLOT_REDRAW_EVERY for why this is a CPU saving and not
+        # the lag fix. The appends above still run every tick, so no data is lost.
+        self._plot_tick += 1
+        if self._plot_tick % self.PLOT_REDRAW_EVERY:
+            return
+
+        # Seconds ago, so the newest sample sits at x=0 and the view never has to move.
+        # The axis range is fixed once at setup; scrolling the DATA instead of the VIEW
+        # is what removes setXRange from this path.
+        t_list = [ti - t for ti in self._plot_t_pos]
+        if pos_visible:
+            # Position plot: X/Y/Z and their commands, nothing else.
+            self._curve_x.setData(t_list, list(self._plot_x))
+            self._curve_y.setData(t_list, list(self._plot_y))
+            self._curve_z.setData(t_list, list(self._plot_z))
+            self._curve_x_cmd.setData(t_list, list(self._plot_x_cmd))
+            self._curve_y_cmd.setData(t_list, list(self._plot_y_cmd))
+            self._curve_z_cmd.setData(t_list, list(self._plot_z_cmd))
+        if angle_visible:
+            # Body-angle plot: roll/pitch/yaw in degrees, with the yaw command dashed.
+            self._curve_roll.setData(t_list, list(self._plot_roll))
+            self._curve_pitch.setData(t_list, list(self._plot_pitch))
+            self._curve_yaw.setData(t_list, list(self._plot_yaw))
+            self._curve_yaw_cmd.setData(t_list, list(self._plot_yaw_cmd))
 
     # --- Position-command step response -----------------------------------------
     def _setup_step_response_controls(self):
@@ -1132,6 +1205,12 @@ class SingleDroneRosThread(QObject):
         self.ui.buttom_pref.setText("Reset")
 
     def _append_step_response(self):
+        # A step that finished while this tab was hidden still owes the operator one
+        # redraw the first time they look at it, or they would see a partial trace.
+        # Only when idle -- doing this while recording would defeat the decimation below.
+        if (not self._pref_recording and getattr(self, '_pref_dirty', False)
+                and hasattr(self, '_pref_curve_x') and self._pref_plot.isVisible()):
+            self._redraw_step_response()
         if not self._pref_recording or self._pref_t0 is None:
             return
         elapsed = time.monotonic() - self._pref_t0
@@ -1151,6 +1230,19 @@ class SingleDroneRosThread(QObject):
 
         if not hasattr(self, '_pref_curve_x'):
             return
+        # Same reasoning as _append_position_plot: the appends above are cheap and must
+        # keep running so the recorded step is complete, but the redraw is not, and while
+        # a step is recording this is a third plot's worth of work on top of the other
+        # two. Skip it when off-screen or on a decimated tick; the flush at the top of
+        # this method makes the trace whole again once the tab is shown.
+        self._pref_dirty = True
+        self._pref_tick = getattr(self, '_pref_tick', 0) + 1
+        if not self._pref_plot.isVisible() or self._pref_tick % self.PLOT_REDRAW_EVERY:
+            return
+        self._redraw_step_response()
+
+    def _redraw_step_response(self):
+        self._pref_dirty = False
         t_values = list(self._pref_t)
         self._pref_curve_x.setData(t_values, list(self._pref_x))
         self._pref_curve_y.setData(t_values, list(self._pref_y))
@@ -1332,7 +1424,9 @@ class SingleDroneRosThread(QObject):
             msg.exec_()
             return
 
-        self.ros_object.publish_coordinates(x, y, z, yaw)
+        # Queued, not published inline: this runs on the Qt thread and must not touch
+        # rclpy. It is issued by _drain_requests() on the next ROS tick (<=33 ms).
+        self.ros_object.queue_coordinates(x, y, z, yaw)
         self.log_message(f"Position command sent: {x}, {y}, {z}, {yaw}")
 
         # Update the dashed command lines in the X/Y/Z plot to the setpoint sent.
