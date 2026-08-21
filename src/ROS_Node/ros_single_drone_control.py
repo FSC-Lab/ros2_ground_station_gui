@@ -194,6 +194,20 @@ class SingleDroneRosNode(Node, QObject):
             self.motor_commands_callback,
             10
         )
+        # Each direct-actuation controller publishes the same message under its
+        # own namespace; one callback serves all (only one node runs at a time).
+        self.geometric_motor_commands_sub = self.create_subscription(
+            ActuatorMotors,
+            '/uav_0/fsc_autopilot_ros2/geometric_direct_actuation/motors_debug',
+            self.motor_commands_callback,
+            10
+        )
+        self.geometric_l1_motor_commands_sub = self.create_subscription(
+            ActuatorMotors,
+            '/uav_0/fsc_autopilot_ros2/geometric_l1_direct_actuation/motors_debug',
+            self.motor_commands_callback,
+            10
+        )
         self.position_error_sub = self.create_subscription(
             PositionControllerState,
             '/uav_0/fsc_autopilot_ros2/position_controller/state',
@@ -1292,7 +1306,11 @@ class SingleDroneRosThread(QObject):
         self.ui.label_vehicle_type.setText(f"Vehicle Type: {vehicle_name}")
         controller_type_display = controller_type or "Unknown"
         self.ui.label_controller_type.setText(f"Controller: {controller_type_display}")
-        direct_actuation = controller_type == "Direct Actuation"
+        direct_actuation = controller_type in (
+            "Direct Actuation",
+            "Geometric Direct Actuation",
+            "Geometric+L1 Direct Actuation",
+        )
         self._update_controller_switch(controller_type)
 
         # accelerometer data
