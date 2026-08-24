@@ -181,12 +181,31 @@ class SingleDroneRosNode(Node, QObject):
             self.controller_type_callback,
             self.controller_type_qos_profile
         )
-        self.motor_commands_sub = self.create_subscription(
-            ActuatorMotors,
-            '/uav_0/fsc_autopilot_ros2/direct_actuation/motors_debug',
-            self.motor_commands_callback,
-            10
-        )
+        # Per-rotor commands, for the "N/T for each rotor" widget. Each
+        # direct-actuation node variant publishes this under its OWN service
+        # namespace, so subscribe to every known one -- only one control node
+        # ever runs at a time, so the extra subscriptions simply stay silent.
+        # (The classic node's namespace is `direct_actuation`; both geometric
+        # nodes -- AM and bare-drone -- use `geometric_direct_actuation`; the
+        # whole-body aerial-manipulator fork uses
+        # `whole_body_direct_actuation`, added 2026-08-23 -- without it the
+        # N/T rotor pies sat at 0.0% for the whole of a whole-body DIRECT
+        # flight, since that fork's stream never reached this list.)
+        self.motor_commands_subs = [
+            self.create_subscription(
+                ActuatorMotors,
+                topic,
+                self.motor_commands_callback,
+                10
+            )
+            for topic in (
+                '/uav_0/fsc_autopilot_ros2/direct_actuation/motors_debug',
+                '/uav_0/fsc_autopilot_ros2/geometric_direct_actuation/motors_debug',
+                '/uav_0/fsc_autopilot_ros2/whole_body_direct_actuation/motors_debug',
+            )
+        ]
+        # Back-compat alias: some code/logging referred to the single handle.
+        self.motor_commands_sub = self.motor_commands_subs[0]
         self.position_error_sub = self.create_subscription(
             PositionControllerState,
             '/uav_0/fsc_autopilot_ros2/position_controller/state',
@@ -1141,7 +1160,12 @@ class SingleDroneRosThread(QObject):
         self.ui.label_vehicle_type.setText(f"Vehicle Type: {vehicle_name}")
         controller_type_display = controller_type or "Unknown"
         self.ui.label_controller_type.setText(f"Controller: {controller_type_display}")
-        direct_actuation = controller_type == "Direct Actuation"
+        # Substring, not equality: every direct-actuation variant reports a
+        # name ENDING in "Direct Actuation" but prefixes it with its law
+        # ("Geometric Direct Actuation"). An equality test silently zeroed the
+        # rotor display and mislabelled the control mode on the geometric
+        # nodes, which publish real motor commands just like the classic one.
+        direct_actuation = "Direct Actuation" in (controller_type or "")
         self._update_controller_switch(controller_type)
 
         # accelerometer data
