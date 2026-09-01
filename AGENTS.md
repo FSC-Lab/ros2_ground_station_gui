@@ -66,6 +66,22 @@ tick, so their sample sets stay aligned.
 
 Conventions that are easy to break:
 
+- **The x-axis is fixed at `[-10, 0]` s and must stay that way.** Curves are fed
+  `t_i - t_now`, so the newest sample sits at x=0 and the *data* scrolls, not the view.
+  Do **not** "fix" this back to absolute time plus a per-tick `setXRange` — profiling
+  under real DIRECT-mode load (2026-08-04) put that single call at **49% of all
+  GUI-thread work**, because moving the view re-runs axis layout, the SI-prefix check and
+  a `setHtml` label re-render every tick. It was the cause of the ground station becoming
+  unusable during flight. Both bottom axes therefore also set `enableAutoSIPrefix(False)`
+  and carry their unit in the label text, for the same reason as the degrees rule below.
+- **Curve updates are skipped while the plots are off-screen** (an `isVisible()` gate),
+  with the deques still filling so no history is lost. Retained as defence in depth after
+  the axis fix. `_append_step_response()` additionally flushes once when its plot becomes
+  visible, so a step recorded on a hidden tab is not left as a partial trace.
+- Before optimising anything here, read [docs/gui_responsiveness.md](docs/gui_responsiveness.md):
+  antialiasing, batched updates, fixed Y range, `setDownsampling`/`setClipToView`, point
+  count (300 → 60) and redraw decimation (30 → 3 Hz) were each measured and **none** of
+  them help; `setDownsampling` made it worse. Message load is not the cause either.
 - **Position and attitude are deliberately on separate plots.** Yaw previously shared
   `display_x_y_z` on a second right-hand `ViewBox` with its own axis, which needed a
   `sigResized` handler to keep the two viewboxes aligned. That is all gone — the
@@ -88,6 +104,27 @@ Conventions that are easy to break:
   the position-error plot they fed was replaced by the body-angle plot. Harmless (they
   are still trimmed, so no unbounded growth), but do not assume they are displayed.
 
+## Single-drone step-response logging
+
+The "Step Response" tab (`single_drone_flight.ui`) plots position response to a single
+commanded step, separate from the continuous telemetry plots on "Flight Log". Recording
+does not start on every `send_coordinates()` call — it must be armed explicitly first
+(added 2026-07-31):
+
+- `buttom_enable_log` toggles `_pref_armed` via `_toggle_enable_log()`. Its label tracks
+  state: `"Enable"` when disarmed, `"Waiting..."` when armed.
+- `send_coordinates()` only calls `_start_step_response(x, y, z)` if `_pref_armed` is
+  `True` at send time; doing so clears the flag and resets the button label, so arming
+  is a single-shot latch that captures exactly one subsequent send, not a persistent
+  recording mode.
+- `buttom_pref` ("Reset") clears the currently plotted window at any time and is
+  independent of arming.
+- `_pref_waiting`/`_pref_recording` track whether a capture is in progress versus
+  finished/idle; they do not gate whether a capture starts — `_pref_armed` does.
+
+Keep the arm state single-shot when extending this workflow, so an accidental repeated
+send doesn't silently overwrite a capture the user meant to keep.
+
 ## Editing rules
 
 - Treat `src/GUI/GUI_Sampler.ui` and `src/GUI/single_drone_flight.ui` as the source of truth for GUI layout changes, for the multi-drone and single-drone stations respectively. Do not manually edit the corresponding generated `*.py` files; they contain a generated-file warning and will be overwritten.
@@ -102,6 +139,8 @@ Conventions that are easy to break:
 - Use `scripts/convert_ui.sh` rather than calling `pyuic5` by hand. The script passes `-x`, which emits the trailing `if __name__ == "__main__":` preview block; a bare `pyuic5` omits it, so a hand-run regeneration silently deletes that block and shows up as unrelated noise in the diff.
 - Keep Qt widget `objectName` values stable unless every corresponding reference in the ROS controller is updated. Renaming a container in Qt Designer does **not** fail loudly — the generated `*.py` picks up the new name while `ros_single_drone_control.py` still asks for the old one, and the GUI dies with an `AttributeError` only when that plot is first built. After any rename, grep the controller for the old name. (Precedent: `display_tracking_error` -> `display_body_angle` and `display_x_y_z_yaw` -> `display_x_y_z`, 2026-07-30.)
 - Preserve the ROS/Qt threading boundary. ROS executors run in `QThread`; GUI widgets must be updated through Qt signals/slots on the GUI side.
+- **The boundary is two-way: nothing on the Qt thread may touch rclpy.** Button handlers run on the Qt thread while the executor spins, so calling a publisher, a service client, `get_clock()` or `get_logger()` from one contends for the rclpy locks. Push the request onto `_pending_requests` (guarded by `_request_lock`) through a `queue_*` helper and let `_drain_requests()` — called from `timer_callback()`, i.e. the ROS thread — issue it on the next tick (≤33 ms). Existing helpers: `queue_controller_list()`, `queue_controller_activation()`, `queue_coordinates()`. The last was added 2026-08-04 after `send_coordinates()` was found publishing inline; the first two came from the switch-controller button stalling ~1 s. Cache service *readiness* too (`_refresh_services_ready()`, throttled to 2 Hz) — graph queries are slow and lock-contended.
+- Keep the flight log bounded. `log_message()` trims `list_cmd_log` to `LOG_MAX_LINES`; an unbounded `QListWidget` makes every `scrollToBottom()` progressively slower over a long session.
 - Keep publishers, subscriptions, clients, timers, executors, and threads referenced for as long as they are needed. Shutdown must not leave an executor or worker thread running.
 - Access shared `CommonData` state under its `QMutex`. Keep lock sections short, copy values locally, always unlock on every acquired path, and preserve the existing non-blocking `tryLock()` behavior unless deliberately changing the concurrency model.
 - For each new UAV-specific topic, derive the namespace from the drone ID (`/uav_{i}/...`) and store subscriptions/publishers so ROS objects remain alive.
