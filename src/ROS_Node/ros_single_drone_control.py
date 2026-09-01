@@ -192,12 +192,21 @@ class SingleDroneRosNode(Node, QObject):
         # direct-actuation node variant publishes this under its OWN service
         # namespace, so subscribe to every known one -- only one control node
         # ever runs at a time, so the extra subscriptions simply stay silent.
-        # (The classic node's namespace is `direct_actuation`; both geometric
-        # nodes -- AM and bare-drone -- use `geometric_direct_actuation`; the
-        # whole-body aerial-manipulator fork uses
-        # `whole_body_direct_actuation`, added 2026-08-23 -- without it the
-        # N/T rotor pies sat at 0.0% for the whole of a whole-body DIRECT
-        # flight, since that fork's stream never reached this list.)
+        # There are exactly FOUR such namespaces across the seven forks, and
+        # forks SHARE them in pairs (AM + bare-drone), so this list is shorter
+        # than the fork count:
+        #   direct_actuation             classic AM + classic drone
+        #   geometric_direct_actuation   geometric AM + geometric drone
+        #   geometric_l1_direct_actuation   geometric+L1 AM + geometric+L1 drone
+        #   whole_body_direct_actuation  whole-body AM
+        # A fork missing from this list shows up as N/T pies pinned at 0.0%
+        # for a whole DIRECT flight with nothing else wrong -- the other two
+        # gates below (the "Direct Actuation" substring test on
+        # controller_type, and `connected`) pass fine, so there is no error
+        # anywhere, just a silent zero. Diagnose with `ros2 topic info` on the
+        # fork's motors_debug: "Publisher count: 1, Subscription count: 0".
+        # Happened twice -- whole_body added 2026-08-23, geometric_l1 added
+        # 2026-08-24. When a NEW fork is added, add its namespace here.
         self.motor_commands_subs = [
             self.create_subscription(
                 ActuatorMotors,
@@ -208,6 +217,7 @@ class SingleDroneRosNode(Node, QObject):
             for topic in (
                 '/uav_0/fsc_autopilot_ros2/direct_actuation/motors_debug',
                 '/uav_0/fsc_autopilot_ros2/geometric_direct_actuation/motors_debug',
+                '/uav_0/fsc_autopilot_ros2/geometric_l1_direct_actuation/motors_debug',
                 '/uav_0/fsc_autopilot_ros2/whole_body_direct_actuation/motors_debug',
             )
         ]
@@ -1335,10 +1345,18 @@ class SingleDroneRosThread(QObject):
         else:
             self.ui.label_total_nt.setText(f"Total N/T: {throttle_pct}%")
 
-        connected = bool(state_msg and state_msg.connected)
+        # GATE ON THE MOTOR STREAM ITSELF, NOT ON `connected`. `connected` is PX4's
+        # pre_flight_checks_pass (see common.py), which is false for an ENTIRE armed
+        # DIRECT flight on the AM-T650 rigs -- EKF aligned, commander "Ready for
+        # takeoff!", vehicle flying -- and pinned these pies at 0.0% with nothing
+        # wrong anywhere. Measured 2026-08-24/25. Freshness of motors_debug is the
+        # question actually being asked here: is a direct-actuation node streaming
+        # commands right now? It also zeroes correctly on reverting to SAFETY, when
+        # the stream stops, which is the behaviour the old gate was reaching for.
+        motors_live = self.ros_object.data_struct.motor_commands_fresh()
         displayed_motor_commands = (
             motor_commands
-            if direct_actuation and connected
+            if direct_actuation and motors_live
             else (0.0, 0.0, 0.0, 0.0)
         )
         self._motor_display.set_commands(displayed_motor_commands)

@@ -22,6 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 '''
 #!/usr/bin/env python
+import time
 from PyQt5.QtCore import QMutex
 from px4_msgs.msg import VehicleStatus
 
@@ -48,6 +49,11 @@ class CommonData(): # store the data from the ROS nodes
         self.current_yaw_align = False
         self.current_controller_type = ""
         self.current_motor_commands = [0.0, 0.0, 0.0, 0.0]
+        # Wall-clock time of the last motors_debug message. The rotor display
+        # gates on THIS (is a direct-actuation node actually streaming commands?)
+        # rather than on current_state.connected, which is PX4's
+        # pre_flight_checks_pass and is false on some rigs for the whole flight.
+        self.last_motor_commands_time = 0.0
         self.current_position_error = ros_common.Vector3()
 
         # water sampling
@@ -299,8 +305,21 @@ class CommonData(): # store the data from the ROS nodes
         if not self.lock.tryLock():
             return
         self.current_motor_commands = list(motor_commands[:4])
+        self.last_motor_commands_time = time.monotonic()
         self.lock.unlock()
         return
+
+    def motor_commands_fresh(self, max_age_s=0.5):
+        """True while a direct-actuation node is actually streaming motor commands.
+
+        This is the liveness test the rotor display needs. It deliberately does NOT
+        consult current_state.connected: that field is PX4's pre_flight_checks_pass,
+        which on the AM-T650 rigs reads false for an entire armed DIRECT flight (EKF
+        aligned, commander "Ready for takeoff!", vehicle flying) and pinned the N/T
+        pies at 0.0% with nothing actually wrong.
+        """
+        return (self.last_motor_commands_time > 0.0
+                and (time.monotonic() - self.last_motor_commands_time) < max_age_s)
 
     def update_position_error(self, x, y, z):
         if not self.lock.tryLock():
