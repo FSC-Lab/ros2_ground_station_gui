@@ -723,6 +723,22 @@ class SingleDroneRosThread(QObject):
     # dangerous name) keeps a newly added mode guarded by default.
     SAFE_CONTROLLER_NAMES = ("Baseline (Safety)", "Baseline", "SAFETY")
 
+    # DISPLAY aliases (2026-09-18, user request): the operator sees the three
+    # roles -- Baseline, Decoupled (the geometric+L1 aerial-manipulator law of
+    # Cai et al.), Whole-Body (the coupled law) -- while every service call and
+    # the safe-name test keep using the registry's own names. A fork not
+    # listed here is shown under its registry name unchanged.
+    CONTROLLER_DISPLAY_ALIASES = {
+        "Baseline (Safety)": "Baseline",
+        "Geometric+L1 Direct Actuation": "Decoupled",
+        "Whole-Body Direct Actuation": "Whole-Body",
+    }
+
+    @classmethod
+    def _controller_display_name(cls, name):
+        alias = cls.CONTROLLER_DISPLAY_ALIASES.get(name)
+        return f"{alias} ({name})" if alias else (name or "Unknown")
+
     def _is_safe_controller(self, name):
         return name in self.SAFE_CONTROLLER_NAMES
 
@@ -752,8 +768,10 @@ class SingleDroneRosThread(QObject):
                 status = "available"
             else:
                 status = reason or "unavailable"
-            for col, text in enumerate((name, desc, status)):
+            for col, text in enumerate((self._controller_display_name(name), desc, status)):
                 item = QTableWidgetItem(text)
+                if col == 0:
+                    item.setToolTip(f"registry name: {name}")
                 if active:
                     font = item.font()
                     font.setBold(True)
@@ -1319,7 +1337,7 @@ class SingleDroneRosThread(QObject):
         self.lock.unlock()
 
         self.ui.label_vehicle_type.setText(f"Vehicle Type: {vehicle_name}")
-        controller_type_display = controller_type or "Unknown"
+        controller_type_display = self._controller_display_name(controller_type)
         self.ui.label_controller_type.setText(f"Controller: {controller_type_display}")
         # Substring, not equality: every direct-actuation variant reports a
         # name ENDING in "Direct Actuation" but prefixes it with its law
