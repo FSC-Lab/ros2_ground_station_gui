@@ -32,8 +32,9 @@ Use a ROS 2 environment that provides the workspace's message packages. Importan
 - ROS 2 Python (`rclpy`)
 - `px4_msgs`
 - `fsc_autopilot_ros2_msgs`
-- `geometry_msgs`, `nav_msgs`, `std_msgs`, `std_srvs`, and `visualization_msgs`
+- `geometry_msgs`, `nav_msgs`, `sensor_msgs`, `std_msgs`, `std_srvs`, and `visualization_msgs`
 - `pyqtgraph` (optional): powers the embedded real-time plots in the single-drone GUI (`display_x_y_z` and `display_body_angle` — see "Single-drone telemetry plots"). Import is guarded — the GUI runs without it, printing `[PLOT] pyqtgraph not found` and leaving those plots blank.
+- `spd-say` from speech-dispatcher, and `pacat` (or `aplay`) (all optional): the spoken OptiTrack/WiFi announcements and the siren in front of a loss, in the single-drone GUI (see "Audio alarms"). Without them the GUI prints `[AUDIO] ... not found`, and the indicators still work silently.
 
 See `docs/prerequisites.md` for the expected ROS 2 workspace layout and upstream packages. In particular, `px4_msgs` and `fsc_autopilot_ros2_msgs` must be available from the sourced workspace.
 
@@ -124,6 +125,147 @@ does not start on every `send_coordinates()` call — it must be armed explicitl
 
 Keep the arm state single-shot when extending this workflow, so an accidental repeated
 send doesn't silently overwrite a capture the user meant to keep.
+
+## Single-drone OptiTrack indicator
+
+`optitrack_status` (a `QLabel` on the Autonomous Flight tab) has a green background with
+"OptiTrack normal" while raw OptiTrack frames arrive. After `OPTITRACK_TIMEOUT_S`
+(0.4 s) without a frame it turns red with "No OptiTrack". Each transition is announced
+and written to the flight log. A real loss (after having been normal) gets a siren
+before the words. See "Audio alarms" (added 2026-09-25; background colours and siren
+since 2026-09-26).
+
+- **It watches `/vrpn_mocap/uav_0/pose` (`OPTITRACK_TOPIC`), not `/uav_0/mocap`.**
+  During a VRPN dropout, `fsc_optitrack_processor_ros2` keeps republishing the held
+  pose on `/uav_0/mocap` at its timer rate. The estimator's `/uav_0/mocap_status`
+  watchdog watches `/uav_0/mocap`, so it too keeps saying `mocap_normal` with
+  OptiTrack gone. The Orin's `fsc_system_monitor` also watches `/uav_0/mocap`, so its
+  `mocap.status` would read "degraded" (the ~60 Hz held-pose rate) rather than "lost".
+  Do not "simplify" the indicator onto any of those. The topic name comes from the
+  Motive rigid-body name (`uav_0`).
+- **Timeout choice:** in the 2026-09-24 flight bag, VRPN ran at ~120 Hz and its largest
+  gap was 23 ms. 0.4 s therefore means ~48 missed frames and will not trip on WiFi
+  jitter. Tested against that bag: red 0.41 s after the last frame (timeout plus one
+  GUI tick).
+- **The subscription is `raw=True`** because only arrival time is used. This avoids
+  deserialising ~120 messages/s on the ROS thread.
+- **Startup:** for `OPTITRACK_STARTUP_GRACE_S` (2 s) the GUI does not declare a loss,
+  which gives DDS discovery time. The first verdict is then announced once either
+  way, so launching the station tells you where OptiTrack stands.
+- **Updates are edge-triggered.** Announcements only happen on a transition, and all
+  three status labels go through `_set_status_label()`. It calls
+  `setText`/`setStyleSheet` only when the value changes, because `setStyleSheet`
+  re-polishes the widget and should not run at 30 Hz.
+- **No siren for the first verdict at launch.** At the desk with no mocap, the startup
+  "No OptiTrack" is spoken without a siren. An alarm that sounds on every launch
+  teaches people to ignore it.
+
+## Single-drone Orin status (`cpu_status`, `wifi_status`)
+
+Both labels come from one topic, published by `fsc_system_monitor` on Orin0 (added
+2026-09-26):
+
+| Topic | Type | Rate | GUI reader |
+| --- | --- | --- | --- |
+| `/uav_0/system_monitor/status` | `std_msgs/String` (JSON, ~600 B) | 1 Hz, published reliable | best-effort, depth 1 |
+
+The JSON has `stamp` (Orin clock, display only), `wifi.*`, `cpu.*`, `mocap.*` and
+`odom.*`, and any field may be `null`. The GUI uses `cpu.load_pct` (six values:
+CPUs 0-3 housekeeping, 4 the uXRCE-DDS Agent, 5 the control node) and the `wifi` block.
+The formatting and thresholds are the module-level functions `cpu_summary()` and
+`wifi_summary()`, so they can be checked without Qt or ROS.
+
+| `wifi_status` | When |
+| --- | --- |
+| green "WiFi good" | none of the conditions below |
+| yellow "WiFi: <reason>" | `signal_dbm` < -75, `ping_ms` null or > 50, `qdisc_backlog_max_pkts` > 0 in 3 consecutive reports, or `udp_txq_max_bytes` > 100 KB |
+| red "No WiFi" | no report for `SYSTEM_STATUS_STALE_S` (3 s), or `wifi.connected` is false |
+
+- **"No WiFi" is mostly judged from silence.** The Orin is WiFi-only, so from the ground
+  station a dead link and a dead monitor look the same. The second line of the label
+  says which one it saw. `connected: false` can only arrive if some other route
+  exists.
+- **Best-effort reader on purpose.** A reliable reader would make the Orin retransmit
+  stale reports over a link that is already stalling.
+- **Two lines at 9 pt** (`TWO_LINE_FONT`). Checked to fit the 231x41 and 391x41
+  labels with the longest texts, e.g. "no status from Orin for 125 s" and six loads
+  at 100%.
+- **Only entering and leaving "No WiFi" is announced and logged**: siren and
+  "No WiFi", then "WiFi restored" without a siren. Good <-> fair can flip every second
+  while the signal sits near a threshold. Nothing fires before the first report
+  arrives, so launching without the Orin is quiet (the label is red).
+- `mocap`/`odom` from this report are not shown. See the OptiTrack section for why
+  `mocap.status` is not used for `optitrack_status`.
+
+## Audio alarms (`AudioAnnouncer`)
+
+Announcements play one at a time: a siren (optional), then speech. Every step is a
+`QProcess`, so nothing blocks the GUI thread.
+
+- **The siren is generated in memory** (`_siren_pcm()`: three 700-1400 Hz sweeps,
+  1.2 s). It is piped as raw PCM to `pacat`, or `aplay` if `pacat` is missing, so no
+  sound file lives in the repo. Speech is `spd-say -w`, which exits once the text has
+  been spoken, and that is what sequences the queue.
+- **Per-source supersession.** Each announcement has a source (`'optitrack'`,
+  `'wifi'`). A newer one from the same source drops that source's queued item and
+  kills its playing one, and speech is cancelled with `spd-say -C`, because killing
+  the client does not reliably stop speech-dispatcher. Without this, a loss followed
+  by a quick recovery would play "OptiTrack normal" during the siren and then the
+  stale "No OptiTrack" after it. Announcements from different sources queue instead,
+  because OptiTrack and WiFi tend to drop together and neither alarm should clip the
+  other.
+- **Watchdog.** A step that runs past `STEP_TIMEOUT_MS` (10 s) is killed and the
+  announcement continues, so a hung siren player still lets the words through.
+- Tested 2026-09-26 with stand-in players (ordering, supersession, both sources at
+  once, hung siren, hung speech) and silently through the real `pacat`/`spd-say`
+  (siren 1.2 s, then speech, no leftover processes).
+
+## Single-drone camera view
+
+`cam_vision_0` on the "VLM" tab shows the onboard RealSense color stream with the
+YOLO detector's boxes drawn over it (`CameraDetectionView`, added 2026-09-25). The other
+widgets on that tab (`textBrowser`, `plainTextEdit`, `buttom_connect_VLM`,
+`pushButton_2`) are VLM placeholders and are not wired to anything yet.
+
+| Topic | Type | Published QoS | GUI reader |
+| --- | --- | --- | --- |
+| `/uav_0/color/compressed` | `sensor_msgs/CompressedImage` (JPEG, 640x480) | best-effort | best-effort, depth 1 |
+| `/uav_0/detections` | `std_msgs/String` (JSON) | reliable | best-effort, depth 5 |
+
+The publisher is the `vision_localization` node, i.e. `main.py --ros` in
+`~/dev_ws/src/realsense_camera_object_localization` on Orin0. It is not in this workspace.
+
+- **The namespace comes from that script's `--ros-ns` flag**, not from this repo. It
+  was `/vision` for the 2026-09-24 bench bag and `/uav_0` from 2026-09-25. If it
+  changes, update the `VISION_*_TOPIC` constants in `ros_single_drone_control.py`.
+  A missing `--ros` flag has the same symptom as a wrong namespace: no topics, only
+  the MJPEG stream on :8080.
+- **Rates depend on the publisher's flags.** Live on 2026-09-25, images and detections
+  both ran at ~24 Hz. The bench bag had images at 10 Hz (`--ros-image-hz 10`) and
+  detections at ~30 Hz.
+- **Desk test without the drone:** replay `~/ros2bag/vision_bench_20260924_181035` on
+  an unused `ROS_DOMAIN_ID` with `ROS_LOCALHOST_ONLY=1`. The bag uses the old
+  namespace, so remap it:
+  `--remap /vision/color/compressed:=/uav_0/color/compressed /vision/detections:=/uav_0/detections`.
+- **Frames and boxes are paired by header stamp, not by arrival.** The JSON `stamp`
+  is the stamp of the color frame the boxes came from. Images can be published at a
+  lower rate than detections (about every third frame in the bench bag), and the two
+  topics arrive independently. Drawing the latest detections on the latest image
+  would therefore put boxes from a different moment on the frame. `CommonData.match_vision_detections()` looks for the exact stamp first,
+  then the nearest one within 60 ms, and otherwise returns no boxes.
+- **`bbox` is in pixels of the published image.** The view scales boxes with the same
+  transform as the letterboxed frame. If the publisher starts downscaling the JPEG
+  without scaling `bbox` to match, the boxes will drift.
+- **Frames are stored undecoded and decoded only while the view is visible.** The
+  same `isVisible()` gate is used for the plots. `QImage.fromData` takes ~1.2 ms per
+  frame and holds the GIL. When visible, the view costs ~0.04 ms per tick plus a
+  ~1.3 ms repaint per new frame (measured against the bag, 2026-09-25). At the live
+  ~24 Hz image rate, that is roughly 6% of the GUI thread while the tab is showing.
+- **Staleness is judged by receive time (`time.monotonic()`), not header stamps**,
+  because the Jetson's clock is not synchronised with the ground station's. After
+  `VISION_STALE_S`, a frozen frame is dimmed and the status line turns red. "Detector
+  silent" is reported separately from "0 object(s)", so that "no detector" and
+  "nothing detected" can be told apart.
 
 ## Editing rules
 

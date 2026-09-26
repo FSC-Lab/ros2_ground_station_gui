@@ -19,6 +19,8 @@ Everything needed to run the GUI entry points in this repository
 | PyQt5 | `sudo apt install python3-pyqt5` | GUI framework — both entry points |
 | NumPy | `sudo apt install python3-numpy` (or `pip install numpy`) | `Common/common.py` — quaternion/frame conversions |
 | pyqtgraph | `pip install pyqtgraph` | **Optional.** Powers the real-time plots in `single_drone_ground_control.py` (`display_x_y_z` and `display_body_angle`). Import is guarded — the GUI runs without it, printing `[PLOT] pyqtgraph not found` and leaving those plots blank. |
+| speech-dispatcher (`spd-say`) | `sudo apt install speech-dispatcher` (ships with Ubuntu desktop) | **Optional.** Speaks the OptiTrack and WiFi announcements ("No OptiTrack", "No WiFi", ...) in `single_drone_ground_control.py`. Without it the indicators still work, silently, and the GUI prints `[AUDIO] spd-say not found`. |
+| `pacat` (pulseaudio-utils), or `aplay` (alsa-utils) | ship with Ubuntu desktop | **Optional.** Plays the siren in front of a loss announcement. Without either, the GUI prints `[AUDIO] neither pacat nor aplay found` and announcements play with no siren. |
 
 ## 3. ROS 2 message packages
 
@@ -27,6 +29,7 @@ Installed with a standard `ros-humble-desktop` setup, no extra action needed:
 - `rclpy`
 - `geometry_msgs`
 - `nav_msgs`
+- `sensor_msgs` (`CompressedImage`, for the single-drone camera view)
 - `std_msgs`
 - `std_srvs`
 - `visualization_msgs`

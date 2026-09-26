@@ -16,3 +16,8 @@ python3 src/GroundControl.py
 # single-drone station (uav_0)
 python3 src/single_drone_ground_control.py
 ```
+
+- the single-drone station announces OptiTrack and WiFi losses with a siren and
+  speech (`pacat` and `spd-say`, installed by default on Ubuntu desktop). Both are
+  optional; see
+  [docs/prerequisites.md](docs/prerequisites.md).

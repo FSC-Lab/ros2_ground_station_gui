@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>1326</width>
+    <width>1411</width>
     <height>865</height>
    </rect>
   </property>
@@ -355,7 +355,7 @@
      <rect>
       <x>730</x>
       <y>30</y>
-      <width>581</width>
+      <width>651</width>
       <height>531</height>
      </rect>
     </property>
@@ -466,6 +466,67 @@
         <width>391</width>
         <height>331</height>
        </rect>
+      </property>
+     </widget>
+    </widget>
+    <widget class="QWidget" name="VLM_tab">
+     <attribute name="title">
+      <string>VLM</string>
+     </attribute>
+     <widget class="QWidget" name="cam_vision_0" native="true">
+      <property name="geometry">
+       <rect>
+        <x>30</x>
+        <y>30</y>
+        <width>361</width>
+        <height>281</height>
+       </rect>
+      </property>
+     </widget>
+     <widget class="QTextBrowser" name="textBrowser">
+      <property name="geometry">
+       <rect>
+        <x>30</x>
+        <y>320</y>
+        <width>601</width>
+        <height>81</height>
+       </rect>
+      </property>
+     </widget>
+     <widget class="QPlainTextEdit" name="plainTextEdit">
+      <property name="geometry">
+       <rect>
+        <x>30</x>
+        <y>410</y>
+        <width>601</width>
+        <height>61</height>
+       </rect>
+      </property>
+     </widget>
+     <widget class="QPushButton" name="buttom_connect_VLM">
+      <property name="geometry">
+       <rect>
+        <x>400</x>
+        <y>30</y>
+        <width>121</width>
+        <height>61</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Connect to VLM</string>
+      </property>
+     </widget>
+     <widget class="QPushButton" name="pushButton_2">
+      <property name="geometry">
+       <rect>
+        <x>400</x>
+        <y>100</y>
+        <width>121</width>
+        <height>61</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Send</string>
       </property>
      </widget>
     </widget>
@@ -824,7 +885,7 @@
     <property name="geometry">
      <rect>
       <x>470</x>
-      <y>520</y>
+      <y>580</y>
       <width>251</width>
       <height>81</height>
      </rect>
@@ -882,9 +943,9 @@
     <property name="geometry">
      <rect>
       <x>470</x>
-      <y>610</y>
-      <width>251</width>
-      <height>201</height>
+      <y>680</y>
+      <width>241</width>
+      <height>121</height>
      </rect>
     </property>
     <layout class="QVBoxLayout" name="verticalLayout_3">
@@ -940,11 +1001,86 @@
    <widget class="QListWidget" name="list_cmd_log">
     <property name="geometry">
      <rect>
-      <x>980</x>
+      <x>990</x>
       <y>590</y>
-      <width>331</width>
+      <width>391</width>
       <height>211</height>
      </rect>
+    </property>
+   </widget>
+   <widget class="QLabel" name="optitrack_status">
+    <property name="geometry">
+     <rect>
+      <x>440</x>
+      <y>30</y>
+      <width>271</width>
+      <height>41</height>
+     </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">color : red</string>
+    </property>
+    <property name="frameShape">
+     <enum>QFrame::Box</enum>
+    </property>
+    <property name="frameShadow">
+     <enum>QFrame::Plain</enum>
+    </property>
+    <property name="text">
+     <string>No OptiTrack</string>
+    </property>
+    <property name="alignment">
+     <set>Qt::AlignCenter</set>
+    </property>
+   </widget>
+   <widget class="QLabel" name="wifi_status">
+    <property name="geometry">
+     <rect>
+      <x>470</x>
+      <y>520</y>
+      <width>231</width>
+      <height>41</height>
+     </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">color : red</string>
+    </property>
+    <property name="frameShape">
+     <enum>QFrame::Box</enum>
+    </property>
+    <property name="frameShadow">
+     <enum>QFrame::Plain</enum>
+    </property>
+    <property name="text">
+     <string>Wifi Lost</string>
+    </property>
+    <property name="alignment">
+     <set>Qt::AlignCenter</set>
+    </property>
+   </widget>
+   <widget class="QLabel" name="cpu_status">
+    <property name="geometry">
+     <rect>
+      <x>310</x>
+      <y>470</y>
+      <width>391</width>
+      <height>41</height>
+     </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">color : red</string>
+    </property>
+    <property name="frameShape">
+     <enum>QFrame::Box</enum>
+    </property>
+    <property name="frameShadow">
+     <enum>QFrame::Plain</enum>
+    </property>
+    <property name="text">
+     <string>cpu0: 0%, cpu1: 0% </string>
+    </property>
+    <property name="alignment">
+     <set>Qt::AlignCenter</set>
     </property>
    </widget>
   </widget>

@@ -24,18 +24,21 @@ SOFTWARE.
 
 import time
 import math
+import shutil
 import threading
 from collections import deque
+
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from PyQt5.QtCore import QObject, pyqtSignal, QThread, QDateTime, QTimer, Qt, QPointF, QRectF
-from PyQt5.QtGui import QBrush, QColor, QFont, QPainter, QPen
+from PyQt5.QtCore import QObject, pyqtSignal, QProcess, QThread, QDateTime, QTimer, Qt, QPointF, QRectF
+from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPen
 from PyQt5.QtWidgets import QAbstractItemView, QMessageBox, QTableWidgetItem, QWidget
 import Common
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PoseStamped
 
 try:
     import os
@@ -52,6 +55,57 @@ STEP_RESPONSE_MAX_WINDOW_S = 60
 # yaw-align flip, operator actions), so this is not a spam guard -- it bounds growth over
 # a long session, where an unbounded QListWidget makes each scrollToBottom() slower.
 LOG_MAX_LINES = 500
+# Onboard RealSense + YOLO node (VLM tab): vision_localization on Orin0, whose namespace
+# comes from its `--ros-ns` flag. It ran as /vision for the 2026-09-24 bench bag and as
+# /uav_0 from 2026-09-25; if the flag changes, change these two and nothing else.
+VISION_IMAGE_TOPIC = '/uav_0/color/compressed'
+VISION_DETECTIONS_TOPIC = '/uav_0/detections'
+# No frame (or no detections) for this long -> the view says so instead of showing a
+# frozen frame as if it were live. Receive time, not header stamp: the Jetson's clock
+# is not synchronised with the ground station's.
+VISION_STALE_S = 1.0
+# OptiTrack liveness indicator (optitrack_status). The RAW VRPN stream, on purpose: see
+# the subscription in SingleDroneRosNode for why /uav_0/mocap cannot show a dropout.
+# The rigid body must be named `uav_0` in Motive for this topic to exist.
+OPTITRACK_TOPIC = '/vrpn_mocap/uav_0/pose'
+# No frame for this long -> "No OptiTrack". Tune here. The stream runs at ~120 Hz, so
+# 0.4 s is ~48 missed frames: well clear of normal WiFi jitter (largest gap in the
+# 2026-09-24 flight bag: 23 ms), still quick enough to act on.
+OPTITRACK_TIMEOUT_S = 0.4
+# DDS discovery takes a moment after launch; no "No OptiTrack" verdict before this.
+OPTITRACK_STARTUP_GRACE_S = 2.0
+# Audio alarms (AudioAnnouncer): spoken text through speech-dispatcher, preceded by a
+# siren for a loss. Both optional: without them the indicators still work, silently.
+SPEECH_COMMAND = shutil.which('spd-say')
+# The siren is generated in memory (_siren_pcm) and piped to a raw-PCM player, so no
+# sound file ships with the repo. pacat (PulseAudio/PipeWire) first, plain ALSA second.
+SIREN_RATE_HZ = 22050
+if shutil.which('pacat'):
+    SIREN_PLAYER = ['pacat', '--raw', '--format=s16le', f'--rate={SIREN_RATE_HZ}', '--channels=1']
+elif shutil.which('aplay'):
+    SIREN_PLAYER = ['aplay', '-q', '-t', 'raw', '-f', 'S16_LE', '-r', str(SIREN_RATE_HZ), '-c', '1']
+else:
+    SIREN_PLAYER = None
+# Orin health report (cpu_status / wifi_status): fsc_system_monitor on Orin0, JSON in a
+# std_msgs/String at 1 Hz. Its `stamp` is the Orin's clock, so freshness is judged by
+# receive time here, like the camera view.
+SYSTEM_STATUS_TOPIC = '/uav_0/system_monitor/status'
+# Three missed 1 Hz reports -> "No WiFi". The Orin is WiFi-only, so from the ground
+# station a silent monitor and a dead link look the same; the text says which it saw.
+SYSTEM_STATUS_STALE_S = 3.0
+# "Fair" (yellow) thresholds, from the system_monitor author's notes (2026-09-26).
+WIFI_WEAK_SIGNAL_DBM = -75.0
+WIFI_SLOW_PING_MS = 50.0
+WIFI_BACKLOG_REPORTS = 3          # consecutive reports with packets queued for WiFi
+WIFI_UDP_TXQ_WARN_BYTES = 100_000  # the kernel limit is 212992
+# Background colours for the status labels (same green as the rotor pies).
+STATUS_STYLE = {
+    'good': 'background-color: #24A148; color: white;',
+    'fair': 'background-color: #F1C21B; color: black;',
+    'bad': 'background-color: #DA1E28; color: white;',
+}
+# cpu_status and wifi_status are two-line labels 41 px tall.
+TWO_LINE_FONT = ' font-size: 9pt;'
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
 from px4_msgs.msg import ActuatorMotors, VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus,VehicleRatesSetpoint, EstimatorStatusFlags
 from fsc_autopilot_ros2_msgs.msg import PositionControllerReference, PositionControllerState, VehicleInfo
@@ -60,10 +114,71 @@ from fsc_autopilot_ros2_msgs.srv import ActivateController, ListControllers
 # from mavros_msgs.msg import State, AttitudeTarget
 from visualization_msgs.msg import Marker
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import CompressedImage
 import json
 # from fsc_autopilot_msgs.msg import TrackingReference
 from std_msgs.msg import Bool, String
 from std_srvs.srv import SetBool
+
+
+def wifi_summary(wifi, backlog_reports):
+    """(level, text) for wifi_status from one report's `wifi` block.
+
+    Every field may be null (not measured yet), so each one is checked on its own.
+    `backlog_reports` is how many consecutive reports have shown a WiFi send backlog.
+    """
+    wifi = wifi or {}
+    connected = wifi.get('connected')
+    if connected is False:
+        return 'bad', 'No WiFi\nOrin reports no access point'
+    if connected is None:
+        # Not measured yet. The report itself got here, so the link is not down.
+        return 'fair', 'WiFi: link unknown\nmonitor has no WiFi data yet'
+    signal = wifi.get('signal_dbm')
+    ping = wifi.get('ping_ms')
+    freq = wifi.get('freq_mhz')
+    txq = wifi.get('udp_txq_max_bytes')
+
+    problems = []
+    if signal is not None and signal < WIFI_WEAK_SIGNAL_DBM:
+        problems.append('weak signal')
+    if ping is None:
+        problems.append('ping lost')
+    elif ping > WIFI_SLOW_PING_MS:
+        problems.append('slow ping')
+    if backlog_reports >= WIFI_BACKLOG_REPORTS:
+        problems.append('TX backlog')
+    if txq is not None and txq > WIFI_UDP_TXQ_WARN_BYTES:
+        problems.append('send queue high')
+
+    details = []
+    if signal is not None:
+        details.append(f'{signal:.0f} dBm')
+    if ping is not None:
+        details.append(f'{ping:.1f} ms' if ping < 10 else f'{ping:.0f} ms')
+    if freq:
+        details.append('2.4 GHz' if freq < 3000 else ('5 GHz' if freq < 5925 else '6 GHz'))
+    details = ' · '.join(details)
+    if problems:
+        # Two at most, so the first line fits the label.
+        return 'fair', f"WiFi: {', '.join(problems[:2])}\n{details}"
+    return 'good', f'WiFi good\n{details}'
+
+
+def cpu_summary(cpu):
+    """Two-line load text for cpu_status, or None if the report carries no loads."""
+    loads = (cpu or {}).get('load_pct')
+    if not loads:
+        return None
+
+    def pct(i):
+        value = loads[i] if i < len(loads) else None
+        return '-' if value is None else f'{value:.0f}%'
+
+    # CPUs 0-3 are the housekeeping group; 4 and 5 are isolated for the uXRCE-DDS
+    # Agent and the control node (system_monitor's field notes).
+    housekeeping = '   '.join(f'cpu{i} {pct(i)}' for i in range(4))
+    return f'{housekeeping}\ncpu4 (Agent) {pct(4)}   cpu5 (control) {pct(5)}'
 
 
 class QuadrotorThrottleWidget(QWidget):
@@ -132,6 +247,210 @@ class QuadrotorThrottleWidget(QWidget):
         painter.drawText(QRectF(center.x() - 25, 2, 50, 16), Qt.AlignCenter, "FRONT")
 
 
+class CameraDetectionView(QWidget):
+    """Camera frame, letterboxed to the widget, with the detector's boxes on top.
+
+    Boxes arrive in pixels of the published image, so they go through the same
+    scale/offset as the image rather than being drawn in widget coordinates.
+    """
+
+    BOX_COLOR = QColor(50, 255, 30)  # same green as the bench bag's vision_viz.py
+    ALERT_COLOR = QColor("#FF5050")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._image = None
+        # (label, confidence, x1, y1, x2, y2, z or None) per box
+        self._detections = ()
+        self._status = "Waiting for camera..."
+        self._live = False
+        self._alert = True
+        self._font = QFont("Sans Serif", 8)
+        self.setAttribute(Qt.WA_OpaquePaintEvent)
+
+    def set_frame(self, image, detections, status, live, alert):
+        # live: the frame is current (a stale one is dimmed).
+        # alert: something needs the operator's attention (status line turns red).
+        self._image = image
+        self._detections = detections
+        self._status = status
+        self._live = live
+        self._alert = alert
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.black)
+        painter.setFont(self._font)
+        metrics = QFontMetrics(self._font)
+
+        if self._image is not None:
+            image_w, image_h = self._image.width(), self._image.height()
+            scale = min(self.width() / image_w, self.height() / image_h)
+            offset_x = (self.width() - image_w * scale) / 2.0
+            offset_y = (self.height() - image_h * scale) / 2.0
+            target = QRectF(offset_x, offset_y, image_w * scale, image_h * scale)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+            painter.drawImage(target, self._image)
+
+            for label, confidence, x1, y1, x2, y2, z in self._detections:
+                box = QRectF(
+                    offset_x + x1 * scale,
+                    offset_y + y1 * scale,
+                    (x2 - x1) * scale,
+                    (y2 - y1) * scale,
+                )
+                painter.setPen(QPen(self.BOX_COLOR, 2))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(box)
+
+                text = f"{label} {confidence:.2f}"
+                if z is not None:
+                    text += f"  z={z:.2f} m"
+                text_w = metrics.horizontalAdvance(text) + 6
+                text_h = metrics.height() + 2
+                # Above the box, or just inside it when the box touches the top edge.
+                text_y = box.top() - text_h if box.top() - text_h >= target.top() else box.top()
+                text_rect = QRectF(box.left(), text_y, text_w, text_h)
+                painter.fillRect(text_rect, QColor(0, 0, 0, 160))
+                painter.setPen(self.BOX_COLOR)
+                painter.drawText(text_rect, Qt.AlignCenter, text)
+
+            if not self._live:
+                # Dim a frozen frame so it cannot be mistaken for live video.
+                painter.fillRect(target, QColor(0, 0, 0, 140))
+
+        status_h = metrics.height() + 4
+        status_rect = QRectF(0, self.height() - status_h, self.width(), status_h)
+        painter.fillRect(status_rect, QColor(0, 0, 0, 170))
+        painter.setPen(self.ALERT_COLOR if self._alert else Qt.white)
+        painter.drawText(status_rect.adjusted(6, 0, -6, 0), Qt.AlignVCenter | Qt.AlignLeft, self._status)
+
+
+def _siren_pcm(sweeps=3, sweep_s=0.4, low_hz=700.0, high_hz=1400.0, level=0.6):
+    """A rising-falling siren (1.2 s by default) as mono s16le PCM at SIREN_RATE_HZ."""
+    t = np.arange(int(SIREN_RATE_HZ * sweep_s)) / SIREN_RATE_HZ
+    # Frequency rises then falls within each sweep; phase is its running integral, so
+    # the tone glides without clicks.
+    freq = np.tile(low_hz + (high_hz - low_hz) * (1.0 - np.abs(2.0 * t / sweep_s - 1.0)), sweeps)
+    wave = np.sin(2.0 * np.pi * np.cumsum(freq) / SIREN_RATE_HZ)
+    fade = int(0.01 * SIREN_RATE_HZ)  # 10 ms ramps: no pop at start/end
+    envelope = np.ones_like(wave)
+    envelope[:fade] = np.linspace(0.0, 1.0, fade)
+    envelope[-fade:] = np.linspace(1.0, 0.0, fade)
+    return (wave * envelope * level * 32767).astype('<i2').tobytes()
+
+
+class AudioAnnouncer(QObject):
+    """Plays announcements (optional siren, then speech) one at a time, off the GUI thread.
+
+    Every step is a QProcess, so nothing here blocks the GUI. Each announcement belongs
+    to a source ("optitrack", "wifi"):
+      * a newer announcement from the SAME source replaces that source's queued one and
+        cuts off its playing one. Otherwise a quick loss-then-recovery would play
+        "OptiTrack normal" during the siren and then the stale "No OptiTrack" after it.
+      * announcements from DIFFERENT sources queue, so a WiFi alarm never cuts off an
+        OptiTrack alarm (they tend to fire together when the link drops).
+    """
+
+    # A hung player or speech-dispatcher must not stall the queue. A step that overruns
+    # is killed and the announcement carries on (siren -> speech -> next), so a broken
+    # siren still lets the words through.
+    STEP_TIMEOUT_MS = 10000
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._queue = deque()     # (source, text, siren) waiting to play
+        self._current = None      # (source, text, siren) playing now
+        self._process = None      # QProcess of the current step
+        self._on_done = None      # what follows the current step
+        self._speaking = False
+        # Bumped whenever a step is abandoned, so its late `finished` is ignored.
+        self._generation = 0
+        self._siren = _siren_pcm() if SIREN_PLAYER is not None else None
+        self._watchdog = QTimer(self)
+        self._watchdog.setSingleShot(True)
+        self._watchdog.timeout.connect(self._step_timed_out)
+
+    def announce(self, source, text, siren=False):
+        self._queue = deque(item for item in self._queue if item[0] != source)
+        if self._current is not None and self._current[0] == source:
+            self._stop_current()
+        self._queue.append((source, text, siren))
+        if self._current is None:
+            self._start_next()
+
+    def _start_next(self):
+        if not self._queue:
+            return
+        self._current = self._queue.popleft()
+        if self._current[2] and self._siren is not None:
+            self._run(SIREN_PLAYER, self._siren, self._speak_current)
+        else:
+            self._speak_current()
+
+    def _speak_current(self):
+        if SPEECH_COMMAND is None:
+            self._finish_current()
+            return
+        self._speaking = True
+        # -w: exit when the text has been spoken, which is what sequences the queue.
+        self._run([SPEECH_COMMAND, '-w', self._current[1]], None, self._finish_current)
+
+    def _finish_current(self):
+        self._current = None
+        self._speaking = False
+        self._start_next()
+
+    def _run(self, command, stdin_data, on_done):
+        self._generation += 1
+        generation = self._generation
+        process = QProcess(self)
+
+        def done(*_):
+            process.deleteLater()
+            if generation == self._generation:
+                self._watchdog.stop()
+                self._process = None
+                on_done()
+
+        def failed(error):
+            # A program that cannot start never emits `finished`.
+            if error == QProcess.FailedToStart:
+                done()
+
+        process.finished.connect(done)
+        process.errorOccurred.connect(failed)
+        self._process = process
+        self._on_done = on_done
+        self._watchdog.start(self.STEP_TIMEOUT_MS)
+        process.start(command[0], command[1:])
+        if stdin_data is not None:
+            process.write(stdin_data)
+            process.closeWriteChannel()
+
+    def _kill_step(self):
+        self._generation += 1
+        self._watchdog.stop()
+        if self._process is not None:
+            self._process.kill()  # its `finished` still fires, and just deletes it
+            self._process = None
+        if self._speaking:
+            # The text is already with speech-dispatcher; killing the client does not
+            # reliably stop it, so cancel explicitly.
+            QProcess.startDetached(SPEECH_COMMAND, ['-C'])
+
+    def _stop_current(self):
+        self._kill_step()
+        self._current = None
+        self._speaking = False
+
+    def _step_timed_out(self):
+        on_done = self._on_done
+        self._kill_step()
+        on_done()
+
+
 class SingleDroneRosNode(Node, QObject):
     ## define signals
     update_data = pyqtSignal(int)
@@ -167,7 +486,40 @@ class SingleDroneRosNode(Node, QObject):
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
-        
+        # Onboard vision stream. The image publisher is BEST_EFFORT, so a RELIABLE reader
+        # would not match it at all; depth 1 because only the newest frame is ever shown
+        # and a queue of older ones over WiFi is just latency. Detections are published
+        # RELIABLE -- a BEST_EFFORT reader still matches, and a dropped set only costs
+        # one frame its exact boxes (see CommonData.match_vision_detections).
+        self.vision_image_qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        self.vision_detections_qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5
+        )
+        # vrpn_mocap publishes best-effort/volatile; only arrival matters, so depth 1.
+        self.optitrack_qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        # system_monitor publishes RELIABLE. A best-effort reader still matches, and it
+        # means the Orin never retransmits stale reports to us over a link that is
+        # already stalling -- the case the WiFi indicator exists to show.
+        self.system_status_qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
         # Define subscribers
         self.imu_sub = self.create_subscription(VehicleAttitude, '/uav_0/fmu/out/vehicle_attitude', self.imu_callback, self.px4_qos_profile)
         self.pos_global_sub = self.create_subscription(VehicleGlobalPosition, '/uav_0/fmu/out/vehicle_global_position', self.pos_global_callback, self.px4_qos_profile)
@@ -228,6 +580,37 @@ class SingleDroneRosNode(Node, QObject):
             '/uav_0/fsc_autopilot_ros2/position_controller/state',
             self.position_error_callback,
             10
+        )
+        self.vision_image_sub = self.create_subscription(
+            CompressedImage,
+            VISION_IMAGE_TOPIC,
+            self.vision_image_callback,
+            self.vision_image_qos_profile
+        )
+        self.vision_detections_sub = self.create_subscription(
+            String,
+            VISION_DETECTIONS_TOPIC,
+            self.vision_detections_callback,
+            self.vision_detections_qos_profile
+        )
+        # OptiTrack liveness. NOT /uav_0/mocap: during a VRPN dropout
+        # fsc_optitrack_processor_ros2 keeps republishing the held pose there at its
+        # timer rate, and the estimator's /uav_0/mocap_status watches /uav_0/mocap, so
+        # both keep reading "normal" with OptiTrack gone. The raw VRPN stream is the one
+        # that actually stops -- and it is what the processor's own dropout detector uses.
+        # raw=True: only the arrival time is used, so skip deserialising ~120 frames/s.
+        self.optitrack_sub = self.create_subscription(
+            PoseStamped,
+            OPTITRACK_TOPIC,
+            self.optitrack_callback,
+            self.optitrack_qos_profile,
+            raw=True
+        )
+        self.system_status_sub = self.create_subscription(
+            String,
+            SYSTEM_STATUS_TOPIC,
+            self.system_status_callback,
+            self.system_status_qos_profile
         )
 
         # Define publishers / services
@@ -347,6 +730,61 @@ class SingleDroneRosNode(Node, QObject):
             msg.position_error.y,
             msg.position_error.z
         )
+
+    def optitrack_callback(self, _serialized_msg):
+        self.data_struct.update_optitrack()
+
+    def system_status_callback(self, msg):
+        # JSON from fsc_system_monitor: {"stamp", "wifi": {...}, "cpu": {...},
+        # "mocap": {...}, "odom": {...}}; any field may be null. Parsed here so the GUI
+        # thread only ever sees a dict.
+        try:
+            status = json.loads(msg.data)
+            if not isinstance(status, dict):
+                raise ValueError('not a JSON object')
+        except ValueError as e:
+            self.get_logger().warn(
+                f'Unparseable {SYSTEM_STATUS_TOPIC} message: {e}',
+                throttle_duration_sec=5.0)
+            return
+        self.data_struct.update_system_status(status)
+
+    def vision_image_callback(self, msg):
+        # Stored as received; decoding is left to the GUI, which only does it while the
+        # camera view is on screen (_update_camera_view).
+        stamp = msg.header.stamp
+        self.data_struct.update_vision_image(
+            bytes(msg.data), stamp.sec * 1_000_000_000 + stamp.nanosec)
+
+    def vision_detections_callback(self, msg):
+        # std_msgs/String carrying JSON from the onboard detector:
+        #   {"stamp": {"sec", "nanosec"}, "frame_id", "count",
+        #    "detections": [{"label", "confidence", "bbox": [x1, y1, x2, y2],
+        #                    "position": [x, y, z]}]}
+        # bbox is in pixels of the published color image; position is metres in
+        # camera_color_optical_frame (x right, y down, z forward), so z is range.
+        # "stamp" is the stamp of the color frame the boxes were computed on.
+        try:
+            data = json.loads(msg.data)
+            stamp = data['stamp']
+            stamp_ns = int(stamp['sec']) * 1_000_000_000 + int(stamp['nanosec'])
+            detections = []
+            for det in data.get('detections', []):
+                bbox = det.get('bbox')
+                if not bbox or len(bbox) != 4:
+                    continue
+                x1, y1, x2, y2 = (float(v) for v in bbox)
+                position = det.get('position')
+                z = float(position[2]) if position and len(position) == 3 else None
+                detections.append(
+                    (str(det.get('label', '?')), float(det.get('confidence', 0.0)),
+                     x1, y1, x2, y2, z))
+        except (ValueError, KeyError, TypeError, AttributeError) as e:
+            self.get_logger().warn(
+                f'Unparseable {VISION_DETECTIONS_TOPIC} message: {e}',
+                throttle_duration_sec=5.0)
+            return
+        self.data_struct.update_vision_detections(stamp_ns, tuple(detections))
 
     def publish_coordinates(self, x, y, z, yaw):
         msg = PositionControllerReference()
@@ -659,6 +1097,9 @@ class SingleDroneRosThread(QObject):
         self._setup_step_response_plot()
         self._setup_step_response_controls()
         self._setup_motor_display()
+        self._setup_camera_view()
+        self._setup_optitrack_status()
+        self._setup_system_status()
         self._setup_controller_switch()
 
         # Move ROS node to thread and start
@@ -699,6 +1140,169 @@ class SingleDroneRosThread(QObject):
         self._motor_display.setGeometry(container.rect())
         self._motor_display.set_commands((0.0, 0.0, 0.0, 0.0))
         self._motor_display.show()
+
+    def _setup_camera_view(self):
+        container = self.ui.cam_vision_0
+        self._camera_view = CameraDetectionView(container)
+        self._camera_view.setGeometry(container.rect())
+        self._camera_view.show()
+        # Decoded frame and the seq it came from, so each JPEG is decoded once.
+        self._camera_image = None
+        self._camera_image_seq = 0
+        self._camera_decode_failed = False
+        # What the view currently shows; repaint only when this changes.
+        self._camera_shown = None
+
+    def _update_camera_view(self):
+        # Hidden tab: skip everything. Frames keep landing in CommonData as raw bytes,
+        # so the view is current again on the first tick after it is shown.
+        if not self._camera_view.isVisible():
+            return
+        if not self.lock.tryLock():
+            return
+        data = self.ros_object.data_struct
+        seq = data.vision_image_seq
+        image_bytes = data.current_vision_image
+        detection_key, detections = data.match_vision_detections(data.current_vision_stamp_ns)
+        image_time = data.last_vision_image_time
+        detections_time = data.last_vision_detections_time
+        self.lock.unlock()
+
+        if seq != self._camera_image_seq and image_bytes is not None:
+            self._camera_image_seq = seq
+            # Format sniffed from the data (JPEG, or PNG if the publisher changes).
+            image = QImage.fromData(image_bytes)
+            self._camera_decode_failed = image.isNull()
+            if not self._camera_decode_failed:
+                self._camera_image = image
+
+        now = time.monotonic()
+        image_age = now - image_time
+        live = image_time > 0.0 and image_age < VISION_STALE_S and not self._camera_decode_failed
+        alert = True
+        if image_time == 0.0:
+            status = f"Waiting for {VISION_IMAGE_TOPIC}"
+        elif self._camera_decode_failed:
+            # The boxes belong to the frame that failed, not the one still on screen.
+            status = f"Cannot decode frames on {VISION_IMAGE_TOPIC}"
+            detection_key, detections = None, ()
+        elif not live:
+            status = f"No video for {int(image_age)} s"
+        elif detections_time == 0.0 or now - detections_time >= VISION_STALE_S:
+            status = f"Detector silent ({VISION_DETECTIONS_TOPIC})"
+        else:
+            status = f"{len(detections)} object(s)"
+            alert = False
+
+        shown = (self._camera_image_seq, detection_key, status)
+        if shown == self._camera_shown:
+            return
+        self._camera_shown = shown
+        self._camera_view.set_frame(self._camera_image, detections, status, live, alert)
+
+    def _set_status_label(self, label, text, style):
+        # Only touch the widget on a change, and restyle only when the style changed:
+        # setStyleSheet re-polishes the widget, which is not something to do at the
+        # 30 Hz tick rate (or every second while a "for N s" counter runs).
+        shown_text, shown_style = self._status_label_shown.get(label.objectName(), (None, None))
+        if text != shown_text:
+            label.setText(text)
+        if style != shown_style:
+            label.setStyleSheet(style)
+        self._status_label_shown[label.objectName()] = (text, style)
+
+    def _setup_optitrack_status(self):
+        self._status_label_shown = {}
+        # None until the first verdict, so startup announces the state once either way.
+        self._optitrack_ok = None
+        self._optitrack_started = time.monotonic()
+        # No frames yet, so red from the start; only the announcement waits for the
+        # startup grace period.
+        self._set_status_label(self.ui.optitrack_status, "No OptiTrack", STATUS_STYLE['bad'])
+        self._announcer = AudioAnnouncer(self)
+        if SPEECH_COMMAND is None:
+            print("[AUDIO] spd-say not found; spoken announcements disabled")
+        if SIREN_PLAYER is None:
+            print("[AUDIO] neither pacat nor aplay found; sirens disabled")
+
+    def _update_optitrack_status(self):
+        ok = self.ros_object.data_struct.optitrack_fresh(OPTITRACK_TIMEOUT_S)
+        if (not ok and self._optitrack_ok is None
+                and time.monotonic() - self._optitrack_started < OPTITRACK_STARTUP_GRACE_S):
+            return
+        # Edge-triggered, so each announcement is spoken once per transition.
+        if ok == self._optitrack_ok:
+            return
+        was_ok = self._optitrack_ok
+        self._optitrack_ok = ok
+        if ok:
+            self._set_status_label(
+                self.ui.optitrack_status, "OptiTrack normal", STATUS_STYLE['good'])
+            self._announcer.announce('optitrack', "OptiTrack normal")
+            self.log_message("OptiTrack normal")
+        else:
+            self._set_status_label(
+                self.ui.optitrack_status, "No OptiTrack", STATUS_STYLE['bad'])
+            # Siren only for a real loss. The first verdict at launch (e.g. at the desk
+            # with no mocap) is spoken but not sirened: an alarm that sounds on every
+            # launch teaches people to ignore it.
+            self._announcer.announce('optitrack', "No OptiTrack", siren=was_ok is True)
+            self.log_message(
+                f"No OptiTrack: nothing on {OPTITRACK_TOPIC} for {OPTITRACK_TIMEOUT_S:.1f} s")
+
+    def _setup_system_status(self):
+        self._system_status_seq = 0
+        # Consecutive reports showing packets queued for WiFi (see wifi_summary).
+        self._wifi_backlog_reports = 0
+        self._wifi_level = None
+        self._set_status_label(
+            self.ui.wifi_status, "No WiFi\nwaiting for Orin status",
+            STATUS_STYLE['bad'] + TWO_LINE_FONT)
+        self._set_status_label(
+            self.ui.cpu_status, "Orin CPU: waiting for status", "color: red;" + TWO_LINE_FONT)
+
+    def _update_system_status(self):
+        data = self.ros_object.data_struct
+        if not self.lock.tryLock():
+            return
+        seq = data.system_status_seq
+        status = data.current_system_status
+        received = data.last_system_status_time
+        self.lock.unlock()
+
+        if seq != self._system_status_seq:
+            self._system_status_seq = seq
+            backlog = ((status.get('wifi') or {}).get('qdisc_backlog_max_pkts') or 0)
+            self._wifi_backlog_reports = self._wifi_backlog_reports + 1 if backlog > 0 else 0
+
+        age = time.monotonic() - received
+        if received == 0.0 or age >= SYSTEM_STATUS_STALE_S:
+            level = 'bad'
+            since = "yet" if received == 0.0 else f"for {int(age)} s"
+            wifi_text = f"No WiFi\nno status from Orin {since}"
+            cpu_text, cpu_style = "Orin CPU: no status", "color: red;"
+        else:
+            level, wifi_text = wifi_summary(status.get('wifi'), self._wifi_backlog_reports)
+            cpu_text = cpu_summary(status.get('cpu'))
+            cpu_style = ""
+            if cpu_text is None:
+                cpu_text, cpu_style = "Orin CPU: no load data", "color: red;"
+
+        self._set_status_label(self.ui.wifi_status, wifi_text, STATUS_STYLE[level] + TWO_LINE_FONT)
+        self._set_status_label(self.ui.cpu_status, cpu_text, cpu_style + TWO_LINE_FONT)
+        # Losing the link to the Orin is worth an alarm and a line in the flight log;
+        # good <-> fair is not, since it can flip every second while the signal sits near
+        # a threshold. Nothing fires before the first report, so launching without the
+        # Orin stays quiet (the label is red) and startup never says "restored".
+        if received > 0.0:
+            if self._wifi_level is not None and (level == 'bad') != (self._wifi_level == 'bad'):
+                if level == 'bad':
+                    self._announcer.announce('wifi', "No WiFi", siren=True)
+                    self.log_message(wifi_text.replace("\n", ": "))
+                else:
+                    self._announcer.announce('wifi', "WiFi restored")
+                    self.log_message("WiFi restored")
+            self._wifi_level = level
 
     # ------------------------------------------------------------------
     # Controller tab
@@ -1386,6 +1990,9 @@ class SingleDroneRosThread(QObject):
 
         self._append_position_plot()
         self._append_step_response()
+        self._update_camera_view()
+        self._update_optitrack_status()
+        self._update_system_status()
 
         self.ui.TargROLL_RATE_DISP.display("{:.2f}".format(alttitude_targ_msg.roll_rate, 2))
         self.ui.TargPITCH_RATE_DISP.display("{:.2f}".format(alttitude_targ_msg.pitch_rate, 2))

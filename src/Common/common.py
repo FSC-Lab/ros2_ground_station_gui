@@ -23,6 +23,7 @@ SOFTWARE.
 '''
 #!/usr/bin/env python
 import time
+from collections import OrderedDict
 from PyQt5.QtCore import QMutex
 from px4_msgs.msg import VehicleStatus
 
@@ -55,6 +56,27 @@ class CommonData(): # store the data from the ROS nodes
         # pre_flight_checks_pass and is false on some rigs for the whole flight.
         self.last_motor_commands_time = 0.0
         self.current_position_error = ros_common.Vector3()
+        # Monotonic time of the last raw OptiTrack (VRPN) frame, for optitrack_status.
+        self.last_optitrack_time = 0.0
+        # Latest 1 Hz report from the Orin's fsc_system_monitor (the parsed JSON dict,
+        # never mutated after it is stored), for cpu_status and wifi_status.
+        self.current_system_status = None
+        self.system_status_seq = 0
+        self.last_system_status_time = 0.0
+
+        # Onboard camera + detector (VLM tab). The frame is kept as the compressed
+        # bytes exactly as received; the GUI decodes it only while the view is on
+        # screen. `vision_image_seq` bumps per frame so the GUI can tell a new frame
+        # from a re-read of the same one. Detections are kept per header stamp so each
+        # frame is drawn with ITS OWN boxes -- the detector can publish images at a
+        # lower rate than detections (`--ros-image-hz`; every ~3rd frame in the
+        # 2026-09-24 bench bag).
+        self.current_vision_image = None
+        self.current_vision_stamp_ns = 0
+        self.vision_image_seq = 0
+        self.last_vision_image_time = 0.0
+        self.vision_detections = OrderedDict()  # stamp_ns -> tuple of detections
+        self.last_vision_detections_time = 0.0
 
         # water sampling
         self.encoder_raw = ros_common.Vector3()
@@ -321,6 +343,27 @@ class CommonData(): # store the data from the ROS nodes
         return (self.last_motor_commands_time > 0.0
                 and (time.monotonic() - self.last_motor_commands_time) < max_age_s)
 
+    def update_optitrack(self):
+        if not self.lock.tryLock():
+            return
+        self.last_optitrack_time = time.monotonic()
+        self.lock.unlock()
+        return
+
+    def update_system_status(self, status):
+        if not self.lock.tryLock():
+            return
+        self.current_system_status = status
+        self.system_status_seq += 1
+        self.last_system_status_time = time.monotonic()
+        self.lock.unlock()
+        return
+
+    def optitrack_fresh(self, max_age_s):
+        """True while raw OptiTrack frames are arriving (same test as motor_commands_fresh)."""
+        return (self.last_optitrack_time > 0.0
+                and (time.monotonic() - self.last_optitrack_time) < max_age_s)
+
     def update_position_error(self, x, y, z):
         if not self.lock.tryLock():
             return
@@ -328,6 +371,47 @@ class CommonData(): # store the data from the ROS nodes
         self.current_position_error.y = y
         self.current_position_error.z = z
         self.lock.unlock()
+
+    # Detections are matched to a frame by header stamp; ~2 s of history at the
+    # detector's 30 Hz is far more than any image/detection arrival skew.
+    VISION_DETECTION_HISTORY = 60
+    VISION_MATCH_TOLERANCE_NS = 60_000_000
+
+    def update_vision_image(self, image_bytes, stamp_ns):
+        if not self.lock.tryLock():
+            return
+        self.current_vision_image = image_bytes
+        self.current_vision_stamp_ns = stamp_ns
+        self.vision_image_seq += 1
+        self.last_vision_image_time = time.monotonic()
+        self.lock.unlock()
+        return
+
+    def update_vision_detections(self, stamp_ns, detections):
+        if not self.lock.tryLock():
+            return
+        self.vision_detections[stamp_ns] = detections
+        while len(self.vision_detections) > self.VISION_DETECTION_HISTORY:
+            self.vision_detections.popitem(last=False)
+        self.last_vision_detections_time = time.monotonic()
+        self.lock.unlock()
+        return
+
+    def match_vision_detections(self, stamp_ns):
+        """(key, detections) for the frame stamped `stamp_ns`; caller holds self.lock.
+
+        Exact stamp first, else the nearest set within VISION_MATCH_TOLERANCE_NS (a
+        dropped best-effort message then costs one detector period of offset, not the
+        boxes). (None, ()) when nothing is close -- boxes from a different moment
+        would sit on the wrong objects.
+        """
+        detections = self.vision_detections.get(stamp_ns)
+        if detections is not None:
+            return stamp_ns, detections
+        best = min(self.vision_detections, key=lambda k: abs(k - stamp_ns), default=None)
+        if best is not None and abs(best - stamp_ns) <= self.VISION_MATCH_TOLERANCE_NS:
+            return best, self.vision_detections[best]
+        return None, ()
         return
     
     ## water sampling tab
