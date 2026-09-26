@@ -58,6 +58,10 @@ class CommonData(): # store the data from the ROS nodes
         self.current_position_error = ros_common.Vector3()
         # Monotonic time of the last raw OptiTrack (VRPN) frame, for optitrack_status.
         self.last_optitrack_time = 0.0
+        # Monotonic receive time per telemetry source ('odom', 'imu', 'state', ...), set
+        # by the update_* methods below. Lets a reader tell "never received" from the
+        # zeros the holders start with, and say how old a value is (the LLM snapshot).
+        self.last_update = {}
         # Latest 1 Hz report from the Orin's fsc_system_monitor (the parsed JSON dict,
         # never mutated after it is stored), for cpu_status and wifi_status.
         self.current_system_status = None
@@ -96,6 +100,7 @@ class CommonData(): # store the data from the ROS nodes
         self.current_imu.roll = euler[0]
         self.current_imu.pitch = euler[1]
         self.current_imu.yaw = euler[2]
+        self.last_update['imu'] = time.monotonic()
         self.lock.unlock()
         return
     
@@ -105,6 +110,7 @@ class CommonData(): # store the data from the ROS nodes
         self.current_global_pos.latitude = latitude
         self.current_global_pos.longitude = longitude
         self.current_global_pos.altitude = altitude
+        self.last_update['global_pos'] = time.monotonic()
         self.lock.unlock()
         return
 
@@ -114,6 +120,7 @@ class CommonData(): # store the data from the ROS nodes
         self.current_local_pos.x = x
         self.current_local_pos.y = y
         self.current_local_pos.z = z
+        self.last_update['odom'] = time.monotonic()
         self.lock.unlock()
         return
     
@@ -131,6 +138,7 @@ class CommonData(): # store the data from the ROS nodes
             return
         self.current_battery_status.percentage = percentage
         self.current_battery_status.voltage = voltage
+        self.last_update['battery'] = time.monotonic()
         self.lock.unlock()
         return
     
@@ -153,6 +161,7 @@ class CommonData(): # store the data from the ROS nodes
         
         self.current_state.mode = self.decode_mode(nav_state)
         self.current_state.seconds = int(timestamp*1e-6)
+        self.last_update['state'] = time.monotonic()
         self.lock.unlock()
         return
     
@@ -168,6 +177,7 @@ class CommonData(): # store the data from the ROS nodes
         self.current_attitude_target.pitch_rate = 0
         self.current_attitude_target.yaw_rate = 0
         self.current_attitude_target.mode = 1 # set to the mode with attitude control
+        self.last_update['attitude_setpoint'] = time.monotonic()
         self.lock.unlock()
         return
     
@@ -183,6 +193,7 @@ class CommonData(): # store the data from the ROS nodes
         self.current_attitude_target.yaw_rate = yaw
         self.current_attitude_target.mode = 2 # set to the mode with body rate control
 
+        self.last_update['rate_setpoint'] = time.monotonic()
         self.lock.unlock()
         return
     
@@ -306,6 +317,7 @@ class CommonData(): # store the data from the ROS nodes
         if not self.lock.tryLock():
             return
         self.current_vehicle_name = vehicle_name
+        self.last_update['vehicle_info'] = time.monotonic()
         self.lock.unlock()
         return
 
@@ -313,6 +325,7 @@ class CommonData(): # store the data from the ROS nodes
         if not self.lock.tryLock():
             return
         self.current_yaw_align = yaw_align
+        self.last_update['yaw_align'] = time.monotonic()
         self.lock.unlock()
         return
 
@@ -320,6 +333,7 @@ class CommonData(): # store the data from the ROS nodes
         if not self.lock.tryLock():
             return
         self.current_controller_type = controller_type
+        self.last_update['controller_type'] = time.monotonic()
         self.lock.unlock()
         return
 
@@ -370,6 +384,7 @@ class CommonData(): # store the data from the ROS nodes
         self.current_position_error.x = x
         self.current_position_error.y = y
         self.current_position_error.z = z
+        self.last_update['position_error'] = time.monotonic()
         self.lock.unlock()
 
     # Detections are matched to a frame by header stamp; ~2 s of history at the

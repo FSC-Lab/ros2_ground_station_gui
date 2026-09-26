@@ -360,7 +360,7 @@
      </rect>
     </property>
     <property name="currentIndex">
-     <number>0</number>
+     <number>3</number>
     </property>
     <widget class="QWidget" name="Flight_Graph">
      <attribute name="title">
@@ -483,7 +483,7 @@
        </rect>
       </property>
      </widget>
-     <widget class="QTextBrowser" name="textBrowser">
+     <widget class="QTextBrowser" name="LLM_chatlog">
       <property name="geometry">
        <rect>
         <x>30</x>
@@ -493,7 +493,7 @@
        </rect>
       </property>
      </widget>
-     <widget class="QPlainTextEdit" name="plainTextEdit">
+     <widget class="QPlainTextEdit" name="LLM_input">
       <property name="geometry">
        <rect>
         <x>30</x>
@@ -516,7 +516,7 @@
        <string>Connect to VLM</string>
       </property>
      </widget>
-     <widget class="QPushButton" name="pushButton_2">
+     <widget class="QPushButton" name="LLM_send">
       <property name="geometry">
        <rect>
         <x>400</x>
@@ -527,6 +527,19 @@
       </property>
       <property name="text">
        <string>Send</string>
+      </property>
+     </widget>
+     <widget class="QLabel" name="Api_status">
+      <property name="geometry">
+       <rect>
+        <x>410</x>
+        <y>170</y>
+        <width>141</width>
+        <height>41</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Api Offline</string>
       </property>
      </widget>
     </widget>

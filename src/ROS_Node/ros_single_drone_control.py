@@ -34,10 +34,12 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from PyQt5.QtCore import QObject, pyqtSignal, QProcess, QThread, QDateTime, QTimer, Qt, QPointF, QRectF
-from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPen
+from PyQt5.QtCore import QEvent, QObject, pyqtSignal, QProcess, QThread, QDateTime, QTimer, Qt, QPointF, QRectF
+from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPen,
+                         QTextCharFormat, QTextCursor, QTextDocument, QTextDocumentFragment)
 from PyQt5.QtWidgets import QAbstractItemView, QMessageBox, QTableWidgetItem, QWidget
 import Common
+from Common.llm_client import LlmClient
 from geometry_msgs.msg import Point, PoseStamped
 
 try:
@@ -106,6 +108,37 @@ STATUS_STYLE = {
 }
 # cpu_status and wifi_status are two-line labels 41 px tall.
 TWO_LINE_FONT = ' font-size: 9pt;'
+# LLM status assistant (VLM tab). The proxy on the LLM host, reached over NetBird; it has
+# no authentication, so only NetBird peers the access policy allows can reach it.
+LLM_BASE_URL = 'http://100.103.152.77:8080'
+LLM_MODEL = 'qwen2.5vl:7b'
+LLM_HEALTH_INTERVAL_MS = 15000  # keeps Api_status honest while connected
+LLM_HISTORY_TURNS = 6           # question/answer pairs resent as context
+LLM_CHATLOG_MAX_BLOCKS = 2000   # bounded, like the flight log
+LLM_FLUSH_MS = 100              # streamed text reaches the widget at most 10x a second
+LLM_SYSTEM_PROMPT = (
+    "You are the status assistant in the ground-station GUI of an indoor quadrotor "
+    "(uav_0) flying under OptiTrack motion capture.\n"
+    "Every question arrives with a telemetry snapshot (JSON) that the ground station took "
+    "when the question was asked. Answer only from that snapshot and this conversation.\n"
+    "- If a value is missing, null or 'no data received', say it is not available. Never "
+    "guess or invent a number.\n"
+    "- age_s is seconds since that source was last received. If it is more than a few "
+    "seconds, say the value may be out of date.\n"
+    "- Units: metres, m/s, degrees, percent, dBm, milliseconds. Position and velocity are "
+    "in the local motion-capture frame: x and y horizontal, z up (height). Yaw is -180 to "
+    "180 degrees.\n"
+    "- optitrack: whether raw motion-capture frames reach the ground station. wifi: the "
+    "drone computer's own view of its WiFi link (good, fair or bad, with the reason); bad "
+    "also means its reports have stopped arriving. onboard_feed_status: the drone "
+    "computer's measurement of its own mocap and odometry input.\n"
+    "- px4_status.preflight_checks_pass is PX4's pre-flight check flag. It can stay false "
+    "for a whole normal flight on these vehicles; do not call that a fault on its own.\n"
+    "- You cannot control the drone: you cannot send commands, arm, move it or change "
+    "modes. If asked to, say that at this stage you can only report status.\n"
+    "Reply in plain text without markdown, in one to four short sentences unless the "
+    "operator asks for detail."
+)
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
 from px4_msgs.msg import ActuatorMotors, VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus,VehicleRatesSetpoint, EstimatorStatusFlags
 from fsc_autopilot_ros2_msgs.msg import PositionControllerReference, PositionControllerState, VehicleInfo
@@ -348,7 +381,7 @@ class AudioAnnouncer(QObject):
     to a source ("optitrack", "wifi"):
       * a newer announcement from the SAME source replaces that source's queued one and
         cuts off its playing one. Otherwise a quick loss-then-recovery would play
-        "OptiTrack normal" during the siren and then the stale "No OptiTrack" after it.
+        "OptiTrack regained" during the siren and then the stale "No OptiTrack" after it.
       * announcements from DIFFERENT sources queue, so a WiFi alarm never cuts off an
         OptiTrack alarm (they tend to fire together when the link drops).
     """
@@ -1079,6 +1112,7 @@ class SingleDroneRosThread(QObject):
         self._last_y_cmd = 0.0
         self._last_z_cmd = 0.0
         self._last_yaw_cmd = 0.0
+        self._last_cmd_time = None  # monotonic time of the last sent command, if any
         self._pref_waiting = True
         self._pref_recording = False
         self._pref_armed = False
@@ -1100,6 +1134,7 @@ class SingleDroneRosThread(QObject):
         self._setup_camera_view()
         self._setup_optitrack_status()
         self._setup_system_status()
+        self._setup_llm()
         self._setup_controller_switch()
 
         # Move ROS node to thread and start
@@ -1238,15 +1273,17 @@ class SingleDroneRosThread(QObject):
         if ok:
             self._set_status_label(
                 self.ui.optitrack_status, "OptiTrack normal", STATUS_STYLE['good'])
-            self._announcer.announce('optitrack', "OptiTrack normal")
-            self.log_message("OptiTrack normal")
+            # The label shows the state; the announcement names the event. "Regained"
+            # only after a loss -- present at launch is just "normal".
+            event = "OptiTrack regained" if was_ok is False else "OptiTrack normal"
+            self._announcer.announce('optitrack', event)
+            self.log_message(event)
         else:
             self._set_status_label(
                 self.ui.optitrack_status, "No OptiTrack", STATUS_STYLE['bad'])
-            # Siren only for a real loss. The first verdict at launch (e.g. at the desk
-            # with no mocap) is spoken but not sirened: an alarm that sounds on every
-            # launch teaches people to ignore it.
-            self._announcer.announce('optitrack', "No OptiTrack", siren=was_ok is True)
+            # Siren on every "No OptiTrack", the launch verdict included (operator's
+            # choice, 2026-09-26): launching at the desk with no mocap sounds it too.
+            self._announcer.announce('optitrack', "No OptiTrack", siren=True)
             self.log_message(
                 f"No OptiTrack: nothing on {OPTITRACK_TOPIC} for {OPTITRACK_TIMEOUT_S:.1f} s")
 
@@ -1254,7 +1291,9 @@ class SingleDroneRosThread(QObject):
         self._system_status_seq = 0
         # Consecutive reports showing packets queued for WiFi (see wifi_summary).
         self._wifi_backlog_reports = 0
-        self._wifi_level = None
+        # None until the first verdict, then whether the last announced state was "lost".
+        self._wifi_lost = None
+        self._system_status_started = time.monotonic()
         self._set_status_label(
             self.ui.wifi_status, "No WiFi\nwaiting for Orin status",
             STATUS_STYLE['bad'] + TWO_LINE_FONT)
@@ -1292,17 +1331,423 @@ class SingleDroneRosThread(QObject):
         self._set_status_label(self.ui.cpu_status, cpu_text, cpu_style + TWO_LINE_FONT)
         # Losing the link to the Orin is worth an alarm and a line in the flight log;
         # good <-> fair is not, since it can flip every second while the signal sits near
-        # a threshold. Nothing fires before the first report, so launching without the
-        # Orin stays quiet (the label is red) and startup never says "restored".
-        if received > 0.0:
-            if self._wifi_level is not None and (level == 'bad') != (self._wifi_level == 'bad'):
-                if level == 'bad':
-                    self._announcer.announce('wifi', "No WiFi", siren=True)
-                    self.log_message(wifi_text.replace("\n", ": "))
-                else:
-                    self._announcer.announce('wifi', "WiFi restored")
-                    self.log_message("WiFi restored")
-            self._wifi_level = level
+        # a threshold. At launch, no verdict until a report has had time to arrive (DDS
+        # discovery plus up to 1 s to the next report); after that, launching with the
+        # Orin off is a loss like any other (operator's choice, 2026-09-26). A good first
+        # verdict is not announced.
+        if (received == 0.0
+                and time.monotonic() - self._system_status_started < SYSTEM_STATUS_STALE_S):
+            return
+        lost = level == 'bad'
+        if lost == self._wifi_lost:
+            return
+        was_lost = self._wifi_lost
+        self._wifi_lost = lost
+        if lost:
+            self._announcer.announce('wifi', "No WiFi", siren=True)
+            self.log_message(wifi_text.replace("\n", ": "))
+        elif was_lost:
+            self._announcer.announce('wifi', "WiFi regained")
+            self.log_message("WiFi regained")
+
+
+    # ------------------------------------------------------------------
+    # LLM status assistant (VLM tab)
+    #
+    # Read-only by design: the model sees a snapshot of what this GUI has received and
+    # answers in text. Nothing here publishes, calls a ROS service, or uses the proxy's
+    # /api/parse -- commands from an LLM would need the geofence and pose checks that
+    # live in nl_commander, not here. All network I/O is QNetworkAccessManager on this
+    # (GUI) thread, which never blocks and never touches rclpy.
+    # ------------------------------------------------------------------
+
+    LLM_TEXT_COLORS = {
+        'info': '#666666',
+        'user': '#1F5FBF',
+        'llm': '#1E7B34',
+        'error': '#C62828',
+    }
+
+    def _setup_llm(self):
+        self._llm = LlmClient(LLM_BASE_URL, LLM_MODEL, self)
+        self._llm.health_checked.connect(self._on_llm_health)
+        self._llm.chat_delta.connect(self._on_llm_delta)
+        self._llm.chat_finished.connect(self._on_llm_finished)
+        # disconnected | connecting | loading | online | offline
+        self._llm_state = 'disconnected'
+        self._llm_warmup = False      # the in-flight chat is the model preload, not a question
+        self._llm_history = []        # plain question/answer turns; snapshots are not kept
+        self._llm_question = ''
+        self._llm_answer = ''
+        self._llm_pending = ''        # streamed text not yet in the widget
+        self._llm_health_timer = QTimer(self)
+        self._llm_health_timer.setInterval(LLM_HEALTH_INTERVAL_MS)
+        self._llm_health_timer.timeout.connect(self._llm.check_health)
+        self._llm_flush_timer = QTimer(self)
+        self._llm_flush_timer.setSingleShot(True)
+        self._llm_flush_timer.setInterval(LLM_FLUSH_MS)
+        self._llm_flush_timer.timeout.connect(self._flush_llm_text)
+
+        # Api_status is optional so a .ui without it cannot stop the station from
+        # starting; the connection state then only shows in the chat log.
+        self._api_status = getattr(self.ui, 'Api_status', None)
+        if self._api_status is None:
+            print("[LLM] no Api_status label in single_drone_flight.ui; "
+                  "LLM connection state is shown in the chat log only")
+        self.ui.LLM_chatlog.document().setMaximumBlockCount(LLM_CHATLOG_MAX_BLOCKS)
+        self.ui.LLM_input.setPlaceholderText(
+            "Ask about the drone's status. Enter sends, Shift+Enter adds a line.")
+        self.ui.LLM_input.installEventFilter(self)
+        self.ui.buttom_connect_VLM.clicked.connect(self._toggle_llm_connection)
+        self.ui.LLM_send.clicked.connect(self._on_llm_send_clicked)
+        self._set_llm_state('disconnected')
+
+    def eventFilter(self, obj, event):
+        # Enter sends; Shift+Enter falls through and inserts a newline.
+        if (obj is self.ui.LLM_input and event.type() == QEvent.KeyPress
+                and event.key() in (Qt.Key_Return, Qt.Key_Enter)
+                and not event.modifiers() & Qt.ShiftModifier):
+            self._send_llm_question()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _set_llm_state(self, state, detail=''):
+        self._llm_state = state
+        if self._api_status is not None and detail:
+            # Fit the error to the label as drawn (9 pt, whatever width Designer gives
+            # it); the full message is in the chat log.
+            font = QFont(self._api_status.font())
+            font.setPointSize(9)
+            detail = QFontMetrics(font).elidedText(
+                detail, Qt.ElideRight, max(40, self._api_status.width() - 8))
+        text, style = {
+            'disconnected': ("LLM: not connected", "color: #555555;"),
+            'connecting': ("LLM: connecting...", STATUS_STYLE['fair']),
+            'loading': (f"LLM: loading model\n{LLM_MODEL}", STATUS_STYLE['fair']),
+            'online': (f"LLM online\n{LLM_MODEL}", STATUS_STYLE['good']),
+            'offline': (f"LLM unreachable\n{detail}", STATUS_STYLE['bad']),
+        }[state]
+        if self._api_status is not None:
+            self._set_status_label(self._api_status, text, style + TWO_LINE_FONT)
+        self.ui.buttom_connect_VLM.setText(
+            "Connect to VLM" if state == 'disconnected' else "Disconnect")
+        self._update_llm_buttons()
+
+    def _update_llm_buttons(self):
+        answering = self._llm.busy() and not self._llm_warmup
+        self.ui.LLM_send.setText("Stop" if answering else "Send")
+        # A question during the preload is fine: it replaces the preload and loads the
+        # model itself.
+        self.ui.LLM_send.setEnabled(answering or self._llm_state in ('online', 'loading'))
+
+    def _toggle_llm_connection(self):
+        if self._llm_state == 'disconnected':
+            self._set_llm_state('connecting')
+            self._llm_chat_append(f"Connecting to {LLM_BASE_URL} ...", 'info')
+            self._llm.check_health()
+            self._llm_health_timer.start()
+            return
+        self._llm_health_timer.stop()
+        self._set_llm_state('disconnected')  # first, so the abort below reports as such
+        if self._llm.busy():
+            self._llm.abort_chat('disconnected')
+        self._llm_chat_append("Disconnected.", 'info')
+
+    def _on_llm_health(self, ok, error, health):
+        if self._llm_state == 'disconnected':
+            return  # a check that was in flight when the operator disconnected
+        was = self._llm_state
+        # A line written now would land inside a streaming answer; Api_status shows it.
+        quiet = self._llm.busy() and not self._llm_warmup
+        if not ok:
+            if was != 'offline' and not quiet:
+                self._llm_chat_append(f"LLM server unreachable: {error}", 'error')
+            self._set_llm_state('offline', error)
+            return
+        names = [m.get('name') for m in health.get('models', []) if isinstance(m, dict)]
+        if LLM_MODEL not in names:
+            if was != 'offline' and not quiet:
+                self._llm_chat_append(
+                    f"The LLM server is up but does not offer {LLM_MODEL} "
+                    f"(it has: {', '.join(n for n in names if n) or 'nothing'}).", 'error')
+            self._set_llm_state('offline', f"{LLM_MODEL} not on server")
+            return
+        if self._llm_warmup:
+            return  # the preload's own result decides
+        loaded = [m.get('name') if isinstance(m, dict) else m for m in health.get('loaded', [])]
+        if LLM_MODEL in loaded or was == 'online' or self._llm.busy():
+            # Online. If the model has since idled out (5 min), the next question
+            # reloads it; the preload is only for a fresh connection.
+            if was != 'online' and not quiet:
+                self._llm_chat_append(f"Connected: {LLM_MODEL} is ready.", 'info')
+            self._set_llm_state('online')
+            return
+        # Load the model now, so the first question does not wait 5-10 s for it. The
+        # proxy rejects an empty message list, so this is a tiny real request.
+        self._llm_warmup = True
+        self._set_llm_state('loading')
+        self._llm_chat_append(f"Loading {LLM_MODEL} on the LLM server (5-10 s) ...", 'info')
+        self._llm.chat([{'role': 'user', 'content': 'Reply with the single word OK.'}])
+        self._update_llm_buttons()
+
+    def _on_llm_send_clicked(self):
+        if self._llm.busy() and not self._llm_warmup:
+            self._llm.abort_chat('stopped')
+        else:
+            self._send_llm_question()
+
+    def _send_llm_question(self):
+        text = self.ui.LLM_input.toPlainText().strip()
+        if not text or self._llm_state not in ('online', 'loading'):
+            return
+        if self._llm.busy():
+            if not self._llm_warmup:
+                return  # an answer is still streaming
+            self._llm.abort_chat('superseded')
+        snapshot = self._llm_telemetry_snapshot()
+        compact = json.dumps(snapshot, separators=(',', ':'), ensure_ascii=False)
+        prompt = (f"Telemetry snapshot:\n{compact}\n\n"
+                  f"Operator question: {text}")
+        messages = ([{'role': 'system', 'content': LLM_SYSTEM_PROMPT}]
+                    + self._llm_history[-2 * LLM_HISTORY_TURNS:]
+                    + [{'role': 'user', 'content': prompt}])
+        if not self._llm.chat(messages):
+            return
+        self._llm_question = text
+        self._llm_answer = ''
+        self._llm_pending = ''
+        self.ui.LLM_input.clear()
+        self._llm_chat_append(f"You: {text}", 'user', bold=True)
+        self._llm_chat_append("LLM: ", 'llm', bold=True)
+        self._update_llm_buttons()
+
+    def _on_llm_delta(self, chunk):
+        if self._llm_warmup:
+            return
+        self._llm_answer += chunk
+        self._llm_pending += chunk
+        if not self._llm_flush_timer.isActive():
+            self._llm_flush_timer.start()
+
+    def _flush_llm_text(self):
+        if self._llm_pending:
+            self._llm_chat_insert(self._llm_pending)
+            self._llm_pending = ''
+
+    def _on_llm_finished(self, ok, error):
+        if self._llm_warmup:
+            self._llm_warmup = False
+            if self._llm_state == 'disconnected':
+                return
+            if ok:
+                self._llm_chat_append(
+                    f"{LLM_MODEL} is loaded. Ask about the drone's status.", 'info')
+                self._set_llm_state('online')
+            elif error == 'superseded':
+                self._set_llm_state('online')  # a question took over the preload
+            else:
+                self._llm_chat_append(f"Could not load {LLM_MODEL}: {error}", 'error')
+                self._set_llm_state('offline', error)
+            return
+        self._llm_flush_timer.stop()
+        self._flush_llm_text()
+        if ok:
+            self._llm_history += [
+                {'role': 'user', 'content': self._llm_question},
+                {'role': 'assistant', 'content': self._llm_answer.strip()},
+            ]
+            self._llm_history = self._llm_history[-2 * LLM_HISTORY_TURNS:]
+            self._render_llm_answer()
+        else:
+            self._llm_chat_insert(f"  [{error}]", 'error')
+            if error not in ('stopped', 'disconnected', 'superseded'):
+                # A transport failure: re-check now rather than at the next poll.
+                self._llm.check_health()
+        self._update_llm_buttons()
+
+    def _render_llm_answer(self):
+        # The model is told not to use markdown, but a 7B model still does for long
+        # answers. Streamed text is shown raw; the finished answer is replaced by its
+        # rendered form (lists, bold) so the log does not fill with ** and -.
+        #
+        # The answer is exactly the last len(answer) characters of the log (a newline is
+        # one position, like the block break it becomes). That holds even while
+        # LLM_CHATLOG_MAX_BLOCKS trims old lines off the top -- which a saved cursor
+        # does not survive: Qt moves it when a newline is inserted at its position.
+        # Only replace if the tail really is the answer, so nothing else is ever lost.
+        cursor = QTextCursor(self.ui.LLM_chatlog.document())
+        cursor.movePosition(QTextCursor.End)
+        start = cursor.position() - len(self._llm_answer)
+        if start < 0:
+            return
+        cursor.setPosition(start, QTextCursor.KeepAnchor)
+        if cursor.selectedText().replace('\u2029', '\n') != self._llm_answer:
+            return
+        cursor.removeSelectedText()
+        rendered = QTextDocument()
+        rendered.setMarkdown(self._llm_answer.strip())
+        cursor.insertFragment(QTextDocumentFragment(rendered))
+        self._llm_chat_scroll()
+
+    def _llm_text_format(self, kind, bold):
+        fmt = QTextCharFormat()
+        if kind is not None:
+            fmt.setForeground(QColor(self.LLM_TEXT_COLORS[kind]))
+        if bold:
+            fmt.setFontWeight(QFont.Bold)
+        return fmt
+
+    def _llm_chat_append(self, text, kind=None, bold=False):
+        """Start a new line in LLM_chatlog."""
+        cursor = QTextCursor(self.ui.LLM_chatlog.document())
+        cursor.movePosition(QTextCursor.End)
+        if not self.ui.LLM_chatlog.document().isEmpty():
+            cursor.insertBlock()
+        cursor.insertText(text, self._llm_text_format(kind, bold))
+        self._llm_chat_scroll()
+
+    def _llm_chat_insert(self, text, kind=None):
+        """Continue the current line (the streamed answer)."""
+        cursor = QTextCursor(self.ui.LLM_chatlog.document())
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(text, self._llm_text_format(kind, False))
+        self._llm_chat_scroll()
+
+    def _llm_chat_scroll(self):
+        bar = self.ui.LLM_chatlog.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _llm_telemetry_snapshot(self):
+        """What this GUI currently knows, as a JSON-able dict for the LLM prompt.
+
+        Copied from CommonData under its lock plus GUI-side state; nothing here touches
+        rclpy. A source never received is reported as such, not as the zeros the data
+        holders start with, and every source carries its age.
+        """
+        data = self.ros_object.data_struct
+        # A bounded wait rather than the tick's bare tryLock: this runs once per
+        # question, and a question should not go out without its telemetry.
+        if not self.lock.tryLock(50):
+            return {'error': 'telemetry unavailable (data lock busy); status is unknown'}
+        try:
+            last = dict(data.last_update)
+            imu = (data.current_imu.roll, data.current_imu.pitch, data.current_imu.yaw)
+            pos = (data.current_local_pos.x, data.current_local_pos.y, data.current_local_pos.z)
+            vel = (data.current_vel.x, data.current_vel.y, data.current_vel.z)
+            armed = data.current_state.armed
+            mode = data.current_state.mode
+            preflight = data.current_state.connected
+            battery = (data.current_battery_status.percentage, data.current_battery_status.voltage)
+            vehicle_name = data.current_vehicle_name
+            yaw_align = data.current_yaw_align
+            controller = data.current_controller_type
+            motors = tuple(data.current_motor_commands)
+            motors_time = data.last_motor_commands_time
+            pos_err = (data.current_position_error.x, data.current_position_error.y,
+                       data.current_position_error.z)
+            system_status = data.current_system_status
+            system_time = data.last_system_status_time
+            optitrack_time = data.last_optitrack_time
+            detections = next(reversed(data.vision_detections.values()), ())
+            detections_time = data.last_vision_detections_time
+        finally:
+            self.lock.unlock()
+
+        now = time.monotonic()
+        no_data = 'no data received'
+
+        def age(t):
+            return round(now - t, 1) if t else None
+
+        def r(value, digits=2):
+            return None if value is None else round(float(value), digits)
+
+        snap = {'ground_station_time': QDateTime.currentDateTime().toString('yyyy-MM-dd hh:mm:ss')}
+        snap['vehicle'] = {
+            'name': vehicle_name or None,
+            'controller': (self._controller_display_name(controller)
+                           if 'controller_type' in last else None),
+            'px4_status': ({
+                'armed': armed,
+                'flight_mode': mode,
+                'preflight_checks_pass': preflight,
+                'yaw_aligned': bool(yaw_align),
+                'age_s': age(last['state']),
+            } if 'state' in last else no_data),
+        }
+        if 'odom' in last:
+            snap['position_m'] = {'x': r(pos[0]), 'y': r(pos[1]), 'z_height': r(pos[2]),
+                                  'age_s': age(last['odom'])}
+            snap['velocity_mps'] = {'x': r(vel[0]), 'y': r(vel[1]), 'z': r(vel[2]),
+                                    'speed': r(math.sqrt(sum(v * v for v in vel)))}
+        else:
+            snap['position_m'] = snap['velocity_mps'] = no_data
+        if 'imu' in last:
+            yaw = ((imu[2] + 180.0) % 360.0) - 180.0  # stored wrapped to [0, 360)
+            snap['attitude_deg'] = {'roll': r(imu[0], 1), 'pitch': r(imu[1], 1),
+                                    'yaw': r(yaw, 1), 'age_s': age(last['imu'])}
+        else:
+            snap['attitude_deg'] = no_data
+        if self._last_cmd_time is not None:
+            snap['last_position_command'] = {
+                'x': self._last_x_cmd, 'y': self._last_y_cmd, 'z': self._last_z_cmd,
+                'yaw_deg': r(self._last_yaw_cmd, 1), 'sent_s_ago': age(self._last_cmd_time)}
+        else:
+            snap['last_position_command'] = 'none sent this session'
+        if 'position_error' in last:
+            snap['position_error_m'] = {'x': r(pos_err[0]), 'y': r(pos_err[1]),
+                                        'z': r(pos_err[2]), 'age_s': age(last['position_error'])}
+        if 'battery' in last:
+            fraction, volts = battery  # PX4 BatteryStatus.remaining: 0..1, negative = unknown
+            snap['battery'] = {
+                'remaining_pct': r(fraction * 100.0, 0) if fraction is not None and fraction >= 0 else None,
+                'voltage_v': r(volts), 'age_s': age(last['battery'])}
+        else:
+            snap['battery'] = no_data
+        if motors_time and now - motors_time < 0.5:
+            snap['motor_commands_pct'] = [r(m * 100.0, 0) for m in motors]
+
+        snap['optitrack'] = {
+            'status': {True: 'normal', False: 'lost', None: 'unknown (station just started)'}[
+                self._optitrack_ok],
+            'last_frame_s_ago': age(optitrack_time) if optitrack_time else 'never received',
+        }
+
+        if system_status is None or now - system_time >= SYSTEM_STATUS_STALE_S:
+            silent = ('never received' if system_status is None
+                      else f'none for {int(now - system_time)} s')
+            snap['wifi'] = {'level': 'bad',
+                            'summary': f'No WiFi: reports from the drone computer: {silent}'}
+            snap['orin_cpu'] = no_data
+        else:
+            wifi = system_status.get('wifi') or {}
+            level, text = wifi_summary(wifi, self._wifi_backlog_reports)
+            snap['wifi'] = {
+                'level': level, 'summary': text.replace('\n', '; '),
+                **{k: wifi.get(k) for k in ('ssid', 'signal_dbm', 'ping_ms', 'freq_mhz',
+                                           'tx_mbps', 'rx_mbps', 'qdisc_backlog_max_pkts',
+                                           'udp_txq_max_bytes')},
+                'report_age_s': age(system_time)}
+            cpu = system_status.get('cpu') or {}
+            snap['orin_cpu'] = {
+                'load_pct': cpu.get('load_pct'),
+                'cores': 'cpu0-3 housekeeping, cpu4 uXRCE-DDS agent, cpu5 control node',
+                'temp_c': cpu.get('temp_c')}
+            snap['onboard_feed_status'] = {'mocap': system_status.get('mocap'),
+                                           'odom': system_status.get('odom')}
+
+        if detections_time:
+            snap['camera_detections'] = {
+                'objects': [{'label': d[0], 'confidence': r(d[1]), 'range_m': r(d[6])}
+                            for d in detections],
+                'age_s': age(detections_time)}
+        else:
+            snap['camera_detections'] = 'no detector data received'
+
+        log = self.ui.list_cmd_log
+        snap['recent_flight_log'] = [log.item(i).text()
+                                     for i in range(max(0, log.count() - 8), log.count())]
+        return snap
 
     # ------------------------------------------------------------------
     # Controller tab
@@ -2101,6 +2546,7 @@ class SingleDroneRosThread(QObject):
         self._last_y_cmd = y
         self._last_z_cmd = z
         self._last_yaw_cmd = ((yaw + 180.0) % 360.0) - 180.0
+        self._last_cmd_time = time.monotonic()
 
         if self._pref_armed:
             self._pref_armed = False

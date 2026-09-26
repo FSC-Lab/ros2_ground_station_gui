@@ -4,7 +4,7 @@
 
 This repository contains a PyQt5 ground-control GUI for ROS 2 and PX4-based drone experiments. There are two entry points: `src/GroundControl.py` launches a multi-drone station for UAV IDs `0`, `1`, and `2`; `src/single_drone_ground_control.py` launches a single-UAV station (`uav_0`) built around a dedicated layout for single-drone flight experiments.
 
-The application is not packaged as an installable Python or ROS package. Imports and configuration paths assume the command is run from the repository root with `src` on `PYTHONPATH`.
+The application is not packaged as an installable Python or ROS package. Imports and configuration paths assume the command is run from the repository root; running a script under `src/` puts `src` on the import path by itself.
 
 ## Repository map
 
@@ -15,6 +15,7 @@ The application is not packaged as an installable Python or ROS package. Imports
 - `src/ROS_Node/ros_water_sample_control.py`: legacy ROS 1 (`rospy`) water-sampling implementation; currently not exported or started.
 - `src/ROS_Node/ros_common.py`: small data-holder classes shared by the controllers.
 - `src/Common/common.py`: mutex-protected telemetry/state shared between ROS callbacks and Qt updates; includes frame and quaternion conversions.
+- `src/Common/llm_client.py`: Qt-only client for the LLM proxy (health check, streamed chat), used by the single-drone VLM tab. No rclpy.
 - `src/GUI/GUI_Sampler.ui`: Qt Designer source of truth for the multi-drone GUI.
 - `src/GUI/GUI_SamplerdotUI.py`: generated PyQt5 code imported by `GroundControl.py`.
 - `src/GUI/single_drone_flight.ui`: Qt Designer source of truth for the single-drone GUI (an "Autonomous Flight" telemetry tab plus an "Initialization" tab with arm/disarm/takeoff/land/mode controls).
@@ -28,7 +29,7 @@ The application is not packaged as an installable Python or ROS package. Imports
 
 Use a ROS 2 environment that provides the workspace's message packages. Important runtime dependencies include:
 
-- Python 3, PyQt5, and NumPy
+- Python 3, PyQt5 (including QtNetwork, which ships with it), and NumPy
 - ROS 2 Python (`rclpy`)
 - `px4_msgs`
 - `fsc_autopilot_ros2_msgs`
@@ -41,14 +42,20 @@ See `docs/prerequisites.md` for the expected ROS 2 workspace layout and upstream
 Source the ROS installation and the containing workspace before running the GUI. From this repository root, launch the multi-drone station with:
 
 ```bash
-PYTHONPATH=src python3 src/GroundControl.py
+python3 src/GroundControl.py
 ```
 
 or the single-drone station with:
 
 ```bash
-PYTHONPATH=src python3 src/single_drone_ground_control.py
+python3 src/single_drone_ground_control.py
 ```
+
+Do not prefix `PYTHONPATH=src`: it *replaces* the sourced ROS entries on `PYTHONPATH` and
+the GUI dies with `No module named 'rclpy'` (checked 2026-09-26). Python already puts the
+script's directory, `src/`, first on the import path. If you must set it, use
+`PYTHONPATH=src:$PYTHONPATH`. Close the window to quit; Ctrl+C in the terminal does not
+stop the Qt event loop.
 
 Run from the repository root because the controllers currently open JSON configuration using paths such as `src/ROS_Node/geofence.json`.
 
@@ -131,9 +138,10 @@ send doesn't silently overwrite a capture the user meant to keep.
 `optitrack_status` (a `QLabel` on the Autonomous Flight tab) has a green background with
 "OptiTrack normal" while raw OptiTrack frames arrive. After `OPTITRACK_TIMEOUT_S`
 (0.4 s) without a frame it turns red with "No OptiTrack". Each transition is announced
-and written to the flight log. A real loss (after having been normal) gets a siren
-before the words. See "Audio alarms" (added 2026-09-25; background colours and siren
-since 2026-09-26).
+and written to the flight log. Recovery after a loss is announced as "OptiTrack
+regained"; present at launch is just "OptiTrack normal". Every "No OptiTrack" gets a
+siren before the words. See "Audio alarms" (added 2026-09-25; background colours and
+siren since 2026-09-26).
 
 - **It watches `/vrpn_mocap/uav_0/pose` (`OPTITRACK_TOPIC`), not `/uav_0/mocap`.**
   During a VRPN dropout, `fsc_optitrack_processor_ros2` keeps republishing the held
@@ -156,9 +164,11 @@ since 2026-09-26).
   three status labels go through `_set_status_label()`. It calls
   `setText`/`setStyleSheet` only when the value changes, because `setStyleSheet`
   re-polishes the widget and should not run at 30 Hz.
-- **No siren for the first verdict at launch.** At the desk with no mocap, the startup
-  "No OptiTrack" is spoken without a siren. An alarm that sounds on every launch
-  teaches people to ignore it.
+- **Every "No OptiTrack" gets the siren, the launch verdict included.** At the desk
+  with no mocap it therefore sounds on every launch. It was briefly exempted to avoid
+  alarm fatigue, but the operator wants it (2026-09-26). If mocap is running but
+  discovery takes longer than the 2 s grace, the siren is cut short by
+  "OptiTrack regained".
 
 ## Single-drone Orin status (`cpu_status`, `wifi_status`)
 
@@ -191,9 +201,11 @@ The formatting and thresholds are the module-level functions `cpu_summary()` and
   labels with the longest texts, e.g. "no status from Orin for 125 s" and six loads
   at 100%.
 - **Only entering and leaving "No WiFi" is announced and logged**: siren and
-  "No WiFi", then "WiFi restored" without a siren. Good <-> fair can flip every second
-  while the signal sits near a threshold. Nothing fires before the first report
-  arrives, so launching without the Orin is quiet (the label is red).
+  "No WiFi", then "WiFi regained" without a siren. Good <-> fair can flip every second
+  while the signal sits near a threshold. At launch the verdict waits
+  `SYSTEM_STATUS_STALE_S` (3 s) for a first report; if none has come, launching with
+  the Orin off is announced like any other loss (siren and "No WiFi"). A good first
+  verdict is not announced.
 - `mocap`/`odom` from this report are not shown. See the OptiTrack section for why
   `mocap.status` is not used for `optitrack_status`.
 
@@ -210,7 +222,7 @@ Announcements play one at a time: a siren (optional), then speech. Every step is
   `'wifi'`). A newer one from the same source drops that source's queued item and
   kills its playing one, and speech is cancelled with `spd-say -C`, because killing
   the client does not reliably stop speech-dispatcher. Without this, a loss followed
-  by a quick recovery would play "OptiTrack normal" during the siren and then the
+  by a quick recovery would play "OptiTrack regained" during the siren and then the
   stale "No OptiTrack" after it. Announcements from different sources queue instead,
   because OptiTrack and WiFi tend to drop together and neither alarm should clip the
   other.
@@ -220,12 +232,85 @@ Announcements play one at a time: a siren (optional), then speech. Every step is
   once, hung siren, hung speech) and silently through the real `pacat`/`spd-say`
   (siren 1.2 s, then speech, no leftover processes).
 
+## Single-drone LLM status assistant (VLM tab)
+
+The operator types a question in `LLM_input`, and a language model answers in
+`LLM_chatlog` from what this GUI has received (added 2026-09-26). It is read-only by
+design.
+
+| Widget | Role |
+| --- | --- |
+| `buttom_connect_VLM` | Connect / Disconnect. Runs a health check, preloads the model, and polls health every 15 s while connected |
+| `LLM_input` | the question. Enter sends; Shift+Enter adds a line |
+| `LLM_send` | Send; becomes Stop while an answer streams |
+| `LLM_chatlog` | the conversation, bounded to `LLM_CHATLOG_MAX_BLOCKS` |
+| `Api_status` | not connected / connecting / loading model / online / unreachable. **Optional**: if the `.ui` has no such label the station still starts and prints a warning |
+
+**Server.** The LLM host's proxy at `LLM_BASE_URL` (a NetBird address), model
+`LLM_MODEL` (`qwen2.5vl:7b`). It exposes `GET /api/health` and `POST /api/chat`. Ollama
+itself stays on loopback on the LLM host. The proxy has **no authentication**, so any
+NetBird peer the access policy allows can use it. Proxy behaviour observed 2026-09-26:
+
+- it forwards only `model` and `messages`, and always streams Ollama-format NDJSON
+  (one JSON object per line). It ignores `stream` and `options`, so temperature and
+  `num_predict` have no effect.
+- it rejects an empty `messages` list, so the preload on connect is a tiny real
+  request.
+- errors come back as `{"error": "..."}`, e.g. with HTTP 400.
+- the model unloads after 5 min idle; the next answer then waits 5-10 s to reload.
+
+Rules for this path:
+
+- **Read-only.** The model gets a telemetry snapshot and answers in text. Nothing here
+  publishes or calls a ROS service, and the proxy's `/api/parse` is not used. If LLM
+  commands are added later, the GUI itself must apply the `geofence.json` check and
+  resolve targets against the current pose. `/api/parse` returns only what the model
+  said; those checks live in `nl_commander` and do not run on this path. The
+  Controller tab's asymmetric safety rules apply too.
+- **Threading.** `QNetworkAccessManager` runs on the GUI thread
+  (`src/Common/llm_client.py`): it is asynchronous, never blocks, and never touches
+  rclpy. The snapshot reads `CommonData` with `tryLock(50)`: a bounded wait once per
+  question, not per tick.
+- **Snapshot (`_llm_telemetry_snapshot()`).** Built fresh for each question and put in
+  that question's user message. It is not kept in the history, which holds only plain
+  question/answer text (the last `LLM_HISTORY_TURNS` pairs). Every source carries
+  `age_s` from `CommonData.last_update`, and a source never received says "no data
+  received" instead of the zeros the data holders start with. It covers:
+  - vehicle and PX4 status;
+  - position and velocity (local mocap frame, z up);
+  - attitude (yaw ±180);
+  - the last position command sent, and position error;
+  - battery (PX4 `remaining` 0..1, shown as %);
+  - motor commands, when fresh;
+  - OptiTrack;
+  - WiFi, CPU and onboard feed status from `system_monitor`;
+  - camera detections;
+  - the last 8 flight-log lines.
+
+  That is roughly 600 tokens.
+- **Streaming.** Text reaches the widget at most 10x a second (`LLM_FLUSH_MS`). A
+  finished answer is re-rendered from markdown, because the 7B model uses markdown for
+  longer answers despite the prompt. The answer is located as the last `len(answer)`
+  characters of the log, and replaced only if they match. A saved `QTextCursor` cannot
+  anchor it, because Qt moves the cursor when a newline is inserted at its position.
+  Status lines are not written to the log while an answer streams; they would land
+  inside it.
+- **Timeouts.** Health checks time out after 5 s. Chat has a 45 s inactivity timeout
+  (Qt's `transferTimeout`, which resets whenever data arrives).
+- **Tested 2026-09-26.** Against the live proxy, with a replayed flight:
+  - answers took 0.7-1.5 s;
+  - an arm request was refused;
+  - Stop, Shift+Enter and Disconnect all worked;
+  - with no telemetry, the model said the armed state was unknown.
+
+  The client's edge cases (HTTP 400 body, a cut stream, a stall timeout,
+  abort-then-ask) were tested against a local fake server.
+
 ## Single-drone camera view
 
 `cam_vision_0` on the "VLM" tab shows the onboard RealSense color stream with the
-YOLO detector's boxes drawn over it (`CameraDetectionView`, added 2026-09-25). The other
-widgets on that tab (`textBrowser`, `plainTextEdit`, `buttom_connect_VLM`,
-`pushButton_2`) are VLM placeholders and are not wired to anything yet.
+YOLO detector's boxes drawn over it (`CameraDetectionView`, added 2026-09-25). The chat
+widgets on the same tab are described in "Single-drone LLM status assistant".
 
 | Topic | Type | Published QoS | GUI reader |
 | --- | --- | --- | --- |

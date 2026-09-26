@@ -16,7 +16,7 @@ Everything needed to run the GUI entry points in this repository
 
 | Package | Install | Required by |
 |---|---|---|
-| PyQt5 | `sudo apt install python3-pyqt5` | GUI framework — both entry points |
+| PyQt5 | `sudo apt install python3-pyqt5` | GUI framework — both entry points. Its QtNetwork module (included) is the single-drone LLM tab's HTTP client. |
 | NumPy | `sudo apt install python3-numpy` (or `pip install numpy`) | `Common/common.py` — quaternion/frame conversions |
 | pyqtgraph | `pip install pyqtgraph` | **Optional.** Powers the real-time plots in `single_drone_ground_control.py` (`display_x_y_z` and `display_body_angle`). Import is guarded — the GUI runs without it, printing `[PLOT] pyqtgraph not found` and leaving those plots blank. |
 | speech-dispatcher (`spd-say`) | `sudo apt install speech-dispatcher` (ships with Ubuntu desktop) | **Optional.** Speaks the OptiTrack and WiFi announcements ("No OptiTrack", "No WiFi", ...) in `single_drone_ground_control.py`. Without it the indicators still work, silently, and the GUI prints `[AUDIO] spd-say not found`. |
