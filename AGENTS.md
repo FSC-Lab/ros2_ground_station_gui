@@ -235,8 +235,9 @@ Announcements play one at a time: a siren (optional), then speech. Every step is
 ## Single-drone LLM status assistant (VLM tab)
 
 The operator types a question in `LLM_input`, and a language model answers in
-`LLM_chatlog` from what this GUI has received (added 2026-09-26). It is read-only by
-design.
+`LLM_chatlog` from what this GUI has received (added 2026-09-26). Status answers are
+read-only. The one exception is the camera search (see "VLM camera search" below): it
+can *propose* small moves, and only the operator's click sends one.
 
 | Widget | Role |
 | --- | --- |
@@ -261,12 +262,13 @@ NetBird peer the access policy allows can use it. Proxy behaviour observed 2026-
 
 Rules for this path:
 
-- **Read-only.** The model gets a telemetry snapshot and answers in text. Nothing here
-  publishes or calls a ROS service, and the proxy's `/api/parse` is not used. If LLM
-  commands are added later, the GUI itself must apply the `geofence.json` check and
-  resolve targets against the current pose. `/api/parse` returns only what the model
-  said; those checks live in `nl_commander` and do not run on this path. The
-  Controller tab's asymmetric safety rules apply too.
+- **Read-only status answers.** The model gets a telemetry snapshot and answers in
+  text; the proxy's `/api/parse` is not used. The only paths from here to the vehicle
+  are the camera search's snapshot request, which is harmless, and its proposed moves.
+  Moves are gated by the operator's click and by the GUI's own checks: geofence, pose,
+  armed, OFFBOARD, yaw alignment and OptiTrack. Any future LLM command path must keep
+  that shape. `/api/parse` returns only what the model said, and the geofence and pose
+  checks live in `nl_commander`, not on this path.
 - **Threading.** `QNetworkAccessManager` runs on the GUI thread
   (`src/Common/llm_client.py`): it is asynchronous, never blocks, and never touches
   rclpy. The snapshot reads `CommonData` with `tryLock(50)`: a bounded wait once per
@@ -305,6 +307,91 @@ Rules for this path:
 
   The client's edge cases (HTTP 400 body, a cut stream, a stall timeout,
   abort-then-ask) were tested against a local fake server.
+
+## VLM camera search ("is there a bottle in view?")
+
+Added 2026-09-27. The operator asks in the chat. Explicit camera requests ("is there a
+bottle in view?", "look for a person") are recognised in code (`parse_look_request`).
+The chat model's `{"action": "look", "object": ...}` reply remains a fallback for
+unusual phrasing. The GUI then:
+
+1. **Snapshot.** It asks the Orin for its latest frame.
+2. **VLM verdict.** The VLM judges whether the object is in view.
+3. **Detector match.** The detector's result for that same frame is matched by label.
+4. **Found:** it stores and reports a room position.
+5. **Not found:** if **LLM Control** is on, it proposes up to `LOOK_MAX_MOVES` (5)
+   relocation moves. **Each move needs a Commit Action click.**
+
+| Widget | Role |
+| --- | --- |
+| `buttom_LLM_commit_2` ("LLM Control") | checkable gate for moves; **off at every launch**; logged on change. Turning it off ends a search with a pending or in-progress move |
+| `buttom_LLM_commit` ("Commit Action") | enabled only while a move is pending; its text names the move, e.g. "Commit: turn left 30°"; a click sends exactly that move |
+| `LLM_control_status` | "LLM control on" (green) / "LLM control off" |
+
+All three are optional, like `Api_status`: without them the search reports but never
+moves. `buttom_LLM_commit_2` is Designer's copy name; renaming it in Designer means
+updating the `getattr` in `_setup_llm`.
+
+| Interface | Type | Notes |
+| --- | --- | --- |
+| `/uav_0/snapshot/request` | `std_msgs/String` JSON `{"id", "quality"}` | GUI → Orin, reliable |
+| `/uav_0/snapshot/response` | `std_msgs/String` JSON, ~85 kB | Orin → GUI, reliable. One message holds `jpeg_b64` (640x480, quality 95), that frame's `detections` (label, confidence, bbox, `position_camera`, `position_body`), `detector_classes`, `body_T_color`, `frame_age_ms` |
+| `/uav_0/mocap` | `fsc_autopilot_ros2_msgs/Mocap` | subscribed `raw=True` and decoded only when a snapshot is requested |
+
+The responder lives in the Orin's `realsense_camera_object_localization` (branch
+`gs-snapshot`, `ros_publisher.py`), inside the detector process, which owns the
+camera. It answers from a background executor thread; the camera loop never waits on
+it. Measured live: ~160 ms round trip, frames 15-40 ms old.
+
+- **Room position = R(q) · `position_body` + t**, using the `/uav_0/mocap` pose sampled
+  on the ROS thread when the request left. Use `/uav_0/mocap`, not the estimator's
+  odom: the camera extrinsic was calibrated against `/uav_0/mocap`, and odom lags it by
+  up to ~10 cm / 5 deg in flight. `body_to_world()` reproduces the Orin calibration's
+  own AprilTag check to 2.3 cm RMS (8 views).
+- **`body_T_color` is the `extrinsics.yaml` matrix as-is.** The 2026-09-25 calibration
+  was solved from points in the *color* optical frame, which is the frame the detector
+  reports in. Do not route it through `load_drone_to_color()`, which is meant for CAD
+  values anchored on the depth module; that would add the depth-to-color offset
+  (~15 mm) a second time.
+- **The VLM judges only the image.** Asked in one JSON reply for visibility, the index
+  of the matching detector box and a move, qwen2.5vl:7b answered from the detector
+  list and called a plainly visible bottle "not visible". The fix was a describe-first
+  reply plus `{"visible", "move"}`, with the detector matched by label in code
+  (`_match_detection`). Keep it that way.
+- **Moves.** Only the fixed set in `LOOK_MOVES` is allowed: yaw ±30°, ±0.3 m ahead or
+  to the side in the heading frame, ±0.2 m vertical.
+  - When the object isn't in view and the VLM suggests nothing, the GUI proposes a
+    scanning turn (yaw left).
+  - A move is only offered if the drone is armed, in OFFBOARD, yaw-aligned and has
+    OptiTrack, and the target is inside the geofence.
+  - These are all re-checked when Commit Action is clicked. If the drone has shifted
+    more than 0.2 m or 10 deg since the proposal, nothing is sent.
+  - Moves are sent through `_issue_position_command()`, the same path as manual
+    commands.
+- **No dialog.** The operator answers on the tab itself, so every other control,
+  back-to-baseline included, stays usable while a move is pending. Stop (`LLM_send`),
+  LLM Control off and Disconnect end the search at any stage.
+- **Routing in code, not by the model.** With an earlier result in its snapshot,
+  qwen2.5 answered a repeat "look for a person" from memory 4 times out of 4, and a
+  stronger prompt fixed only 1 in 4. `parse_look_request` catches the explicit
+  phrasings, skips the routing call (about 1 s faster), and leaves past-tense
+  questions ("did you find ...?") and telemetry words ("can you see the WiFi status?")
+  to the model. Label matching knows `people` -> `person` (`object_matches_label`).
+- **History.** The chat history keeps the model's `{"action": "look"}` reply. Results
+  reach it through the snapshot (`recent_camera_checks`, `found_objects`). Storing the
+  result text as the model's reply broke "did you find a person earlier?".
+- **Tested 2026-09-27.**
+  - Live against the Orin camera and the real VLM: a bottle was found in 1.7 s; the
+    chair was reported as not detectable; the person scan was refused because the
+    drone was disarmed. Command publishing was stubbed out.
+  - On an isolated domain with a replayed flight, through the real widgets:
+    - a 5-move scan with Commit Action clicks;
+    - a room position (bottle on the floor, z ≈ 0.05 m);
+    - LLM Control off with a move pending;
+    - a search with control off, which proposed no move;
+    - Stop during analysis.
+    - 6 commands reached the recorder, as expected.
+  - Not yet flown.
 
 ## Single-drone camera view
 

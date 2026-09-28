@@ -22,6 +22,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 '''
 
+import base64
+import re
 import time
 import math
 import shutil
@@ -34,9 +36,11 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from PyQt5.QtCore import QEvent, QObject, pyqtSignal, QProcess, QThread, QDateTime, QTimer, Qt, QPointF, QRectF
+from PyQt5.QtCore import (QEvent, QObject, pyqtSignal, QProcess, QThread, QDateTime, QTimer, Qt,
+                          QPointF, QRectF, QUrl)
 from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPen,
-                         QTextCharFormat, QTextCursor, QTextDocument, QTextDocumentFragment)
+                         QTextCharFormat, QTextCursor, QTextDocument, QTextDocumentFragment,
+                         QTextImageFormat)
 from PyQt5.QtWidgets import QAbstractItemView, QMessageBox, QTableWidgetItem, QWidget
 import Common
 from Common.llm_client import LlmClient
@@ -116,6 +120,57 @@ LLM_HEALTH_INTERVAL_MS = 15000  # keeps Api_status honest while connected
 LLM_HISTORY_TURNS = 6           # question/answer pairs resent as context
 LLM_CHATLOG_MAX_BLOCKS = 2000   # bounded, like the flight log
 LLM_FLUSH_MS = 100              # streamed text reaches the widget at most 10x a second
+# "Is there a <object> in view?" -> VLM camera check (look pipeline). The Orin's detector
+# process answers snapshot requests with the latest frame + that frame's detections; the
+# namespace follows its --ros-ns, like the VISION_* topics above.
+VISION_SNAPSHOT_REQUEST_TOPIC = '/uav_0/snapshot/request'
+VISION_SNAPSHOT_RESPONSE_TOPIC = '/uav_0/snapshot/response'
+# Room-frame positions use /uav_0/mocap, the pose the camera-to-drone extrinsic was
+# calibrated against (the estimator's odom lags it by up to ~10 cm / 5 deg in flight).
+MOCAP_POSE_TOPIC = '/uav_0/mocap'
+LOOK_SNAPSHOT_QUALITY = 95
+LOOK_SNAPSHOT_TIMEOUT_MS = 5000
+LOOK_POSE_MAX_AGE_S = 0.5       # older than this -> no room position, only drone-relative
+LOOK_STILL_M = 0.05             # pose change across the request -> "drone was moving"
+LOOK_STILL_DEG = 3.0
+LOOK_MAX_MOVES = 5              # relocation attempts per search, each operator-confirmed
+LOOK_STEP_M = 0.3
+LOOK_STEP_UP_M = 0.2
+LOOK_YAW_STEP_DEG = 30.0
+LOOK_SETTLE_POS_M = 0.10        # "arrived": within this of the target...
+LOOK_SETTLE_YAW_DEG = 6.0
+LOOK_SETTLE_HOLD_S = 1.0        # ...for this long
+LOOK_SETTLE_TIMEOUT_S = 10.0    # then take the picture anyway, and say so
+LOOK_THUMBNAILS_KEPT = 12       # snapshot thumbnails kept in LLM_chatlog (memory bound)
+# The only moves the VLM may propose. Horizontal steps are in the drone's heading frame
+# (ENU yaw: 0 = +x, anticlockwise positive -- matches /uav_0/mocap within 0.7 deg).
+LOOK_MOVES = {
+    'yaw_left': (f"turn left {LOOK_YAW_STEP_DEG:.0f}°", 0.0, 0.0, 0.0, +LOOK_YAW_STEP_DEG),
+    'yaw_right': (f"turn right {LOOK_YAW_STEP_DEG:.0f}°", 0.0, 0.0, 0.0, -LOOK_YAW_STEP_DEG),
+    'forward': (f"move forward {LOOK_STEP_M:.1f} m", LOOK_STEP_M, 0.0, 0.0, 0.0),
+    'back': (f"move back {LOOK_STEP_M:.1f} m", -LOOK_STEP_M, 0.0, 0.0, 0.0),
+    'left': (f"move left {LOOK_STEP_M:.1f} m", 0.0, LOOK_STEP_M, 0.0, 0.0),
+    'right': (f"move right {LOOK_STEP_M:.1f} m", 0.0, -LOOK_STEP_M, 0.0, 0.0),
+    'up': (f"climb {LOOK_STEP_UP_M:.1f} m", 0.0, 0.0, LOOK_STEP_UP_M, 0.0),
+    'down': (f"descend {LOOK_STEP_UP_M:.1f} m", 0.0, 0.0, -LOOK_STEP_UP_M, 0.0),
+}
+# The VLM only judges the image. Tested 2026-09-27: asked for visibility, the index of
+# the matching detector box and a move in one JSON reply, qwen2.5vl:7b answered from the
+# detector list and called a plainly visible bottle "not visible". Describe-first plus
+# a two-field JSON fixed it; matching the detector result is done in code (by label).
+LOOK_SYSTEM_PROMPT = (
+    "You look at one image from a drone's camera, which points forward and about 45 "
+    "degrees down, to check for an object the operator asked about.\n"
+    "Reply in exactly two lines:\n"
+    "Line 1: one short sentence naming the main things you can see in the image.\n"
+    'Line 2: only this JSON: {"visible": true or false, "move": "yaw_left", "yaw_right", '
+    '"forward", "back", "left", "right", "up", "down" or null}\n'
+    "visible: true if the object is anywhere in the image, even partly.\n"
+    "move: the one move that would give a closer or clearer view of the object: yaw_left "
+    "or yaw_right to turn toward something at that edge, forward if it is small or far, "
+    "up to see further, back if it is cut off at the bottom. null if it is already large "
+    "and clear, or if no move would help."
+)
 LLM_SYSTEM_PROMPT = (
     "You are the status assistant in the ground-station GUI of an indoor quadrotor "
     "(uav_0) flying under OptiTrack motion capture.\n"
@@ -136,18 +191,28 @@ LLM_SYSTEM_PROMPT = (
     "for a whole normal flight on these vehicles; do not call that a fault on its own.\n"
     "- You cannot control the drone: you cannot send commands, arm, move it or change "
     "modes. If asked to, say that at this stage you can only report status.\n"
+    "- Exception, the camera: if the operator asks whether something is in the camera's "
+    "view, or asks you to look for, find or check for an object, do not answer from the "
+    "snapshot. Reply with only this JSON and nothing else: "
+    '{"action": "look", "object": "<the object, in a few words>"}. '
+    "Do this every time, even if the same object was checked before: the drone or the "
+    "object may have moved. The ground station then checks the camera and reports back. "
+    "Results of earlier "
+    "checks are in recent_camera_checks, and objects found (with positions) in "
+    "found_objects.\n"
     "Reply in plain text without markdown, in one to four short sentences unless the "
     "operator asks for detail."
 )
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
 from px4_msgs.msg import ActuatorMotors, VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus,VehicleRatesSetpoint, EstimatorStatusFlags
-from fsc_autopilot_ros2_msgs.msg import PositionControllerReference, PositionControllerState, VehicleInfo
+from fsc_autopilot_ros2_msgs.msg import Mocap, PositionControllerReference, PositionControllerState, VehicleInfo
 from fsc_autopilot_ros2_msgs.srv import ActivateController, ListControllers
 
 # from mavros_msgs.msg import State, AttitudeTarget
 from visualization_msgs.msg import Marker
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CompressedImage
+from rclpy.serialization import deserialize_message
 import json
 # from fsc_autopilot_msgs.msg import TrackingReference
 from std_msgs.msg import Bool, String
@@ -212,6 +277,83 @@ def cpu_summary(cpu):
     # Agent and the control node (system_monitor's field notes).
     housekeeping = '   '.join(f'cpu{i} {pct(i)}' for i in range(4))
     return f'{housekeeping}\ncpu4 (Agent) {pct(4)}   cpu5 (control) {pct(5)}'
+
+
+def quat_to_matrix(q):
+    """3x3 rotation from a unit quaternion (x, y, z, w), same form as the Orin's
+    extrinsics._quat_to_matrix used to calibrate the camera."""
+    x, y, z, w = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def body_to_world(p_body, position, orientation):
+    """Drone-body (FLU) point -> room (/uav_0/mocap ENU) point: R(q) p + t, the
+    composition scripts/solve_extrinsic.py calibrated against."""
+    return quat_to_matrix(orientation) @ np.asarray(p_body, dtype=float) + np.asarray(position, dtype=float)
+
+
+# Explicit camera requests, recognised in code before the chat model is asked. Tested
+# 2026-09-27: with an earlier result in its snapshot, qwen2.5 answered a repeat "look for
+# a person" from memory 4 times out of 4 instead of routing it to the camera. Past-tense
+# questions ("did you find ...?") do not match and are answered by the model from
+# recent_camera_checks.
+_LOOK_PATTERNS = [re.compile(pattern, re.I) for pattern in (
+    r"^(?:please\s+)?(?:look|search|scan)\s+(?:around\s+)?for\s+(?P<obj>.+)$",
+    r"^(?:please\s+)?find\s+(?P<obj>.+)$",
+    r"^(?:can|could|do)\s+you\s+see\s+(?P<obj>.+?)(?:\s+(?:now|in\s+(?:the\s+)?"
+    r"(?:view|frame|camera|image|picture)))?$",
+    r"^(?:is|are)\s+there\s+(?P<obj>.+?)\s+(?:in\s+(?:the\s+)?"
+    r"(?:view|frame|camera|image|picture|sight)|visible)(?:\s+now)?$",
+    r"^(?:does|can)\s+the\s+camera\s+see\s+(?P<obj>.+)$",
+    r"^check\s+(?:if|whether)\s+(?:the\s+camera\s+(?:can\s+)?sees?|you\s+can\s+see)\s+(?P<obj>.+)$",
+)]
+_LOOK_LEADING_WORDS = re.compile(r"^(?:a|an|the|any|my|some)\s+", re.I)
+# "can you see the WiFi status?" is a telemetry question, not a camera request.
+_LOOK_NOT_OBJECTS = re.compile(
+    r"\b(?:wifi|battery|cpu|position|status|altitude|height|speed|velocity|mode|signal|"
+    r"ping|telemetry|log|optitrack|mocap|controller|yaw|attitude)\b", re.I)
+
+
+def parse_look_request(text):
+    """The object in an explicit camera request ("is there a bottle in view?"), or None."""
+    sentence = text.strip().rstrip('?.! ').strip()
+    for pattern in _LOOK_PATTERNS:
+        match = pattern.match(sentence)
+        if match:
+            obj = _LOOK_LEADING_WORDS.sub('', match.group('obj').strip()).strip()
+            if obj and len(obj) <= 40 and not _LOOK_NOT_OBJECTS.search(obj):
+                return obj
+    return None
+
+
+# Irregular names for COCO labels ("bottles" already contains "bottle").
+_LABEL_SYNONYMS = {'people': 'person', 'persons': 'person', 'man': 'person', 'men': 'person',
+                   'woman': 'person', 'women': 'person', 'human': 'person', 'humans': 'person'}
+
+
+def object_matches_label(obj, label):
+    """Does the operator's object name refer to this detector label? ('blue bottle' ->
+    'bottle', 'people' -> 'person')."""
+    name, label = obj.lower(), label.lower()
+    names = [name] + [_LABEL_SYNONYMS[w] for w in re.findall(r"[a-z]+", name) if w in _LABEL_SYNONYMS]
+    return any(label in n or n in label for n in names)
+
+
+def parse_json_object(text):
+    """The first {...} object in a model reply, or None. Models sometimes wrap JSON in
+    prose or code fences despite being told not to."""
+    start, end = text.find('{'), text.rfind('}')
+    if start < 0 or end <= start:
+        return None
+    try:
+        obj = json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 class QuadrotorThrottleWidget(QWidget):
@@ -493,6 +635,9 @@ class SingleDroneRosNode(Node, QObject):
     # plain tuples rather than ROS messages so nothing ROS-typed crosses into Qt slots.
     controllers_listed = pyqtSignal(bool, str, list)
     controller_activated = pyqtSignal(bool, str, str)
+    # One parsed snapshot/response from the Orin, plus the /uav_0/mocap pose sampled on
+    # this (ROS) thread when the request went out and when the response came in.
+    snapshot_received = pyqtSignal(dict)
 
     def __init__(self):
         Node.__init__(self, 'single_drone_gui_node')
@@ -645,6 +790,25 @@ class SingleDroneRosNode(Node, QObject):
             self.system_status_callback,
             self.system_status_qos_profile
         )
+        # Camera snapshots for the VLM look pipeline. RELIABLE both ways: requests are
+        # rare and must arrive; a response (~85 kB) is being actively waited for.
+        self.snapshot_qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=2
+        )
+        self.snapshot_request_pub = self.create_publisher(
+            String, VISION_SNAPSHOT_REQUEST_TOPIC, self.snapshot_qos_profile)
+        self.snapshot_response_sub = self.create_subscription(
+            String, VISION_SNAPSHOT_RESPONSE_TOPIC, self.snapshot_response_callback,
+            self.snapshot_qos_profile)
+        # /uav_0/mocap arrives at ~120 Hz but is only needed when a snapshot is taken, so
+        # keep the latest serialized message (raw=True) and decode it on demand.
+        self._mocap_raw = None  # (bytes, monotonic receive time)
+        self.mocap_sub = self.create_subscription(
+            Mocap, MOCAP_POSE_TOPIC, self.mocap_callback, self.optitrack_qos_profile, raw=True)
+        self._snapshot_request_pose = {}  # request id -> pose when it was sent
 
         # Define publishers / services
         # self.coords_pub = self.create_publisher(TrackingReference, 'position_controller/target', 10)
@@ -766,6 +930,42 @@ class SingleDroneRosNode(Node, QObject):
 
     def optitrack_callback(self, _serialized_msg):
         self.data_struct.update_optitrack()
+
+    def mocap_callback(self, serialized_msg):
+        self._mocap_raw = (serialized_msg, time.monotonic())  # one tuple swap, no lock
+
+    def _latest_mocap_pose(self):
+        """ROS thread: the latest /uav_0/mocap pose as plain values, or None."""
+        latest = self._mocap_raw
+        if latest is None:
+            return None
+        msg = deserialize_message(latest[0], Mocap)
+        p, q = msg.pose.position, msg.pose.orientation
+        return {'position': [p.x, p.y, p.z], 'orientation': [q.x, q.y, q.z, q.w],
+                'age_s': time.monotonic() - latest[1]}
+
+    def _send_snapshot_request(self, request_id):
+        # Sample the pose as the request leaves: the frame the Orin answers with is its
+        # latest one, a few tens of ms older than the request's arrival.
+        self._snapshot_request_pose[request_id] = self._latest_mocap_pose()
+        while len(self._snapshot_request_pose) > 20:  # unanswered requests
+            self._snapshot_request_pose.pop(next(iter(self._snapshot_request_pose)))
+        msg = String()
+        msg.data = json.dumps({'id': request_id, 'quality': LOOK_SNAPSHOT_QUALITY})
+        self.snapshot_request_pub.publish(msg)
+
+    def snapshot_response_callback(self, msg):
+        try:
+            response = json.loads(msg.data)
+            if not isinstance(response, dict):
+                raise ValueError('not a JSON object')
+        except ValueError as e:
+            self.get_logger().warn(f'Unparseable {VISION_SNAPSHOT_RESPONSE_TOPIC} message: {e}',
+                                   throttle_duration_sec=5.0)
+            return
+        response['_pose_at_request'] = self._snapshot_request_pose.pop(response.get('id'), None)
+        response['_pose_at_response'] = self._latest_mocap_pose()
+        self.snapshot_received.emit(response)
 
     def system_status_callback(self, msg):
         # JSON from fsc_system_monitor: {"stamp", "wifi": {...}, "cpu": {...},
@@ -890,6 +1090,10 @@ class SingleDroneRosNode(Node, QObject):
         with self._request_lock:
             self._pending_requests.append(("activate", name))
 
+    def queue_snapshot_request(self, request_id):
+        with self._request_lock:
+            self._pending_requests.append(("snapshot", request_id))
+
     def queue_coordinates(self, x, y, z, yaw):
         # Same reason as the two above: publish_coordinates() touches the clock, a
         # publisher and the logger, and doing that from the Qt thread while the executor
@@ -911,6 +1115,8 @@ class SingleDroneRosNode(Node, QObject):
                 self.request_controller_activation(arg)
             elif kind == "coords":
                 self.publish_coordinates(*arg)
+            elif kind == "snapshot":
+                self._send_snapshot_request(arg)
 
     def request_controller_list(self):
         if not self.list_controllers_client.service_is_ready():
@@ -1380,6 +1586,20 @@ class SingleDroneRosThread(QObject):
         self._llm_question = ''
         self._llm_answer = ''
         self._llm_pending = ''        # streamed text not yet in the widget
+        self._llm_look_inflight = False  # the in-flight chat is a camera-search VLM verdict
+        self._look = None             # the active camera search (see _start_look), or None
+        self._look_reply = ''
+        self._found_objects = []      # finished searches that found something, newest last
+        self._camera_checks = []      # every finished search's result text, newest last
+        self._thumb_urls = deque()    # snapshot thumbnails currently held by LLM_chatlog
+        self._thumb_seq = 0
+        self._look_timeout_timer = QTimer(self)
+        self._look_timeout_timer.setSingleShot(True)
+        self._look_timeout_timer.setInterval(LOOK_SNAPSHOT_TIMEOUT_MS)
+        self._look_timeout_timer.timeout.connect(self._on_look_snapshot_timeout)
+        self._look_settle_timer = QTimer(self)
+        self._look_settle_timer.setInterval(100)
+        self._look_settle_timer.timeout.connect(self._look_settle_tick)
         self._llm_health_timer = QTimer(self)
         self._llm_health_timer.setInterval(LLM_HEALTH_INTERVAL_MS)
         self._llm_health_timer.timeout.connect(self._llm.check_health)
@@ -1400,6 +1620,22 @@ class SingleDroneRosThread(QObject):
         self.ui.LLM_input.installEventFilter(self)
         self.ui.buttom_connect_VLM.clicked.connect(self._toggle_llm_connection)
         self.ui.LLM_send.clicked.connect(self._on_llm_send_clicked)
+        # LLM Control (buttom_LLM_commit_2) gates camera-search moves and is OFF at every
+        # launch; Commit Action (buttom_LLM_commit) sends the one pending move. Optional
+        # like Api_status: without them the search still reports, but never moves.
+        self._llm_control_button = getattr(self.ui, 'buttom_LLM_commit_2', None)
+        self._llm_commit_button = getattr(self.ui, 'buttom_LLM_commit', None)
+        self._llm_control_label = getattr(self.ui, 'LLM_control_status', None)
+        self._llm_control = False
+        if self._llm_control_button is None or self._llm_commit_button is None:
+            print("[LLM] no LLM Control / Commit Action buttons in single_drone_flight.ui; "
+                  "camera search will not propose moves")
+        else:
+            self._llm_control_button.setCheckable(True)
+            self._llm_control_button.toggled.connect(self._set_llm_control)
+            self._llm_commit_button.clicked.connect(lambda: self._on_look_move_answer(True))
+        self._set_llm_control(False)
+        self._update_commit_button()
         self._set_llm_state('disconnected')
 
     def eventFilter(self, obj, event):
@@ -1434,7 +1670,7 @@ class SingleDroneRosThread(QObject):
         self._update_llm_buttons()
 
     def _update_llm_buttons(self):
-        answering = self._llm.busy() and not self._llm_warmup
+        answering = (self._llm.busy() and not self._llm_warmup) or self._look is not None
         self.ui.LLM_send.setText("Stop" if answering else "Send")
         # A question during the preload is fine: it replaces the preload and loads the
         # model itself.
@@ -1448,6 +1684,7 @@ class SingleDroneRosThread(QObject):
             self._llm_health_timer.start()
             return
         self._llm_health_timer.stop()
+        self._abort_look("Camera search stopped: disconnected from the LLM.")
         self._set_llm_state('disconnected')  # first, so the abort below reports as such
         if self._llm.busy():
             self._llm.abort_chat('disconnected')
@@ -1490,20 +1727,63 @@ class SingleDroneRosThread(QObject):
         self._llm.chat([{'role': 'user', 'content': 'Reply with the single word OK.'}])
         self._update_llm_buttons()
 
+    def _set_llm_control(self, on):
+        on = bool(on) and self._llm_control_button is not None and self._llm_commit_button is not None
+        changed = on != self._llm_control
+        self._llm_control = on
+        button = self._llm_control_button
+        if button is not None:
+            if button.isChecked() != on:
+                button.blockSignals(True)
+                button.setChecked(on)
+                button.blockSignals(False)
+            button.setText("LLM Control: ON" if on else "LLM Control: OFF")
+        if self._llm_control_label is not None:
+            self._set_status_label(self._llm_control_label,
+                                   "LLM control on" if on else "LLM control off",
+                                   STATUS_STYLE['good'] if on else "color: #555555;")
+        if changed:
+            self.log_message("LLM control on: camera search may propose moves" if on
+                             else "LLM control off")
+            # Off means the LLM stops acting now: no pending move survives it, and a
+            # search mid-move ends (the move already sent is not undone).
+            if not on and self._look is not None and self._look['phase'] in ('confirm', 'moving'):
+                self._end_look("Camera search stopped: LLM control was turned off.")
+
+    def _update_commit_button(self):
+        button = self._llm_commit_button
+        if button is None:
+            return
+        look = self._look
+        pending = look is not None and look['phase'] == 'confirm'
+        button.setEnabled(pending)
+        button.setText(f"Commit: {look['pending_move'][1]}" if pending else "Commit Action")
+
     def _on_llm_send_clicked(self):
-        if self._llm.busy() and not self._llm_warmup:
+        if self._look is not None:
+            self._abort_look("Camera search stopped by the operator.")
+        elif self._llm.busy() and not self._llm_warmup:
             self._llm.abort_chat('stopped')
         else:
             self._send_llm_question()
 
     def _send_llm_question(self):
         text = self.ui.LLM_input.toPlainText().strip()
-        if not text or self._llm_state not in ('online', 'loading'):
+        if not text or self._llm_state not in ('online', 'loading') or self._look is not None:
             return
         if self._llm.busy():
             if not self._llm_warmup:
                 return  # an answer is still streaming
             self._llm.abort_chat('superseded')
+        look_object = parse_look_request(text)
+        if look_object is not None:
+            # Straight to the camera, no routing call (see _LOOK_PATTERNS).
+            self._llm_question = text
+            self.ui.LLM_input.clear()
+            self._llm_chat_append(f"You: {text}", 'user', bold=True)
+            self._llm_chat_append("LLM: ", 'llm', bold=True)
+            self._start_look(look_object, text)
+            return
         snapshot = self._llm_telemetry_snapshot()
         compact = json.dumps(snapshot, separators=(',', ':'), ensure_ascii=False)
         prompt = (f"Telemetry snapshot:\n{compact}\n\n"
@@ -1524,7 +1804,14 @@ class SingleDroneRosThread(QObject):
     def _on_llm_delta(self, chunk):
         if self._llm_warmup:
             return
+        if self._llm_look_inflight:
+            self._look_reply += chunk  # a verdict is JSON for the GUI, not for display
+            return
         self._llm_answer += chunk
+        if self._llm_answer.lstrip()[:1] in ('{', '`'):
+            # Maybe a camera-look action (bare, or in a ``` fence as models often do):
+            # hold it until complete so raw JSON never reaches the log.
+            return
         self._llm_pending += chunk
         if not self._llm_flush_timer.isActive():
             self._llm_flush_timer.start()
@@ -1549,7 +1836,22 @@ class SingleDroneRosThread(QObject):
                 self._llm_chat_append(f"Could not load {LLM_MODEL}: {error}", 'error')
                 self._set_llm_state('offline', error)
             return
+        if self._llm_look_inflight:
+            self._llm_look_inflight = False
+            if self._look is not None and self._look['phase'] == 'analyze':
+                self._on_look_verdict(ok, error)
+            self._update_llm_buttons()
+            return
         self._llm_flush_timer.stop()
+        held = self._llm_answer.lstrip()[:1] in ('{', '`')
+        if ok and held:
+            action = parse_json_object(self._llm_answer)
+            obj = action.get('object') if action and action.get('action') == 'look' else None
+            if isinstance(obj, str) and obj.strip():
+                self._start_look(obj.strip()[:60], self._llm_question)
+                return
+        if held:
+            self._llm_pending = self._llm_answer  # not an action after all: show it as text
         self._flush_llm_text()
         if ok:
             self._llm_history += [
@@ -1744,10 +2046,396 @@ class SingleDroneRosThread(QObject):
         else:
             snap['camera_detections'] = 'no detector data received'
 
+        if self._camera_checks:
+            snap['recent_camera_checks'] = self._camera_checks[-5:]
+        if self._found_objects:
+            snap['found_objects'] = self._found_objects[-5:]
         log = self.ui.list_cmd_log
         snap['recent_flight_log'] = [log.item(i).text()
                                      for i in range(max(0, log.count() - 8), log.count())]
         return snap
+
+    # ------------------------------------------------------------------
+    # Camera search ("is there a bottle in view?")
+    #
+    # The chat model routes the question here with {"action": "look", ...}. Then:
+    #   1. snapshot: the Orin returns its latest frame + that frame's detections
+    #      (camera and drone-body positions), with the /uav_0/mocap pose sampled on the
+    #      ROS thread as the request left and as the reply arrived;
+    #   2. verdict: the VLM sees the image and says whether the object is in view, and
+    #      which one move from LOOK_MOVES would give a better view; the detector result
+    #      is matched to the object by label, in code (_match_detection);
+    #   3. found -> room position = R(q) p_body + t, stored in _found_objects; or
+    #      not found -> if LLM Control is on, one move is proposed on the Commit Action
+    #      button and sent ONLY when the operator clicks it, after the same checks as a
+    #      manual command plus armed, OFFBOARD and OptiTrack. At most LOOK_MAX_MOVES.
+    # Nothing moves the drone without that click. LLM Control (off at launch), Stop and
+    # Disconnect end a search at any stage. There is no dialog, so every other control
+    # (back to baseline included) stays usable while a move is pending.
+    # ------------------------------------------------------------------
+
+    def _start_look(self, obj, question):
+        self._look = {
+            'object': obj, 'question': question, 'moves': 0, 'snapshots': 0,
+            'phase': None, 'request_id': None, 'snapshot': None, 'image': None,
+            'pending_move': None, 'target': None, 'move_started': None,
+            'settled_since': None,
+        }
+        self._llm_chat_insert(f"checking the camera for: {obj}.")
+        self._look_capture()
+        self._update_llm_buttons()
+
+    def _look_capture(self):
+        look = self._look
+        look['snapshots'] += 1
+        look['phase'] = 'capture'
+        look['request_id'] = f"gs-{int(time.time() * 1000)}-{look['snapshots']}"
+        self.ros_object.queue_snapshot_request(look['request_id'])
+        self._look_timeout_timer.start()
+        self._llm_chat_append(f"Camera: snapshot {look['snapshots']} requested ...", 'info')
+
+    def _on_look_snapshot_timeout(self):
+        if self._look is not None and self._look['phase'] == 'capture':
+            self._end_look(
+                f"No snapshot from the drone within {LOOK_SNAPSHOT_TIMEOUT_MS / 1000:.0f} s. "
+                "Is the detector running with --ros on the Orin?", error=True)
+
+    def _on_snapshot_received(self, response):
+        look = self._look
+        if (look is None or look['phase'] != 'capture'
+                or response.get('id') != look['request_id']):
+            return  # late, or someone else's
+        self._look_timeout_timer.stop()
+        if response.get('error'):
+            self._end_look(f"The drone could not take a snapshot: {response['error']}.",
+                           error=True)
+            return
+        try:
+            image = QImage.fromData(base64.b64decode(response['jpeg_b64']))
+        except (KeyError, TypeError, ValueError):
+            image = QImage()
+        if image.isNull():
+            self._end_look("The snapshot from the drone was unreadable.", error=True)
+            return
+        look['snapshot'] = response
+        look['image'] = image
+        messages = [{'role': 'system', 'content': LOOK_SYSTEM_PROMPT},
+                    {'role': 'user', 'content': f"Object to look for: {look['object']}",
+                     'images': [response['jpeg_b64']]}]
+        if not self._llm.chat(messages):
+            self._end_look("The LLM is busy; ask again in a moment.", error=True)
+            return
+        look['phase'] = 'analyze'
+        self._look_reply = ''
+        self._llm_look_inflight = True
+        self._llm_chat_append("VLM: looking at the image ...", 'info')
+
+    def _on_look_verdict(self, ok, error):
+        look = self._look
+        if not ok:
+            self._end_look(f"The VLM request failed: {error}.", error=True)
+            return
+        snapshot = look['snapshot']
+        detections = snapshot.get('detections') or []
+        verdict = parse_json_object(self._look_reply)
+        if verdict is None:
+            self._show_look_thumbnail(None)
+            self._end_look(
+                f"Could not read the VLM's verdict ({self._look_reply.strip()[:80]!r}). "
+                f"The detector saw: {self._describe_detections(detections)}.", error=True)
+            return
+        visible = verdict.get('visible') is True
+        move = verdict.get('move') if verdict.get('move') in LOOK_MOVES else None
+        seen = self._look_reply[:self._look_reply.find('{')].strip().strip('`').strip()
+        if seen:
+            self._llm_chat_append(f"VLM: {seen[:200]}", 'info')
+        match = self._match_detection(look['object'], detections)
+        self._show_look_thumbnail(match)
+        if match is not None:
+            self._look_found(match, confirmed=visible)
+            return
+        classes = snapshot.get('detector_classes') or []
+        if not any(object_matches_label(look['object'], c) for c in classes):
+            self._end_look(
+                f"The {look['object']} is {'in view' if visible else 'not in view'} "
+                f"according to the VLM, but the detector cannot recognise it (it detects: "
+                f"{', '.join(classes) or 'unknown'}), so there is no position for it.")
+            return
+        if move is None and not visible:
+            # The VLM cannot know where an unseen object is, so it rarely suggests a move;
+            # scan by turning instead. Still one confirmed step at a time.
+            move = 'yaw_left'
+        if move is None:
+            self._end_look(f"The {look['object']} was seen but not detected, and the VLM "
+                           "suggests no move that would help.")
+            return
+        if look['moves'] >= LOOK_MAX_MOVES:
+            self._end_look(f"The {look['object']} was not localised after {LOOK_MAX_MOVES} moves.")
+            return
+        if not self._llm_control:
+            self._end_look(
+                f"The {look['object']} was {'seen but not detected' if visible else 'not found'}. "
+                f"LLM control is off, so no move is proposed (the VLM would {LOOK_MOVES[move][0]}). "
+                "Turn on LLM Control to let the search propose moves; each still needs Commit Action.")
+            return
+        self._propose_look_move(move, "it sees it, but it is not detected yet" if visible
+                                else "not in view yet")
+
+    @staticmethod
+    def _match_detection(obj, detections):
+        """The most confident detection whose label names the object ('blue bottle' ->
+        'bottle'), or None. Deterministic on purpose: see LOOK_SYSTEM_PROMPT."""
+        matches = [d for d in detections if d.get('label') and object_matches_label(obj, d['label'])]
+        return max(matches, key=lambda d: d.get('confidence', 0.0)) if matches else None
+
+    @staticmethod
+    def _describe_detections(detections):
+        return ', '.join(f"{d.get('label')} {d.get('confidence', 0):.2f}" for d in detections) or 'nothing'
+
+    def _look_found(self, detection, confirmed):
+        look = self._look
+        response = look['snapshot']
+        p_body = detection.get('position_body')
+        pose = response.get('_pose_at_request')
+        pose_after = response.get('_pose_at_response')
+        world, note = None, ''
+        if not confirmed:
+            note = ("the VLM did not confirm it in the image; this rests on the detector "
+                    f"alone (confidence {detection.get('confidence', 0):.2f})")
+        if p_body is None:
+            note = self._join_notes(note, "no camera-to-drone calibration on the Orin, so no room position")
+        elif pose is None:
+            note = self._join_notes(note, f"no OptiTrack pose on {MOCAP_POSE_TOPIC}, so no room position")
+        elif pose['age_s'] > LOOK_POSE_MAX_AGE_S or self._optitrack_ok is not True:
+            note = self._join_notes(note, "the OptiTrack pose is stale, so no room position")
+        else:
+            world = body_to_world(p_body, pose['position'], pose['orientation'])
+            if pose_after is not None:
+                shift = math.dist(pose['position'], pose_after['position'])
+                dot = abs(float(np.dot(pose['orientation'], pose_after['orientation'])))
+                turn = math.degrees(2.0 * math.acos(min(1.0, dot)))
+                if shift > LOOK_STILL_M or turn > LOOK_STILL_DEG:
+                    note = self._join_notes(note, "the drone was moving during the snapshot, so the position is approximate")
+        record = {
+            'object': look['object'], 'detector_label': detection.get('label'),
+            'confidence': detection.get('confidence'),
+            'room_xyz_m': [round(float(v), 2) for v in world] if world is not None else None,
+            'from_drone_m': ({'ahead': round(p_body[0], 2), 'left': round(p_body[1], 2),
+                              'up': round(p_body[2], 2)} if p_body is not None else None),
+            'time': QDateTime.currentDateTime().toString('hh:mm:ss'),
+            'moves_used': look['moves'],
+            'vlm_confirmed': confirmed,
+        }
+        if note:
+            record['note'] = note
+        self._found_objects = (self._found_objects + [record])[-20:]
+        text = (f"Found the {look['object']} (detector: {detection.get('label')} "
+                f"{detection.get('confidence', 0):.2f}).")
+        if world is not None:
+            text += f" Room position x={world[0]:.2f}, y={world[1]:.2f}, z={world[2]:.2f} m."
+        if p_body is not None:
+            ahead, left, up = p_body
+            text += (f" It is {abs(ahead):.2f} m {'ahead' if ahead >= 0 else 'behind'},"
+                     f" {abs(left):.2f} m to the {'left' if left >= 0 else 'right'} and"
+                     f" {abs(up):.2f} m {'above' if up >= 0 else 'below'} the drone.")
+        if note:
+            text += f" Note: {note}."
+        self._end_look(text, found=True)
+
+    @staticmethod
+    def _join_notes(first, second):
+        return f"{first}; {second}" if first else second
+
+    def _look_move_base(self):
+        """(x, y, z, yaw) to step from, or (None, why not). Same gates as a manual
+        command (yaw aligned, geofence later) plus armed, OFFBOARD and OptiTrack."""
+        data = self.ros_object.data_struct
+        if not self.lock.tryLock(50):
+            return None, "telemetry is busy"
+        try:
+            armed = data.current_state.armed
+            mode = data.current_state.mode or ''
+            odom_time = data.last_update.get('odom', 0.0)
+            pos = (data.current_local_pos.x, data.current_local_pos.y, data.current_local_pos.z)
+            yaw = ((data.current_imu.yaw + 180.0) % 360.0) - 180.0
+        finally:
+            self.lock.unlock()
+        if armed is not True:
+            return None, "the drone is not armed"
+        if 'OFFBOARD' not in mode:
+            return None, f"the drone is not in OFFBOARD mode ({mode or 'unknown'})"
+        if not self._yaw_align:
+            return None, "yaw is not aligned"
+        if self._optitrack_ok is not True:
+            return None, "OptiTrack is not normal"
+        if not odom_time or time.monotonic() - odom_time > 0.5:
+            return None, "there is no current position"
+        # Step from the setpoint the drone is holding, if it is holding the last one we
+        # sent; otherwise from where it is. Avoids creeping by the hover error each move.
+        if (self._last_cmd_time is not None
+                and math.dist(pos, (self._last_x_cmd, self._last_y_cmd, self._last_z_cmd)) < 0.3):
+            return (self._last_x_cmd, self._last_y_cmd, self._last_z_cmd, self._last_yaw_cmd), None
+        return (pos[0], pos[1], pos[2], yaw), None
+
+    def _propose_look_move(self, move, reason):
+        look = self._look
+        desc, d_ahead, d_left, d_up, d_yaw = LOOK_MOVES[move]
+        base, problem = self._look_move_base()
+        if problem:
+            self._end_look(f"The VLM suggests to {desc}, but {problem}. "
+                           "Reposition the drone yourself and ask again.")
+            return
+        x0, y0, z0, yaw0 = base
+        heading = math.radians(yaw0)
+        x = round(x0 + d_ahead * math.cos(heading) - d_left * math.sin(heading), 2)
+        y = round(y0 + d_ahead * math.sin(heading) + d_left * math.cos(heading), 2)
+        z = round(z0 + d_up, 2)
+        yaw = round(((yaw0 + d_yaw + 180.0) % 360.0) - 180.0, 1)
+        if not self._within_geofence(x, y, z):
+            self._end_look(f"The VLM suggests to {desc}, but that would leave the geofence.")
+            return
+        look['phase'] = 'confirm'
+        look['pending_move'] = (move, desc, (x, y, z, yaw), base)
+        number = look['moves'] + 1
+        self._llm_chat_append(
+            f"VLM suggests: {desc} (move {number} of {LOOK_MAX_MOVES}; {reason}). From "
+            f"x={x0:.2f} y={y0:.2f} z={z0:.2f} yaw={yaw0:.1f} to x={x:.2f} y={y:.2f} "
+            f"z={z:.2f} yaw={yaw:.1f}. Click Commit Action to move, or Stop.", 'info')
+        # No dialog: the operator answers on the tab itself, so every other control
+        # (back to baseline included) stays usable while a move is pending.
+        self._update_commit_button()
+
+    def _on_look_move_answer(self, accepted):
+        look = self._look
+        if look is None or look['phase'] != 'confirm':
+            return
+        if not accepted:
+            self._end_look("Camera search stopped by the operator.")
+            return
+        move, desc, target, base = look['pending_move']
+        # The dialog may have been open a while: re-check before anything is sent, and
+        # never send a target computed from a pose the drone has since left.
+        now_base, problem = self._look_move_base()
+        if problem:
+            self._end_look(f"Not moving: {problem}.")
+            return
+        drift = math.dist(now_base[:3], base[:3])
+        turned = abs(((now_base[3] - base[3] + 180.0) % 360.0) - 180.0)
+        if drift > 0.2 or turned > 10.0:
+            self._end_look("Not moving: the drone moved while the confirmation was open. "
+                           "Ask again for a fresh suggestion.")
+            return
+        look['moves'] += 1
+        x, y, z, yaw = target
+        self._issue_position_command(
+            x, y, z, yaw, source=f"Camera search move {look['moves']}/{LOOK_MAX_MOVES} ({desc})")
+        look['phase'] = 'moving'
+        look['target'] = target
+        look['move_started'] = time.monotonic()
+        look['settled_since'] = None
+        self._llm_chat_append(f"Moving: {desc} ...", 'info')
+        self._look_settle_timer.start()
+        self._update_commit_button()
+        self._update_llm_buttons()
+
+    def _look_settle_tick(self):
+        look = self._look
+        if look is None or look['phase'] != 'moving':
+            self._look_settle_timer.stop()
+            return
+        if self._optitrack_ok is False:
+            self._look_settle_timer.stop()
+            self._end_look("OptiTrack was lost during the move; camera search stopped.",
+                           error=True)
+            return
+        data = self.ros_object.data_struct
+        if not self.lock.tryLock():
+            return  # next tick
+        pos = (data.current_local_pos.x, data.current_local_pos.y, data.current_local_pos.z)
+        yaw = ((data.current_imu.yaw + 180.0) % 360.0) - 180.0
+        self.lock.unlock()
+        x, y, z, target_yaw = look['target']
+        distance = math.dist(pos, (x, y, z))
+        yaw_error = abs(((yaw - target_yaw + 180.0) % 360.0) - 180.0)
+        now = time.monotonic()
+        if distance <= LOOK_SETTLE_POS_M and yaw_error <= LOOK_SETTLE_YAW_DEG:
+            if look['settled_since'] is None:
+                look['settled_since'] = now
+            elif now - look['settled_since'] >= LOOK_SETTLE_HOLD_S:
+                self._look_settle_timer.stop()
+                self._look_capture()
+                return
+        else:
+            look['settled_since'] = None
+        if now - look['move_started'] > LOOK_SETTLE_TIMEOUT_S:
+            self._look_settle_timer.stop()
+            self._llm_chat_append(
+                f"Not settled after {LOOK_SETTLE_TIMEOUT_S:.0f} s ({distance:.2f} m, "
+                f"{yaw_error:.0f} deg off the target); taking the snapshot anyway.", 'info')
+            self._look_capture()
+
+    def _show_look_thumbnail(self, detection):
+        """Put the analysed frame in the chat log, with the matched box drawn."""
+        look = self._look
+        if look is None or look['image'] is None:
+            return
+        thumb = look['image'].convertToFormat(QImage.Format_RGB32)
+        if detection is not None and detection.get('bbox'):
+            x1, y1, x2, y2 = detection['bbox']
+            painter = QPainter(thumb)
+            painter.setPen(QPen(CameraDetectionView.BOX_COLOR, 3))
+            painter.drawRect(QRectF(x1, y1, x2 - x1, y2 - y1))
+            painter.end()
+        thumb = thumb.scaledToWidth(200, Qt.SmoothTransformation)
+        document = self.ui.LLM_chatlog.document()
+        self._thumb_seq += 1
+        url = QUrl(f"snapshot://{self._thumb_seq}")
+        document.addResource(QTextDocument.ImageResource, url, thumb)
+        self._thumb_urls.append(url)
+        while len(self._thumb_urls) > LOOK_THUMBNAILS_KEPT:
+            # Free the oldest thumbnail's pixels; its line keeps an empty 1x1 image.
+            blank = QImage(1, 1, QImage.Format_ARGB32)
+            blank.fill(Qt.transparent)
+            document.addResource(QTextDocument.ImageResource, self._thumb_urls.popleft(), blank)
+        cursor = QTextCursor(document)
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertBlock()
+        image_format = QTextImageFormat()
+        image_format.setName(url.toString())
+        image_format.setWidth(thumb.width())
+        cursor.insertImage(image_format)
+        self._llm_chat_scroll()
+
+    def _end_look(self, text, error=False, found=False):
+        look = self._look
+        if look is None:
+            return
+        self._look = None
+        self._look_timeout_timer.stop()
+        self._look_settle_timer.stop()
+        self._update_commit_button()
+        self._llm_chat_append(text, 'error' if error else 'llm', bold=found)
+        self.log_message(f"Camera search ({look['object']}): {text}")
+        self._camera_checks = (self._camera_checks + [{
+            'object': look['object'], 'time': QDateTime.currentDateTime().toString('hh:mm:ss'),
+            'result': text}])[-10:]
+        # History keeps what the model actually replied (the action), so it keeps routing
+        # repeat questions to the camera; the result reaches it via recent_camera_checks.
+        # (With the result text as its reply, 'did you find a person earlier?' got
+        # "no data received" -- tested 2026-09-27.)
+        self._llm_history += [{'role': 'user', 'content': look['question']},
+                              {'role': 'assistant', 'content': json.dumps(
+                                  {'action': 'look', 'object': look['object']})}]
+        self._llm_history = self._llm_history[-2 * LLM_HISTORY_TURNS:]
+        self._update_llm_buttons()
+
+    def _abort_look(self, reason):
+        if self._look is None:
+            return
+        analyzing = self._look['phase'] == 'analyze'
+        self._end_look(reason)
+        if analyzing and self._llm.busy():
+            self._llm.abort_chat('stopped')  # its finish is ignored: no search is active
 
     # ------------------------------------------------------------------
     # Controller tab
@@ -2354,6 +3042,7 @@ class SingleDroneRosThread(QObject):
         self.ros_object.direct_mode_result.connect(self._handle_direct_mode_result)
         self.ros_object.controllers_listed.connect(self._handle_controllers_listed)
         self.ros_object.controller_activated.connect(self._handle_controller_activated)
+        self.ros_object.snapshot_received.connect(self._on_snapshot_received)
 
         # callbacks from GUI
         self.ui.SendPositionUAV.clicked.connect(self.send_coordinates)
@@ -2526,7 +3215,7 @@ class SingleDroneRosThread(QObject):
             return
         
         # if values are outside the geofence, warn user
-        if abs(x) > float(self.ros_object.config[0]) or abs(y) > float(self.ros_object.config[1]) or abs(z) > float(self.ros_object.config[2]) or z <= 0:
+        if not self._within_geofence(x, y, z):
             ## pop up dialog
             msg = QMessageBox()
             msg.setIcon(QMessageBox.Warning)
@@ -2536,10 +3225,25 @@ class SingleDroneRosThread(QObject):
             msg.exec_()
             return
 
+        self._issue_position_command(x, y, z, yaw)
+
+        if self._pref_armed:
+            self._pref_armed = False
+            self.ui.buttom_enable_log.setText("Enable")
+            self._start_step_response(x, y, z)
+            self.log_message("Step response logging started")
+
+    def _within_geofence(self, x, y, z):
+        return (abs(x) <= float(self.ros_object.config[0])
+                and abs(y) <= float(self.ros_object.config[1])
+                and abs(z) <= float(self.ros_object.config[2]) and z > 0)
+
+    def _issue_position_command(self, x, y, z, yaw, source="Position command sent"):
+        """The one way a position setpoint leaves the GUI (operator or camera search)."""
         # Queued, not published inline: this runs on the Qt thread and must not touch
         # rclpy. It is issued by _drain_requests() on the next ROS tick (<=33 ms).
         self.ros_object.queue_coordinates(x, y, z, yaw)
-        self.log_message(f"Position command sent: {x}, {y}, {z}, {yaw}")
+        self.log_message(f"{source}: {x}, {y}, {z}, {yaw}")
 
         # Update the dashed command lines in the X/Y/Z plot to the setpoint sent.
         self._last_x_cmd = x
@@ -2547,12 +3251,6 @@ class SingleDroneRosThread(QObject):
         self._last_z_cmd = z
         self._last_yaw_cmd = ((yaw + 180.0) % 360.0) - 180.0
         self._last_cmd_time = time.monotonic()
-
-        if self._pref_armed:
-            self._pref_armed = False
-            self.ui.buttom_enable_log.setText("Enable")
-            self._start_step_response(x, y, z)
-            self.log_message("Step response logging started")
 
     def get_coordinates(self):
         # get current relative position
