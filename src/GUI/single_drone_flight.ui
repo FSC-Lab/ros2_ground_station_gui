@@ -387,6 +387,54 @@
       </property>
      </widget>
     </widget>
+    <widget class="QWidget" name="ccm_flight_log_tab">
+     <attribute name="title">
+      <string>CCM Flight Log</string>
+     </attribute>
+     <widget class="QLabel" name="label_ccm_log_status">
+      <property name="geometry">
+       <rect>
+        <x>20</x>
+        <y>4</y>
+        <width>541</width>
+        <height>22</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>CCM: --   planner: --</string>
+      </property>
+     </widget>
+     <widget class="QWidget" name="display_ccm_xyz" native="true">
+      <property name="geometry">
+       <rect>
+        <x>20</x>
+        <y>28</y>
+        <width>541</width>
+        <height>232</height>
+       </rect>
+      </property>
+     </widget>
+     <widget class="QWidget" name="display_ccm_xy" native="true">
+      <property name="geometry">
+       <rect>
+        <x>20</x>
+        <y>268</y>
+        <width>265</width>
+        <height>205</height>
+       </rect>
+      </property>
+     </widget>
+     <widget class="QWidget" name="display_ccm_err" native="true">
+      <property name="geometry">
+       <rect>
+        <x>295</x>
+        <y>268</y>
+        <width>266</width>
+        <height>205</height>
+       </rect>
+      </property>
+     </widget>
+    </widget>
     <widget class="QWidget" name="tab">
      <attribute name="title">
       <string>Step Response</string>
@@ -824,6 +872,191 @@
       </property>
       <property name="text">
        <string>Status: Standby</string>
+      </property>
+     </widget>
+    </widget>
+    <widget class="QWidget" name="ccm_trajectory_tab">
+     <attribute name="title">
+      <string>CCM Trajectory</string>
+     </attribute>
+     <widget class="QLabel" name="label_ccm_trajectory">
+      <property name="geometry">
+       <rect>
+        <x>10</x>
+        <y>12</y>
+        <width>86</width>
+        <height>26</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Trajectory</string>
+      </property>
+     </widget>
+     <widget class="QComboBox" name="combo_ccm_trajectory">
+      <property name="geometry">
+       <rect>
+        <x>98</x>
+        <y>10</y>
+        <width>204</width>
+        <height>30</height>
+       </rect>
+      </property>
+     </widget>
+     <widget class="QPushButton" name="buttom_ccm_hold">
+      <property name="geometry">
+       <rect>
+        <x>310</x>
+        <y>10</y>
+        <width>105</width>
+        <height>30</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Hold here</string>
+      </property>
+     </widget>
+     <widget class="QLabel" name="label_ccm_time_scale">
+      <property name="geometry">
+       <rect>
+        <x>10</x>
+        <y>46</y>
+        <width>405</width>
+        <height>22</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Time scale: 1.00x</string>
+      </property>
+     </widget>
+     <widget class="QSlider" name="slider_ccm_time_scale">
+      <property name="geometry">
+       <rect>
+        <x>10</x>
+        <y>68</y>
+        <width>405</width>
+        <height>24</height>
+       </rect>
+      </property>
+      <property name="minimum">
+       <number>25</number>
+      </property>
+      <property name="maximum">
+       <number>150</number>
+      </property>
+      <property name="singleStep">
+       <number>5</number>
+      </property>
+      <property name="pageStep">
+       <number>10</number>
+      </property>
+      <property name="value">
+       <number>100</number>
+      </property>
+      <property name="orientation">
+       <enum>Qt::Horizontal</enum>
+      </property>
+      <property name="tickPosition">
+       <enum>QSlider::TicksBelow</enum>
+      </property>
+      <property name="tickInterval">
+       <number>25</number>
+      </property>
+     </widget>
+     <widget class="QPushButton" name="buttom_ccm_fly_to_start">
+      <property name="geometry">
+       <rect>
+        <x>10</x>
+        <y>102</y>
+        <width>130</width>
+        <height>50</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Fly to start</string>
+      </property>
+     </widget>
+     <widget class="QPushButton" name="buttom_ccm_start">
+      <property name="geometry">
+       <rect>
+        <x>147</x>
+        <y>102</y>
+        <width>130</width>
+        <height>50</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Start trajectory</string>
+      </property>
+     </widget>
+     <widget class="QPushButton" name="buttom_ccm_back_to_hover">
+      <property name="geometry">
+       <rect>
+        <x>284</x>
+        <y>102</y>
+        <width>131</width>
+        <height>50</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Back to hover</string>
+      </property>
+     </widget>
+     <widget class="QLabel" name="label_ccm_status">
+      <property name="geometry">
+       <rect>
+        <x>10</x>
+        <y>160</y>
+        <width>405</width>
+        <height>22</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Planner: not running</string>
+      </property>
+     </widget>
+     <widget class="QLabel" name="label_ccm_info">
+      <property name="geometry">
+       <rect>
+        <x>10</x>
+        <y>182</y>
+        <width>405</width>
+        <height>40</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string></string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+     <widget class="QProgressBar" name="progress_ccm">
+      <property name="geometry">
+       <rect>
+        <x>10</x>
+        <y>228</y>
+        <width>300</width>
+        <height>23</height>
+       </rect>
+      </property>
+      <property name="value">
+       <number>0</number>
+      </property>
+     </widget>
+     <widget class="QPushButton" name="buttom_ccm_release">
+      <property name="geometry">
+       <rect>
+        <x>318</x>
+        <y>224</y>
+        <width>97</width>
+        <height>30</height>
+       </rect>
+      </property>
+      <property name="toolTip">
+       <string>Stop the planner streaming (outside CCM only): the operator's position commands take over again</string>
+      </property>
+      <property name="text">
+       <string>Release</string>
       </property>
      </widget>
     </widget>

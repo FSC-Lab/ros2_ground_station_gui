@@ -112,6 +112,69 @@ Conventions that are easy to break:
   the position-error plot they fed was replaced by the body-angle plot. Harmless (they
   are still trimmed, so no unbounded growth), but do not assume they are displayed.
 
+## Torque-mode CCM tabs (added 2026-09-29)
+
+Two tabs serve the torque-mode CCM stack (`fsc_autopilot_ros2` `single_drone_ccm_direct_actuation`
++ `fsc_trajectory_planner` `quadrotor_ccm_planner` + `torch_model_loader` `CCM_torque_direct`).
+Both are inert (they show "no data") under any other stack.
+
+**"CCM Flight Log"** (`Additional_Function`, right after "Flight Log"). Containers
+`display_ccm_xyz` (reference dashed vs actual solid X/Y/Z), `display_ccm_xy` (top-down:
+geofence, the planner's preview of the selected shape, reference and actual trails, start
+and hover marks) and `display_ccm_err` (error per axis and |e|), plus the one-line
+`label_ccm_log_status`. Built by `_setup_ccm_flight_log_impl()`, fed by
+`_append_ccm_flight_log()` every GUI tick.
+
+- **What is compared:** `quadrotor_planner/ccm_reference` (`CcmReference`, x*) against
+  `fsc_autopilot_ros2/ccm_direct_actuation/state` (`CcmState`, x) -- the exact pair the
+  model loader evaluates the controller on, not the generic odometry. Each is carried
+  forward by its own velocity to the GUI tick (at most 50 ms) so the 100 Hz and 250 Hz
+  streams compare at one instant. `CcmState` is subscribed best-effort, depth 1.
+- Same plot rules as "Flight Log": fixed seconds-ago x-axis (`CCM_PLOT_HISTORY_S` = 20 s),
+  `isVisible()` gating, `PLOT_REDRAW_EVERY` decimation. The XY view is re-ranged only
+  when the planner's preview path / start / hover change, never per tick. The error
+  plot autoscales with transparent +-5 cm anchors instead of a pinned range.
+- Every planner RUNNING segment is scored (RMS / max of |x* - x|) and logged as
+  "CCM run finished: ..." with the node modes seen during it (`[CCM]`, or `[SAFETY]` when
+  the baseline flew it).
+
+**"CCM Trajectory"** (`tabWidget`, right after "Trajectory"). `combo_ccm_trajectory`,
+`buttom_ccm_hold`, `slider_ccm_time_scale` (value = 100 x time scale),
+`buttom_ccm_fly_to_start`, `buttom_ccm_start`, `buttom_ccm_back_to_hover`,
+`label_ccm_status`, `label_ccm_info`, `progress_ccm`.
+
+| Control | Interface (under `/uav_0/quadrotor_planner/`) |
+|---|---|
+| Dropdown contents | `available_trajectories` (String JSON list, latched, published ONCE) |
+| Dropdown choice | publishes `select` (String) |
+| Time-scale slider | publishes `time_scale` (Float64) on release / keyboard step |
+| Hold here / Fly to start / Start trajectory / Back to hover | `hold` / `go_to_start` / `start` / `back_to_hover` (`std_srvs/Trigger`) |
+| Status, progress, enabling | `status` (String) and `info` (String JSON: phase, selected, time_scale, at_start, within_limits, t, T, start, hover, path, ...), latched, 2 Hz |
+
+- Same threading rules as the Controller tab: `queue_ccm_planner_call()` /
+  `queue_ccm_select()` / `queue_ccm_time_scale()` onto `_pending_requests`; calls are
+  async with a `CCM_PLANNER_TIMEOUT_S` deadline (`_check_ccm_planner_deadlines()`), and a
+  timeout does not claim failure. Service readiness is cached in `_refresh_services_ready()`.
+- **A topic and a service call are not ordered.** "Fly to start" and "Start trajectory"
+  stay disabled until the planner's `info` echoes the dropdown selection and the slider's
+  time scale, so a move can never use a stale selection.
+- The latched planner topics update `CommonData` under a BLOCKING `lock()` (deliberate:
+  `available_trajectories` arrives once, and a dropped `tryLock()` sample would leave the
+  dropdown empty until the planner restarts). The two streams keep `tryLock()`.
+- "Start trajectory" asks for confirmation when the CCM node is not in `CCM` (the SAFETY
+  baseline would then fly the path). "Back to hover" is one click. Engaging / leaving CCM
+  is NOT on this tab: it stays with the Controller tab (confirmation dialog) and
+  `buttom_back_to_baseline`. The planner never arms, changes the PX4 mode or switches the
+  controller.
+- `ccm_direct_actuation/motors_debug` is in `motor_commands_subs`, so the rotor pies show
+  the CCM node's motor commands (`controller_type` "CCM Direct Actuation" passes the
+  "Direct Actuation" substring gate).
+- **Two CCM nodes, one set of fields.** The rotor-thrust node (`single_drone_ccm_rotor_actuation`,
+  namespace `ccm_rotor_actuation`, controller type "CCM Rotor Direct Actuation", added 2026-09-30)
+  is subscribed alongside the torque node: its `motors_debug`, `mode` and `state`
+  (`CcmRotorState`, same position/velocity fields) feed the same `CommonData` fields through the
+  same callbacks (`CCM_ROTOR_NODE_NS`). Only one CCM node ever runs.
+
 ## Single-drone step-response logging
 
 The "Step Response" tab (`single_drone_flight.ui`) plots position response to a single

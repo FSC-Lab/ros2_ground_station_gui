@@ -82,6 +82,25 @@ class CommonData(): # store the data from the ROS nodes
         self.vision_detections = OrderedDict()  # stamp_ns -> tuple of detections
         self.last_vision_detections_time = 0.0
 
+        # Torque-mode CCM pipeline (single_drone_ccm_direct_actuation + fsc_trajectory_planner's
+        # quadrotor_ccm_planner). ENU metres / m/s; *_time are time.monotonic() arrival times.
+        # ccm_ref: (px, py, pz, vx, vy, vz, phase, trajectory, t) from quadrotor_planner/ccm_reference
+        # ccm_state: (px, py, pz, vx, vy, vz) from ccm_direct_actuation/state -- the x the model
+        # loader evaluates the controller on, so ccm_ref - ccm_state is the error CCM acts on.
+        self.ccm_ref = None
+        self.ccm_ref_time = 0.0
+        self.ccm_state = None
+        self.ccm_state_time = 0.0
+        self.ccm_mode = ""
+        self.ccm_planner_status = ""
+        # Parsed JSON. The dict / list objects are replaced, never mutated, so a reader may
+        # keep the reference it copied under the lock. *_seq counts arrivals.
+        self.ccm_planner_info = None
+        self.ccm_planner_info_time = 0.0
+        self.ccm_planner_info_seq = 0
+        self.ccm_trajectories = None
+        self.ccm_trajectories_seq = 0
+
         # water sampling
         self.encoder_raw = ros_common.Vector3()
         self.payload_pos = ros_common.Vector3()
@@ -428,7 +447,51 @@ class CommonData(): # store the data from the ROS nodes
             return best, self.vision_detections[best]
         return None, ()
         return
-    
+
+    ## CCM pipeline
+    # The two streams (100 Hz reference, 250 Hz state) keep the usual drop-on-contention
+    # tryLock(); the next sample is milliseconds away.
+    def update_ccm_reference(self, values):
+        if not self.lock.tryLock():
+            return
+        self.ccm_ref = values
+        self.ccm_ref_time = time.monotonic()
+        self.lock.unlock()
+
+    def update_ccm_state(self, values):
+        if not self.lock.tryLock():
+            return
+        self.ccm_state = values
+        self.ccm_state_time = time.monotonic()
+        self.lock.unlock()
+
+    # The planner/mode topics are latched and slow (2 Hz, or once: available_trajectories is
+    # published a single time), so a dropped sample could leave the CCM Trajectory tab empty
+    # until the node restarts. These take the lock BLOCKING -- deliberately, the GUI thread
+    # holds it only for a few attribute copies.
+    def update_ccm_mode(self, mode):
+        self.lock.lock()
+        self.ccm_mode = mode
+        self.lock.unlock()
+
+    def update_ccm_planner_status(self, status):
+        self.lock.lock()
+        self.ccm_planner_status = status
+        self.lock.unlock()
+
+    def update_ccm_planner_info(self, info):
+        self.lock.lock()
+        self.ccm_planner_info = info
+        self.ccm_planner_info_time = time.monotonic()
+        self.ccm_planner_info_seq += 1
+        self.lock.unlock()
+
+    def update_ccm_trajectories(self, trajectories):
+        self.lock.lock()
+        self.ccm_trajectories = trajectories
+        self.ccm_trajectories_seq += 1
+        self.lock.unlock()
+
     ## water sampling tab
 
     def update_encoder_raw(self, x, y, z):

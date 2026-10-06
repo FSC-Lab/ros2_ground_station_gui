@@ -55,6 +55,18 @@ except ImportError:
     _HAS_PYQTGRAPH = False
 
 POSITION_PLOT_HISTORY_S = 10.0  # seconds of history shown in the live plots
+# CCM Flight Log: long enough for two laps of the default 8 s circle / figure-8.
+CCM_PLOT_HISTORY_S = 20.0
+# A CCM stream older than this is treated as absent (the plots break the line).
+CCM_STREAM_FRESH_S = 0.5
+# Latched planner info is re-published at 2 Hz; older than this the planner is gone.
+CCM_PLANNER_INFO_FRESH_S = 3.0
+CCM_PLANNER_TIMEOUT_S = 3.0
+CCM_PLANNER_NS = '/uav_0/quadrotor_planner'
+CCM_NODE_NS = '/uav_0/fsc_autopilot_ros2/ccm_direct_actuation'
+# The rotor-thrust CCM node (single_drone_ccm_rotor_actuation): same interface, own namespace
+# and state message. Only one CCM node ever runs, so both feed the same CommonData fields.
+CCM_ROTOR_NODE_NS = '/uav_0/fsc_autopilot_ros2/ccm_rotor_actuation'
 STEP_RESPONSE_DEFAULT_WINDOW_S = 30
 STEP_RESPONSE_MAX_WINDOW_S = 60
 # Cap on the flight-log widget. Every entry is edge-triggered (arm/disarm, mode change,
@@ -205,7 +217,7 @@ LLM_SYSTEM_PROMPT = (
 )
 # from mavros_msgs.srv import CommandHome, CommandHomeRequest, CommandLong, SetMode
 from px4_msgs.msg import ActuatorMotors, VehicleStatus,VehicleAttitudeSetpoint,VehicleAttitude, VehicleGlobalPosition, BatteryStatus,VehicleRatesSetpoint, EstimatorStatusFlags
-from fsc_autopilot_ros2_msgs.msg import Mocap, PositionControllerReference, PositionControllerState, VehicleInfo
+from fsc_autopilot_ros2_msgs.msg import CcmReference, CcmRotorState, CcmState, Mocap, PositionControllerReference, PositionControllerState, VehicleInfo
 from fsc_autopilot_ros2_msgs.srv import ActivateController, ListControllers
 
 # from mavros_msgs.msg import State, AttitudeTarget
@@ -215,8 +227,8 @@ from sensor_msgs.msg import CompressedImage
 from rclpy.serialization import deserialize_message
 import json
 # from fsc_autopilot_msgs.msg import TrackingReference
-from std_msgs.msg import Bool, String
-from std_srvs.srv import SetBool
+from std_msgs.msg import Bool, Float64, String
+from std_srvs.srv import SetBool, Trigger
 
 
 def wifi_summary(wifi, backlog_reports):
@@ -638,6 +650,8 @@ class SingleDroneRosNode(Node, QObject):
     # One parsed snapshot/response from the Orin, plus the /uav_0/mocap pose sampled on
     # this (ROS) thread when the request went out and when the response came in.
     snapshot_received = pyqtSignal(dict)
+    # (action, success, message) of a quadrotor_ccm_planner Trigger call.
+    ccm_planner_result = pyqtSignal(str, bool, str)
 
     def __init__(self):
         Node.__init__(self, 'single_drone_gui_node')
@@ -737,6 +751,9 @@ class SingleDroneRosNode(Node, QObject):
         # fork's motors_debug: "Publisher count: 1, Subscription count: 0".
         # Happened twice -- whole_body added 2026-08-23, geometric_l1 added
         # 2026-08-24. When a NEW fork is added, add its namespace here.
+        # (ccm_direct_actuation: the torque-mode CCM node, its own fork and
+        # namespace; its controller_type "CCM Direct Actuation" passes the
+        # substring gate.)
         self.motor_commands_subs = [
             self.create_subscription(
                 ActuatorMotors,
@@ -749,6 +766,8 @@ class SingleDroneRosNode(Node, QObject):
                 '/uav_0/fsc_autopilot_ros2/geometric_direct_actuation/motors_debug',
                 '/uav_0/fsc_autopilot_ros2/geometric_l1_direct_actuation/motors_debug',
                 '/uav_0/fsc_autopilot_ros2/whole_body_direct_actuation/motors_debug',
+                f'{CCM_NODE_NS}/motors_debug',
+                f'{CCM_ROTOR_NODE_NS}/motors_debug',
             )
         ]
         # Back-compat alias: some code/logging referred to the single handle.
@@ -810,6 +829,38 @@ class SingleDroneRosNode(Node, QObject):
             Mocap, MOCAP_POSE_TOPIC, self.mocap_callback, self.optitrack_qos_profile, raw=True)
         self._snapshot_request_pose = {}  # request id -> pose when it was sent
 
+        # Torque-mode CCM pipeline: the pair the CCM actually tracks -- x* from the
+        # planner and x from the flight node (the message the model loader evaluates
+        # the controller on) -- plus the flight node's mode and the planner's latched
+        # status / info / trajectory list for the CCM Trajectory tab.
+        self.ccm_reference_sub = self.create_subscription(
+            CcmReference, f'{CCM_PLANNER_NS}/ccm_reference', self.ccm_reference_callback, 10)
+        # 250 Hz, depth 1 and best effort: only the newest state is ever displayed.
+        self.ccm_state_sub = self.create_subscription(
+            CcmState, f'{CCM_NODE_NS}/state', self.ccm_state_callback,
+            QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                       durability=DurabilityPolicy.VOLATILE,
+                       history=HistoryPolicy.KEEP_LAST, depth=1))
+        self.ccm_mode_sub = self.create_subscription(
+            String, f'{CCM_NODE_NS}/mode', self.ccm_mode_callback, self.controller_type_qos_profile)
+        # Rotor-thrust node: CcmRotorState has the same position / velocity fields.
+        self.ccm_rotor_state_sub = self.create_subscription(
+            CcmRotorState, f'{CCM_ROTOR_NODE_NS}/state', self.ccm_state_callback,
+            QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                       durability=DurabilityPolicy.VOLATILE,
+                       history=HistoryPolicy.KEEP_LAST, depth=1))
+        self.ccm_rotor_mode_sub = self.create_subscription(
+            String, f'{CCM_ROTOR_NODE_NS}/mode', self.ccm_mode_callback, self.controller_type_qos_profile)
+        self.ccm_planner_status_sub = self.create_subscription(
+            String, f'{CCM_PLANNER_NS}/status', self.ccm_planner_status_callback,
+            self.controller_type_qos_profile)
+        self.ccm_planner_info_sub = self.create_subscription(
+            String, f'{CCM_PLANNER_NS}/info', self.ccm_planner_info_callback,
+            self.controller_type_qos_profile)
+        self.ccm_trajectories_sub = self.create_subscription(
+            String, f'{CCM_PLANNER_NS}/available_trajectories', self.ccm_trajectories_callback,
+            self.controller_type_qos_profile)
+
         # Define publishers / services
         # self.coords_pub = self.create_publisher(TrackingReference, 'position_controller/target', 10)
         self.geofence_pub = self.create_publisher(Marker, 'tracking_controller/geofence', 10)
@@ -831,6 +882,19 @@ class SingleDroneRosNode(Node, QObject):
             ActivateController,
             '/uav_0/fsc_autopilot_ros2/activate_controller'
         )
+        # quadrotor_ccm_planner (fsc_trajectory_planner). The planner never arms, never
+        # changes the PX4 mode and never switches the controller; these only move the
+        # reference it streams.
+        self.ccm_select_pub = self.create_publisher(String, f'{CCM_PLANNER_NS}/select', 10)
+        self.ccm_time_scale_pub = self.create_publisher(Float64, f'{CCM_PLANNER_NS}/time_scale', 10)
+        self.ccm_planner_clients = {
+            action: self.create_client(Trigger, f'{CCM_PLANNER_NS}/{action}')
+            for action in ('hold', 'go_to_start', 'start', 'back_to_hover', 'release')
+        }
+        # action -> (future, deadline) of the call in flight; enforced in
+        # _check_ccm_planner_deadlines() for the same reason as the controller calls.
+        self._ccm_calls = {}
+        self._ccm_planner_ready_cache = False
 
         # self.set_home_service = self.create_client(CommandHome, 'mavros/cmd/set_home')
 
@@ -920,6 +984,40 @@ class SingleDroneRosNode(Node, QObject):
             for value in msg.control[:4]
         ]
         self.data_struct.update_motor_commands(commands)
+
+    def ccm_reference_callback(self, msg):
+        self.data_struct.update_ccm_reference((
+            msg.position.x, msg.position.y, msg.position.z,
+            msg.velocity.x, msg.velocity.y, msg.velocity.z,
+            msg.phase, msg.trajectory, msg.t))
+
+    def ccm_state_callback(self, msg):
+        self.data_struct.update_ccm_state((
+            msg.position.x, msg.position.y, msg.position.z,
+            msg.velocity.x, msg.velocity.y, msg.velocity.z))
+
+    def ccm_mode_callback(self, msg):
+        self.data_struct.update_ccm_mode(msg.data)
+
+    def ccm_planner_status_callback(self, msg):
+        self.data_struct.update_ccm_planner_status(msg.data)
+
+    def ccm_planner_info_callback(self, msg):
+        try:
+            info = json.loads(msg.data)
+        except ValueError:
+            return
+        if isinstance(info, dict):
+            self.data_struct.update_ccm_planner_info(info)
+
+    def ccm_trajectories_callback(self, msg):
+        try:
+            entries = json.loads(msg.data)
+        except ValueError:
+            return
+        if isinstance(entries, list):
+            self.data_struct.update_ccm_trajectories(
+                [e for e in entries if isinstance(e, dict) and e.get('name')])
 
     def position_error_callback(self, msg):
         self.data_struct.update_position_error(
@@ -1080,6 +1178,12 @@ class SingleDroneRosNode(Node, QObject):
         self._services_ready_cache = (
             self.list_controllers_client.service_is_ready()
             and self.activate_controller_client.service_is_ready())
+        self._ccm_planner_ready_cache = all(
+            c.service_is_ready() for c in self.ccm_planner_clients.values())
+
+    def ccm_planner_ready(self):
+        """Cached -- safe to call from the Qt thread at GUI rate."""
+        return self._ccm_planner_ready_cache
 
     # -- called FROM THE QT THREAD: enqueue only, never touch rclpy ---------
     def queue_controller_list(self):
@@ -1102,6 +1206,18 @@ class SingleDroneRosNode(Node, QObject):
         with self._request_lock:
             self._pending_requests.append(("coords", (x, y, z, yaw)))
 
+    def queue_ccm_planner_call(self, action):
+        with self._request_lock:
+            self._pending_requests.append(("ccm_call", action))
+
+    def queue_ccm_select(self, name):
+        with self._request_lock:
+            self._pending_requests.append(("ccm_select", name))
+
+    def queue_ccm_time_scale(self, value):
+        with self._request_lock:
+            self._pending_requests.append(("ccm_time_scale", value))
+
     def _drain_requests(self):
         """ROS-thread only: issue whatever the GUI queued."""
         while True:
@@ -1117,6 +1233,51 @@ class SingleDroneRosNode(Node, QObject):
                 self.publish_coordinates(*arg)
             elif kind == "snapshot":
                 self._send_snapshot_request(arg)
+            elif kind == "ccm_call":
+                self.request_ccm_planner_call(arg)
+            elif kind == "ccm_select":
+                self.ccm_select_pub.publish(String(data=arg))
+            elif kind == "ccm_time_scale":
+                self.ccm_time_scale_pub.publish(Float64(data=float(arg)))
+
+    def request_ccm_planner_call(self, action):
+        client = self.ccm_planner_clients.get(action)
+        if client is None or not client.service_is_ready():
+            self.ccm_planner_result.emit(
+                action, False, f"{CCM_PLANNER_NS}/{action} is unavailable "
+                "(is quadrotor_ccm_planner running?)")
+            return
+        if action in self._ccm_calls:
+            self.ccm_planner_result.emit(action, False, "previous request still pending")
+            return
+        future = client.call_async(Trigger.Request())
+        self._ccm_calls[action] = (future, time.monotonic() + CCM_PLANNER_TIMEOUT_S)
+        future.add_done_callback(lambda f, a=action: self._ccm_planner_response(a, f))
+
+    def _ccm_planner_response(self, action, future):
+        entry = self._ccm_calls.get(action)
+        if entry is None or entry[0] is not future:
+            return  # timed out and already reported
+        del self._ccm_calls[action]
+        if future.cancelled():
+            return
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.ccm_planner_result.emit(action, False, f"call failed: {exc}")
+            return
+        self.ccm_planner_result.emit(action, response.success, response.message)
+
+    def _check_ccm_planner_deadlines(self):
+        now = time.monotonic()
+        for action, (future, deadline) in list(self._ccm_calls.items()):
+            if now > deadline:
+                del self._ccm_calls[action]
+                future.cancel()
+                # Not a failure claim: the planner may have acted on it. Its status says.
+                self.ccm_planner_result.emit(
+                    action, False,
+                    f"no response after {CCM_PLANNER_TIMEOUT_S:.0f}s; confirm from the planner status")
 
     def request_controller_list(self):
         if not self.list_controllers_client.service_is_ready():
@@ -1231,6 +1392,7 @@ class SingleDroneRosNode(Node, QObject):
         self._refresh_services_ready()
         self._drain_requests()
         self._check_controller_deadlines()
+        self._check_ccm_planner_deadlines()
         self.update_data.emit(0)
     
     # main loop of ros node (for compatibility with thread)
@@ -1342,6 +1504,8 @@ class SingleDroneRosThread(QObject):
         self._setup_system_status()
         self._setup_llm()
         self._setup_controller_switch()
+        self._setup_ccm_flight_log()
+        self._setup_ccm_trajectory_tab()
 
         # Move ROS node to thread and start
         self.ros_object.moveToThread(self.thread)
@@ -3035,6 +3199,453 @@ class SingleDroneRosThread(QObject):
         self._pref_curve_y_cmd.setData(t_values, list(self._pref_y_cmd))
         self._pref_curve_z_cmd.setData(t_values, list(self._pref_z_cmd))
 
+    # ------------------------------------------------------------------
+    # Torque-mode CCM: "CCM Flight Log" (Additional_Function) and "CCM Trajectory"
+    # (tabWidget).
+    #
+    # Data: quadrotor_planner/ccm_reference (x*) against ccm_direct_actuation/state (x),
+    # the pair the model loader evaluates the controller on. The two streams (100 Hz and
+    # 250 Hz) are each carried forward by their own velocity to the GUI tick, so they are
+    # compared at one instant rather than up to 10 ms apart. The plots keep the Flight
+    # Log conventions: a fixed seconds-ago x-axis, isVisible() gating, decimated redraw.
+    #
+    # Buttons: Trigger services of quadrotor_ccm_planner, queued to the ROS thread. The
+    # planner only moves the reference it streams -- it never arms, changes the PX4 mode
+    # or switches the controller. Engaging CCM stays on the Controller tab (with its
+    # confirmation) and the always-available "Back to Baseline Control" button.
+    # ------------------------------------------------------------------
+    CCM_PHASES = {0: "IDLE", 1: "HOLD", 2: "RUNNING", 3: "FINISHED", 4: "TRANSITION"}
+
+    def _setup_ccm_flight_log(self):
+        self._ccm_t0 = None
+        self._ccm_t = deque()
+        # actual X/Y/Z, reference X/Y/Z, error X/Y/Z, |error|
+        self._ccm_series = [deque() for _ in range(10)]
+        self._ccm_tick = 0
+        self._ccm_run = None        # stats of the run in progress (planner RUNNING)
+        self._ccm_last_run = ""
+        self._ccm_last_run_short = ""
+        self._ccm_prev_phase = None
+        self._ccm_mode = ""
+        self._ccm_path_key = None
+        self._ccm_error_now = None
+        if not _HAS_PYQTGRAPH:
+            return
+        try:
+            self._setup_ccm_flight_log_impl()
+        except Exception as e:
+            import traceback
+            print(f"[PLOT] CCM flight log setup failed: {e}")
+            traceback.print_exc()
+
+    @staticmethod
+    def _ccm_plot(container, left_label, bottom_label):
+        plot = pg.PlotWidget(parent=container)
+        plot.setGeometry(container.rect())
+        plot.setBackground('w')
+        plot.getPlotItem().layout.setContentsMargins(0, 15, 0, 0)
+        # Units in the label text with SI prefixes off, as on the Flight Log plots.
+        plot.setLabel('left', left_label)
+        plot.setLabel('bottom', bottom_label)
+        plot.getAxis('left').enableAutoSIPrefix(False)
+        plot.getAxis('bottom').enableAutoSIPrefix(False)
+        plot.show()
+        return plot
+
+    def _setup_ccm_flight_log_impl(self):
+        dashed = Qt.DashLine
+        colours = ('#CC0000', '#008800', '#0055AA')
+
+        # Reference (dashed) vs actual (solid) X/Y/Z.
+        p = self._ccm_xyz_plot = self._ccm_plot(
+            self.ui.display_ccm_xyz, 'Position (m)', 'Time (s, relative)')
+        p.setXRange(-CCM_PLOT_HISTORY_S, 0, padding=0)
+        p.addLegend(offset=(5, -5), colCount=3)
+        self._ccm_curves_act = [
+            p.plot(pen=pg.mkPen(c, width=2), name=f'{a}', connect='finite')
+            for c, a in zip(colours, 'XYZ')]
+        self._ccm_curves_ref = [
+            p.plot(pen=pg.mkPen(c, width=2, style=dashed), name=f'{a} ref', connect='finite')
+            for c, a in zip(colours, 'XYZ')]
+
+        # Top-down path: geofence, the planner's preview of the selected shape, the
+        # reference and actual trails, and the start / hover points. The view is set
+        # only when the preview changes (never per tick) and stays aspect-locked.
+        xy = self._ccm_xy_plot = self._ccm_plot(self.ui.display_ccm_xy, 'Y (m)', 'X (m)')
+        xy.setAspectLocked(True)
+        xy.disableAutoRange()
+        gx, gy = float(self.ros_object.config[0]), float(self.ros_object.config[1])
+        xy.plot([gx, -gx, -gx, gx, gx], [gy, gy, -gy, -gy, gy], pen=pg.mkPen('#999999', width=1))
+        self._ccm_xy_path = xy.plot(pen=pg.mkPen('#999999', width=1, style=dashed))
+        self._ccm_xy_ref = xy.plot(pen=pg.mkPen('#0055AA', width=2, style=dashed), connect='finite')
+        self._ccm_xy_act = xy.plot(pen=pg.mkPen('#CC0000', width=2), connect='finite')
+        self._ccm_xy_marks = pg.ScatterPlotItem(pxMode=True)
+        xy.addItem(self._ccm_xy_marks)
+        self._ccm_xy_now = pg.ScatterPlotItem(size=8, brush=pg.mkBrush('#CC0000'), pen=None)
+        xy.addItem(self._ccm_xy_now)
+        xy.setRange(xRange=(-gx, gx), yRange=(-gy, gy), padding=0.02)
+
+        # Tracking error, reference minus actual.
+        e = self._ccm_err_plot = self._ccm_plot(
+            self.ui.display_ccm_err, 'Error (m)', 'Time (s, relative)')
+        e.setXRange(-CCM_PLOT_HISTORY_S, 0, padding=0)
+        e.addLegend(offset=(5, -5), colCount=2)
+        # Transparent anchors keep the autoscaled span at least +-5 cm, so hover noise
+        # does not fill the plot (the angle plot pins its range for the same reason).
+        e.plot([-CCM_PLOT_HISTORY_S, 0], [-0.05, 0.05], pen=pg.mkPen((0, 0, 0, 0)))
+        self._ccm_err_curves = [
+            e.plot(pen=pg.mkPen(c, width=1), name=f'e{a}', connect='finite')
+            for c, a in zip(colours, 'xyz')]
+        self._ccm_err_norm = e.plot(pen=pg.mkPen('#000000', width=2), name='|e|', connect='finite')
+
+    @staticmethod
+    def _ccm_now(sample, arrival, now):
+        """Position carried forward to `now` by the sample's own velocity (<= 50 ms)."""
+        if sample is None or now - arrival > CCM_STREAM_FRESH_S:
+            return None
+        dt = min(max(now - arrival, 0.0), 0.05)
+        return (sample[0] + sample[3] * dt, sample[1] + sample[4] * dt, sample[2] + sample[5] * dt)
+
+    def _append_ccm_flight_log(self, ccm, now):
+        nan = float('nan')
+        act = self._ccm_now(ccm['state'], ccm['state_time'], now)
+        ref = self._ccm_now(ccm['ref'], ccm['ref_time'], now)
+        phase = ccm['ref'][6] if (ccm['ref'] is not None and ref is not None) else None
+        err = None
+        if act is not None and ref is not None:
+            err = tuple(r - a for r, a in zip(ref, act))
+        self._ccm_error_now = err
+        self._track_ccm_run(phase, ccm, err)
+
+        if self._ccm_t0 is None:
+            self._ccm_t0 = now
+        t = now - self._ccm_t0
+        self._ccm_t.append(t)
+        row = ((act or (nan,) * 3) + (ref or (nan,) * 3) + (err or (nan,) * 3)
+               + ((math.sqrt(sum(v * v for v in err)) if err else nan),))
+        for series, value in zip(self._ccm_series, row):
+            series.append(value)
+        cutoff = t - CCM_PLOT_HISTORY_S
+        while self._ccm_t and self._ccm_t[0] < cutoff:
+            self._ccm_t.popleft()
+            for series in self._ccm_series:
+                series.popleft()
+
+        if not _HAS_PYQTGRAPH or not hasattr(self, '_ccm_xyz_plot'):
+            return
+        self._update_ccm_xy_preview(ccm['info'])
+        visible = (self._ccm_xyz_plot.isVisible(), self._ccm_xy_plot.isVisible(),
+                   self._ccm_err_plot.isVisible())
+        if not any(visible):
+            return
+        self._ccm_tick += 1
+        if self._ccm_tick % self.PLOT_REDRAW_EVERY:
+            return
+        t_list = [ti - t for ti in self._ccm_t]
+        s = [list(series) for series in self._ccm_series]
+        if visible[0]:
+            for i in range(3):
+                self._ccm_curves_act[i].setData(t_list, s[i])
+                self._ccm_curves_ref[i].setData(t_list, s[3 + i])
+        if visible[1]:
+            self._ccm_xy_act.setData(s[0], s[1])
+            self._ccm_xy_ref.setData(s[3], s[4])
+            if act:
+                self._ccm_xy_now.setData([act[0]], [act[1]])
+            else:
+                self._ccm_xy_now.setData([], [])
+        if visible[2]:
+            for i in range(3):
+                self._ccm_err_curves[i].setData(t_list, s[6 + i])
+            self._ccm_err_norm.setData(t_list, s[9])
+
+    def _update_ccm_xy_preview(self, info):
+        """Planner's XY path of the selection + start / hover marks; re-ranges on change."""
+        path = (info or {}).get('path') or []
+        start = (info or {}).get('start')
+        hover = (info or {}).get('hover')
+        key = (len(path), tuple(path[0]) if path else None, tuple(path[-1]) if path else None,
+               tuple(start or ()), tuple(hover or ()))
+        if key == self._ccm_path_key:
+            return
+        self._ccm_path_key = key
+        self._ccm_xy_path.setData([p[0] for p in path], [p[1] for p in path])
+        spots = []
+        if start:
+            spots.append({'pos': (start[0], start[1]), 'size': 11, 'symbol': 'o',
+                          'brush': pg.mkBrush('#24A148'), 'pen': None})
+        if hover:
+            spots.append({'pos': (hover[0], hover[1]), 'size': 11, 'symbol': 'x',
+                          'brush': pg.mkBrush('#222222'), 'pen': pg.mkPen('#222222')})
+        self._ccm_xy_marks.setData(spots)
+        xs = [p[0] for p in path] + ([start[0]] if start else []) + ([hover[0]] if hover else [])
+        ys = [p[1] for p in path] + ([start[1]] if start else []) + ([hover[1]] if hover else [])
+        if xs:
+            margin = 0.5
+            self._ccm_xy_plot.setRange(xRange=(min(xs) - margin, max(xs) + margin),
+                                       yRange=(min(ys) - margin, max(ys) + margin), padding=0)
+
+    def _track_ccm_run(self, phase, ccm, err):
+        """RMS / max error over each planner RUNNING segment, logged when it ends."""
+        # (Mode changes are already logged through controller_type.)
+        mode = ccm['mode']
+        running = phase == 2
+        if running and self._ccm_run is None:
+            info = ccm['info'] or {}
+            self._ccm_run = {'name': ccm['ref'][7], 'scale': info.get('time_scale'),
+                             'sq': 0.0, 'max': 0.0, 'n': 0, 'modes': set()}
+        if self._ccm_run is not None and running:
+            self._ccm_run['modes'].add(mode or '?')
+            if err is not None:
+                e2 = sum(v * v for v in err)
+                self._ccm_run['sq'] += e2
+                self._ccm_run['max'] = max(self._ccm_run['max'], math.sqrt(e2))
+                self._ccm_run['n'] += 1
+        if self._ccm_run is not None and not running:
+            run, self._ccm_run = self._ccm_run, None
+            if run['n'] > 0:
+                scale = f" x{run['scale']:.2f}" if isinstance(run['scale'], (int, float)) else ""
+                modes = "/".join(sorted(run['modes']))
+                rms = 100 * math.sqrt(run['sq'] / run['n'])
+                self._ccm_last_run = (f"{run['name']}{scale} [{modes}]: RMS {rms:.1f} cm, "
+                                      f"max {100 * run['max']:.1f} cm")
+                self._ccm_last_run_short = f"{run['name']}{scale}: RMS {rms:.1f} cm"
+                self.log_message(f"CCM run finished: {self._ccm_last_run}")
+        self._ccm_prev_phase = phase
+
+    def _ccm_status_text(self, ccm):
+        err = self._ccm_error_now
+        info = ccm['info'] if ccm['info_fresh'] else None
+        parts = [f"Node: {ccm['mode'] or '--'}",
+                 f"Planner: {info.get('phase', '--') if info else '--'}",
+                 f"|e| {100 * math.sqrt(sum(v * v for v in err)):.1f} cm" if err else "|e| --"]
+        if self._ccm_run is not None and self._ccm_run['n']:
+            parts.append(f"run RMS {100 * math.sqrt(self._ccm_run['sq'] / self._ccm_run['n']):.1f} cm")
+        elif self._ccm_last_run:
+            parts.append(f"last {self._ccm_last_run_short}")
+        return "  ·  ".join(parts)
+
+    # --- CCM Trajectory tab -------------------------------------------------------
+    def _setup_ccm_trajectory_tab(self):
+        self._ccm_traj_seq = -1
+        self._ccm_info_seq = -1
+        self._ccm_ts_range_set = False
+        # (value, time) the operator last sent, until the planner's info echoes it.
+        self._ccm_ts_sent = None
+        self._ccm_info = None
+        self._ccm_info_phase = None
+        self._ccm_pending = set()
+        combo = self.ui.combo_ccm_trajectory
+        combo.clear()
+        combo.addItem("(waiting for the planner)", None)
+        combo.setEnabled(False)
+        self.ui.progress_ccm.setValue(0)
+        self.ui.label_ccm_info.setText("")
+        self._update_ccm_time_scale_label()
+        self._update_ccm_buttons(None, False)
+
+    def _ccm_selected_name(self):
+        return self.ui.combo_ccm_trajectory.currentData()
+
+    def _ccm_slider_scale(self):
+        return self.ui.slider_ccm_time_scale.value() / 100.0
+
+    def _on_ccm_trajectory_selected(self, _index):
+        # `activated` fires on user choice only, so this never echoes a programmatic sync.
+        name = self._ccm_selected_name()
+        if name:
+            self.ros_object.queue_ccm_select(name)
+            self.log_message(f"CCM trajectory selected: {name}")
+
+    def _on_ccm_time_scale_moved(self, _value):
+        self._update_ccm_time_scale_label()
+        if not self.ui.slider_ccm_time_scale.isSliderDown():
+            self._send_ccm_time_scale()  # keyboard / click steps; a drag sends on release
+
+    def _send_ccm_time_scale(self):
+        scale = self._ccm_slider_scale()
+        self._ccm_ts_sent = (scale, time.monotonic())
+        self.ros_object.queue_ccm_time_scale(scale)
+
+    def _update_ccm_time_scale_label(self):
+        scale = self._ccm_slider_scale()
+        info = self._ccm_info or {}
+        text = f"Time scale {scale:.2f}x"
+        style = ""
+        ts0 = info.get('time_scale')
+        if isinstance(ts0, (int, float)) and ts0 > 0 and 'lap_time' in info:
+            # Lap time goes as 1/s, cruise speed as s and acceleration as s^2.
+            k = scale / ts0
+            lap = info['lap_time'] / k
+            v = info.get('cruise_speed', 0.0) * k
+            a = info.get('cruise_accel', 0.0) * k * k
+            text += f"  · lap {lap:.1f} s · {v:.2f} m/s · {a:.2f} m/s²"
+            # Yaw-along-path shapes: yaw rate also goes as s, yaw acceleration as s^2.
+            yr = info.get('yaw_rate_max', 0.0) * k
+            ya = info.get('yaw_accel_max', 0.0) * k * k
+            if info.get('yaw_tangent'):
+                text += f" · yaw {yr:.2f} rad/s"
+            if (v > info.get('max_speed', float('inf')) or a > info.get('max_accel', float('inf'))
+                    or yr > info.get('max_yaw_rate', float('inf')) or ya > info.get('max_yaw_accel', float('inf'))):
+                text += "  OVER LIMITS"
+                style = "color: #d9534f; font-weight: bold"
+        self.ui.label_ccm_time_scale.setText(text)
+        self.ui.label_ccm_time_scale.setStyleSheet(style)
+
+    def _ccm_call(self, action, label):
+        self._ccm_pending.add(action)
+        self.log_message(f"CCM planner: {label}...")
+        self.ros_object.queue_ccm_planner_call(action)
+        self._update_ccm_buttons(self._ccm_info, self.ros_object.ccm_planner_ready())
+
+    def _request_ccm_hold(self):
+        self._ccm_call('hold', "hold here")
+
+    def _request_ccm_fly_to_start(self):
+        self._ccm_call('go_to_start', f"fly to the {self._ccm_selected_name()} start")
+
+    def _request_ccm_start(self):
+        mode = self._ccm_mode
+        if mode != "CCM":
+            answer = QMessageBox.question(
+                None, "CCM is not engaged",
+                f"The CCM node is in {mode or 'an unknown mode'}, so the SAFETY baseline "
+                "would fly this trajectory (it follows the planner's position reference).\n\n"
+                "Engage CCM on the Controller tab first, or start anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                self.log_message("CCM trajectory start cancelled (CCM not engaged)")
+                return
+        self._ccm_call('start', f"start {self._ccm_selected_name()} x{self._ccm_slider_scale():.2f}")
+
+    def _request_ccm_back_to_hover(self):
+        # The safe direction: one click, no dialog.
+        self._ccm_call('back_to_hover', "back to hover")
+
+    def _request_ccm_release(self):
+        # Only offered outside CCM: in CCM, a released (idle) reference is an abort.
+        self._ccm_call('release', "release (stop streaming)")
+
+    def _handle_ccm_planner_result(self, action, success, message):
+        self._ccm_pending.discard(action)
+        self.log_message(f"CCM planner {action}: {'OK' if success else 'REFUSED'} - {message}")
+
+    def _update_ccm_trajectory_tab(self, ccm):
+        ready = self.ros_object.ccm_planner_ready()
+        info = ccm['info'] if ccm['info_fresh'] else None
+
+        if ccm['traj_seq'] != self._ccm_traj_seq and ccm['trajectories']:
+            self._ccm_traj_seq = ccm['traj_seq']
+            combo = self.ui.combo_ccm_trajectory
+            combo.blockSignals(True)
+            combo.clear()
+            for entry in ccm['trajectories']:
+                combo.addItem(entry.get('label') or entry['name'], entry['name'])
+            combo.blockSignals(False)
+            self._ccm_info_seq = -1  # re-sync the selection below
+
+        if ccm['info_seq'] != self._ccm_info_seq and info is not None:
+            self._ccm_info_seq = ccm['info_seq']
+            self._ccm_info = info
+            self._sync_ccm_controls(info)
+        elif info is None:
+            self._ccm_info = None
+
+        phase = info.get('phase') if info else None
+        if phase != self._ccm_info_phase:
+            if self._ccm_info_phase is not None or phase is not None:
+                self.log_message(f"CCM planner: {self._ccm_info_phase or 'offline'} -> {phase or 'offline'}")
+            self._ccm_info_phase = phase
+
+        if info is None:
+            self.ui.label_ccm_status.setText(
+                "Planner: no data (is quadrotor_ccm_planner running?)")
+            self.ui.label_ccm_info.setText("")
+            self.ui.progress_ccm.setValue(0)
+        else:
+            self.ui.label_ccm_status.setText(f"Planner: {ccm['status']}")
+            parts = []
+            if info.get('start'):
+                parts.append("start [" + ", ".join(f"{v:.2f}" for v in info['start']) + "]")
+            if info.get('hover'):
+                parts.append("hover [" + ", ".join(f"{v:.2f}" for v in info['hover']) + "]")
+            if 'duration' in info:
+                parts.append(f"run {info['duration']:.1f} s")
+            if info.get('pos_ref'):
+                parts.append("SAFETY baseline follows the planner")
+            self.ui.label_ccm_info.setText("   ".join(parts))
+            T = info.get('T') or 0.0
+            if phase in ("RUNNING", "TRANSITION") and T > 0:
+                self.ui.progress_ccm.setValue(int(round(100 * min(1.0, info.get('t', 0.0) / T))))
+            elif phase == "FINISHED":
+                self.ui.progress_ccm.setValue(100)
+            else:
+                self.ui.progress_ccm.setValue(0)
+        self._update_ccm_buttons(info, ready)
+
+    def _sync_ccm_controls(self, info):
+        combo = self.ui.combo_ccm_trajectory
+        # Follow the planner's selection unless the operator has the list open.
+        selected = info.get('selected')
+        if selected and not combo.view().isVisible():
+            index = combo.findData(selected)
+            if index >= 0 and index != combo.currentIndex():
+                combo.blockSignals(True)
+                combo.setCurrentIndex(index)
+                combo.blockSignals(False)
+        slider = self.ui.slider_ccm_time_scale
+        lo, hi = info.get('time_scale_min'), info.get('time_scale_max')
+        if not self._ccm_ts_range_set and isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+            slider.blockSignals(True)
+            slider.setRange(int(round(100 * lo)), int(round(100 * hi)))
+            slider.blockSignals(False)
+            self._ccm_ts_range_set = True
+        ts = info.get('time_scale')
+        if isinstance(ts, (int, float)) and not slider.isSliderDown():
+            if self._ccm_ts_sent is not None:
+                sent, when = self._ccm_ts_sent
+                if abs(ts - sent) < 0.005:
+                    self._ccm_ts_sent = None  # echoed: the planner has it
+                elif time.monotonic() - when > 2.0:
+                    self._ccm_ts_sent = None
+                    self.log_message(f"CCM time scale {sent:.2f}x not applied; planner has {ts:.2f}x")
+            if self._ccm_ts_sent is None:
+                slider.blockSignals(True)
+                slider.setValue(int(round(100 * ts)))
+                slider.blockSignals(False)
+        self._update_ccm_time_scale_label()
+
+    def _update_ccm_buttons(self, info, ready):
+        phase = (info or {}).get('phase')
+        live = info is not None and ready
+        idle_like = phase in ("IDLE", "HOLD", "FINISHED")
+        selected = self._ccm_selected_name()
+        # The selection and time scale the planner reports must match what is on
+        # screen before a move or start, since a topic and a service call are not
+        # ordered with respect to each other.
+        in_sync = (info is not None and selected == info.get('selected')
+                   and self._ccm_ts_sent is None
+                   and abs(self._ccm_slider_scale() - (info.get('time_scale') or 0.0)) < 0.005)
+        pending = self._ccm_pending
+        self.ui.combo_ccm_trajectory.setEnabled(live and idle_like and selected is not None)
+        self.ui.slider_ccm_time_scale.setEnabled(info is not None and ready and phase != "RUNNING")
+        self.ui.buttom_ccm_hold.setEnabled(live and idle_like and 'hold' not in pending)
+        self.ui.buttom_ccm_fly_to_start.setEnabled(
+            live and idle_like and in_sync and not info.get('at_start', False)
+            and 'go_to_start' not in pending)
+        can_start = (live and phase in ("HOLD", "FINISHED") and in_sync and info.get('at_start', False)
+                     and info.get('within_limits', False) and 'start' not in pending)
+        self.ui.buttom_ccm_start.setEnabled(can_start)
+        self.ui.buttom_ccm_start.setStyleSheet(
+            "background-color: #24A148; color: white; font-weight: bold;" if can_start else "")
+        back = (live and 'back_to_hover' not in pending
+                and (phase == "RUNNING" or (phase in ("HOLD", "FINISHED") and bool(info.get('hover')))))
+        self.ui.buttom_ccm_back_to_hover.setEnabled(back)
+        self.ui.buttom_ccm_back_to_hover.setStyleSheet(
+            "background-color: #f0ad4e; font-weight: bold;" if back else "")
+        self.ui.buttom_ccm_release.setEnabled(
+            live and phase not in (None, "IDLE") and self._ccm_mode != "CCM" and 'release' not in pending)
+
     # define the signal-slot combination of ros and pyqt GUI
     def set_ros_callbacks(self):
         # feedbacks from ros
@@ -3043,6 +3654,7 @@ class SingleDroneRosThread(QObject):
         self.ros_object.controllers_listed.connect(self._handle_controllers_listed)
         self.ros_object.controller_activated.connect(self._handle_controller_activated)
         self.ros_object.snapshot_received.connect(self._on_snapshot_received)
+        self.ros_object.ccm_planner_result.connect(self._handle_ccm_planner_result)
 
         # callbacks from GUI
         self.ui.SendPositionUAV.clicked.connect(self.send_coordinates)
@@ -3054,6 +3666,15 @@ class SingleDroneRosThread(QObject):
         self.ui.buttom_activate_controller.clicked.connect(self._request_controller_switch)
         # Was previously never connected, so the dedicated abort path did nothing.
         self.ui.buttom_back_to_baseline.clicked.connect(self._request_back_to_baseline)
+        # CCM Trajectory tab
+        self.ui.combo_ccm_trajectory.activated.connect(self._on_ccm_trajectory_selected)
+        self.ui.slider_ccm_time_scale.valueChanged.connect(self._on_ccm_time_scale_moved)
+        self.ui.slider_ccm_time_scale.sliderReleased.connect(self._send_ccm_time_scale)
+        self.ui.buttom_ccm_hold.clicked.connect(self._request_ccm_hold)
+        self.ui.buttom_ccm_fly_to_start.clicked.connect(self._request_ccm_fly_to_start)
+        self.ui.buttom_ccm_start.clicked.connect(self._request_ccm_start)
+        self.ui.buttom_ccm_back_to_hover.clicked.connect(self._request_ccm_back_to_hover)
+        self.ui.buttom_ccm_release.clicked.connect(self._request_ccm_release)
 
     # update GUI data
     def update_gui_data(self):
@@ -3072,7 +3693,24 @@ class SingleDroneRosThread(QObject):
         motor_commands = tuple(self.ros_object.data_struct.current_motor_commands)
         position_error = self.ros_object.data_struct.current_position_error
         self.position_error = (position_error.x, position_error.y, position_error.z)
+        ds = self.ros_object.data_struct
+        ccm = {
+            'ref': ds.ccm_ref, 'ref_time': ds.ccm_ref_time,
+            'state': ds.ccm_state, 'state_time': ds.ccm_state_time,
+            'mode': ds.ccm_mode, 'status': ds.ccm_planner_status,
+            'info': ds.ccm_planner_info, 'info_time': ds.ccm_planner_info_time,
+            'info_seq': ds.ccm_planner_info_seq,
+            'trajectories': ds.ccm_trajectories, 'traj_seq': ds.ccm_trajectories_seq,
+        }
         self.lock.unlock()
+
+        now = time.monotonic()
+        ccm['info_fresh'] = (ccm['info'] is not None
+                             and now - ccm['info_time'] < CCM_PLANNER_INFO_FRESH_S)
+        self._ccm_mode = ccm['mode']
+        self._append_ccm_flight_log(ccm, now)
+        self._update_ccm_trajectory_tab(ccm)
+        self.ui.label_ccm_log_status.setText(self._ccm_status_text(ccm))
 
         self.ui.label_vehicle_type.setText(f"Vehicle Type: {vehicle_name}")
         controller_type_display = self._controller_display_name(controller_type)
