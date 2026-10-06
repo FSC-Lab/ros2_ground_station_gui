@@ -31,7 +31,7 @@
     </property>
     <property name="font">
      <font>
-      <pointsize>24</pointsize>
+      <pointsize>20</pointsize>
       <weight>75</weight>
       <bold>true</bold>
      </font>
@@ -792,89 +792,6 @@
       </property>
      </widget>
     </widget>
-    <widget class="QWidget" name="trajectory_tab">
-     <attribute name="title">
-      <string>Trajectory</string>
-     </attribute>
-     <widget class="QPushButton" name="buttom_back_to_hover">
-      <property name="geometry">
-       <rect>
-        <x>230</x>
-        <y>20</y>
-        <width>181</width>
-        <height>61</height>
-       </rect>
-      </property>
-      <property name="text">
-       <string>Back to Hover</string>
-      </property>
-     </widget>
-     <widget class="QPushButton" name="buttom_load_trajectory">
-      <property name="geometry">
-       <rect>
-        <x>40</x>
-        <y>20</y>
-        <width>181</width>
-        <height>61</height>
-       </rect>
-      </property>
-      <property name="text">
-       <string>Load</string>
-      </property>
-     </widget>
-     <widget class="QProgressBar" name="progressBar">
-      <property name="geometry">
-       <rect>
-        <x>50</x>
-        <y>220</y>
-        <width>351</width>
-        <height>23</height>
-       </rect>
-      </property>
-      <property name="value">
-       <number>24</number>
-      </property>
-     </widget>
-     <widget class="QPushButton" name="buttom_load_start_tracking">
-      <property name="geometry">
-       <rect>
-        <x>40</x>
-        <y>90</y>
-        <width>181</width>
-        <height>61</height>
-       </rect>
-      </property>
-      <property name="text">
-       <string>Start</string>
-      </property>
-     </widget>
-     <widget class="QLabel" name="label">
-      <property name="geometry">
-       <rect>
-        <x>240</x>
-        <y>100</y>
-        <width>161</width>
-        <height>21</height>
-       </rect>
-      </property>
-      <property name="text">
-       <string>Trajectory type: N/A</string>
-      </property>
-     </widget>
-     <widget class="QLabel" name="label_3">
-      <property name="geometry">
-       <rect>
-        <x>240</x>
-        <y>130</y>
-        <width>171</width>
-        <height>18</height>
-       </rect>
-      </property>
-      <property name="text">
-       <string>Status: Standby</string>
-      </property>
-     </widget>
-    </widget>
     <widget class="QWidget" name="ccm_trajectory_tab">
      <attribute name="title">
       <string>CCM Trajectory</string>
@@ -1346,9 +1263,9 @@
    <widget class="QLabel" name="cpu_status">
     <property name="geometry">
      <rect>
-      <x>310</x>
+      <x>412</x>
       <y>470</y>
-      <width>391</width>
+      <width>316</width>
       <height>41</height>
      </rect>
     </property>

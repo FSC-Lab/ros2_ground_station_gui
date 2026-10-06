@@ -124,6 +124,8 @@ STATUS_STYLE = {
 }
 # cpu_status and wifi_status are two-line labels 41 px tall.
 TWO_LINE_FONT = ' font-size: 9pt;'
+# The CPU box sits right of the control tab bar (316 px): its four-core first line needs 8 pt.
+CPU_STATUS_FONT = ' font-size: 8pt;'
 # LLM status assistant (VLM tab). The proxy on the LLM host, reached over NetBird; it has
 # no authentication, so only NetBird peers the access policy allows can reach it.
 LLM_BASE_URL = 'http://100.103.152.77:8080'
@@ -1668,7 +1670,7 @@ class SingleDroneRosThread(QObject):
             self.ui.wifi_status, "No WiFi\nwaiting for Orin status",
             STATUS_STYLE['bad'] + TWO_LINE_FONT)
         self._set_status_label(
-            self.ui.cpu_status, "Orin CPU: waiting for status", "color: red;" + TWO_LINE_FONT)
+            self.ui.cpu_status, "Orin CPU: waiting for status", "color: red;" + CPU_STATUS_FONT)
 
     def _update_system_status(self):
         data = self.ros_object.data_struct
@@ -1698,7 +1700,7 @@ class SingleDroneRosThread(QObject):
                 cpu_text, cpu_style = "Orin CPU: no load data", "color: red;"
 
         self._set_status_label(self.ui.wifi_status, wifi_text, STATUS_STYLE[level] + TWO_LINE_FONT)
-        self._set_status_label(self.ui.cpu_status, cpu_text, cpu_style + TWO_LINE_FONT)
+        self._set_status_label(self.ui.cpu_status, cpu_text, cpu_style + CPU_STATUS_FONT)
         # Losing the link to the Orin is worth an alarm and a line in the flight log;
         # good <-> fair is not, since it can flip every second while the signal sits near
         # a threshold. At launch, no verdict until a report has had time to arrive (DDS
