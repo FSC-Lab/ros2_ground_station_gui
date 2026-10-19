@@ -889,6 +889,7 @@ class SingleDroneRosNode(Node, QObject):
         # reference it streams.
         self.ccm_select_pub = self.create_publisher(String, f'{CCM_PLANNER_NS}/select', 10)
         self.ccm_time_scale_pub = self.create_publisher(Float64, f'{CCM_PLANNER_NS}/time_scale', 10)
+        self.ccm_radius_pub = self.create_publisher(Float64, f'{CCM_PLANNER_NS}/radius', 10)
         self.ccm_planner_clients = {
             action: self.create_client(Trigger, f'{CCM_PLANNER_NS}/{action}')
             for action in ('hold', 'go_to_start', 'start', 'back_to_hover', 'release')
@@ -1220,6 +1221,10 @@ class SingleDroneRosNode(Node, QObject):
         with self._request_lock:
             self._pending_requests.append(("ccm_time_scale", value))
 
+    def queue_ccm_radius(self, value):
+        with self._request_lock:
+            self._pending_requests.append(("ccm_radius", value))
+
     def _drain_requests(self):
         """ROS-thread only: issue whatever the GUI queued."""
         while True:
@@ -1241,6 +1246,8 @@ class SingleDroneRosNode(Node, QObject):
                 self.ccm_select_pub.publish(String(data=arg))
             elif kind == "ccm_time_scale":
                 self.ccm_time_scale_pub.publish(Float64(data=float(arg)))
+            elif kind == "ccm_radius":
+                self.ccm_radius_pub.publish(Float64(data=float(arg)))
 
     def request_ccm_planner_call(self, action):
         client = self.ccm_planner_clients.get(action)
@@ -3434,6 +3441,9 @@ class SingleDroneRosThread(QObject):
         self._ccm_ts_range_set = False
         # (value, time) the operator last sent, until the planner's info echoes it.
         self._ccm_ts_sent = None
+        self._ccm_radius_range_set = False
+        # Same for the radius box: (value, time) until the planner's info echoes it.
+        self._ccm_radius_sent = None
         self._ccm_info = None
         self._ccm_info_phase = None
         self._ccm_pending = set()
@@ -3444,6 +3454,7 @@ class SingleDroneRosThread(QObject):
         self.ui.progress_ccm.setValue(0)
         self.ui.label_ccm_info.setText("")
         self._update_ccm_time_scale_label()
+        self._update_ccm_radius_hint()
         self._update_ccm_buttons(None, False)
 
     def _ccm_selected_name(self):
@@ -3458,6 +3469,37 @@ class SingleDroneRosThread(QObject):
         if name:
             self.ros_object.queue_ccm_select(name)
             self.log_message(f"CCM trajectory selected: {name}")
+
+    @staticmethod
+    def _ccm_size_key(name):
+        # The info key holding the size of a shape: the circles share circle_radius,
+        # the figure-8s share fig8_a; hover (or nothing selected) has none.
+        if name in ("circle", "circle_tangent"):
+            return 'circle_radius'
+        if name in ("figure8", "figure8_tangent"):
+            return 'fig8_a'
+        return None
+
+    def _on_ccm_radius_changed(self, value):
+        # keyboardTracking is off: fires on Enter, focus-out and arrow steps, never per keystroke.
+        self._update_ccm_radius_hint()
+        name = self._ccm_selected_name()
+        if self._ccm_size_key(name) is None:
+            return
+        self._ccm_radius_sent = (value, time.monotonic())
+        self.ros_object.queue_ccm_radius(value)
+        self.log_message(f"CCM {name} radius -> {value:.2f} m")
+
+    def _update_ccm_radius_hint(self):
+        key = self._ccm_size_key(self._ccm_selected_name())
+        r = self.ui.spin_ccm_radius.value()
+        if key == 'circle_radius':
+            text = "circle: start = centre + R"
+        elif key == 'fig8_a':
+            text = f"figure-8: {2 * r:.2f} x {r:.2f} m"
+        else:
+            text = ""
+        self.ui.label_ccm_radius_hint.setText(text)
 
     def _on_ccm_time_scale_moved(self, _value):
         self._update_ccm_time_scale_label()
@@ -3615,6 +3657,30 @@ class SingleDroneRosThread(QObject):
                 slider.blockSignals(True)
                 slider.setValue(int(round(100 * ts)))
                 slider.blockSignals(False)
+        spin = self.ui.spin_ccm_radius
+        rlo, rhi = info.get('radius_min'), info.get('radius_max')
+        if not self._ccm_radius_range_set and isinstance(rlo, (int, float)) and isinstance(rhi, (int, float)):
+            spin.blockSignals(True)
+            spin.setRange(rlo, rhi)
+            spin.blockSignals(False)
+            self._ccm_radius_range_set = True
+        key = self._ccm_size_key(info.get('selected'))
+        size = info.get(key) if key else None
+        if isinstance(size, (int, float)):
+            if self._ccm_radius_sent is not None:
+                sent, when = self._ccm_radius_sent
+                if abs(size - sent) < 0.005:
+                    self._ccm_radius_sent = None
+                elif time.monotonic() - when > 2.0:
+                    self._ccm_radius_sent = None
+                    self.log_message(f"CCM radius {sent:.2f} m not applied; planner has {size:.2f} m")
+            # Leave the box alone while it holds uncommitted typing.
+            typing = spin.hasFocus() and spin.cleanText() != spin.textFromValue(spin.value())
+            if self._ccm_radius_sent is None and not typing and abs(spin.value() - size) >= 0.005:
+                spin.blockSignals(True)
+                spin.setValue(size)
+                spin.blockSignals(False)
+        self._update_ccm_radius_hint()
         self._update_ccm_time_scale_label()
 
     def _update_ccm_buttons(self, info, ready):
@@ -3625,12 +3691,20 @@ class SingleDroneRosThread(QObject):
         # The selection and time scale the planner reports must match what is on
         # screen before a move or start, since a topic and a service call are not
         # ordered with respect to each other.
+        size_key = self._ccm_size_key(selected)
         in_sync = (info is not None and selected == info.get('selected')
                    and self._ccm_ts_sent is None
-                   and abs(self._ccm_slider_scale() - (info.get('time_scale') or 0.0)) < 0.005)
+                   and abs(self._ccm_slider_scale() - (info.get('time_scale') or 0.0)) < 0.005
+                   and self._ccm_radius_sent is None
+                   and (size_key is None
+                        or abs(self.ui.spin_ccm_radius.value() - (info.get(size_key) or 0.0)) < 0.005))
         pending = self._ccm_pending
         self.ui.combo_ccm_trajectory.setEnabled(live and idle_like and selected is not None)
         self.ui.slider_ccm_time_scale.setEnabled(info is not None and ready and phase != "RUNNING")
+        # The planner applies a radius to ITS selection, so only offer the box once the
+        # dropdown and the planner agree on the shape, and not during a run or move.
+        self.ui.spin_ccm_radius.setEnabled(
+            live and idle_like and size_key is not None and selected == info.get('selected'))
         self.ui.buttom_ccm_hold.setEnabled(live and idle_like and 'hold' not in pending)
         self.ui.buttom_ccm_fly_to_start.setEnabled(
             live and idle_like and in_sync and not info.get('at_start', False)
@@ -3672,6 +3746,7 @@ class SingleDroneRosThread(QObject):
         self.ui.combo_ccm_trajectory.activated.connect(self._on_ccm_trajectory_selected)
         self.ui.slider_ccm_time_scale.valueChanged.connect(self._on_ccm_time_scale_moved)
         self.ui.slider_ccm_time_scale.sliderReleased.connect(self._send_ccm_time_scale)
+        self.ui.spin_ccm_radius.valueChanged.connect(self._on_ccm_radius_changed)
         self.ui.buttom_ccm_hold.clicked.connect(self._request_ccm_hold)
         self.ui.buttom_ccm_fly_to_start.clicked.connect(self._request_ccm_fly_to_start)
         self.ui.buttom_ccm_start.clicked.connect(self._request_ccm_start)

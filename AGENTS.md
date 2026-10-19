@@ -139,15 +139,17 @@ and hover marks) and `display_ccm_err` (error per axis and |e|), plus the one-li
   the baseline flew it).
 
 **"CCM Trajectory"** (`tabWidget`, right after "Trajectory"). `combo_ccm_trajectory`,
-`buttom_ccm_hold`, `slider_ccm_time_scale` (value = 100 x time scale),
+`buttom_ccm_hold`, `spin_ccm_radius` + `label_ccm_radius_hint` (2026-10-19),
+`slider_ccm_time_scale` (value = 100 x time scale),
 `buttom_ccm_fly_to_start`, `buttom_ccm_start`, `buttom_ccm_back_to_hover`,
 `label_ccm_status`, `label_ccm_info`, `progress_ccm`.
 
 | Control | Interface (under `/uav_0/quadrotor_planner/`) |
 |---|---|
-| Dropdown contents | `available_trajectories` (String JSON list, latched, published ONCE) |
+| Dropdown contents | `available_trajectories` (String JSON list, latched; republished when a radius changes, since the labels carry the sizes) |
 | Dropdown choice | publishes `select` (String) |
 | Time-scale slider | publishes `time_scale` (Float64) on release / keyboard step |
+| Radius box | publishes `radius` (Float64) on Enter / focus-out / arrow step (`keyboardTracking` off). The planner applies it to ITS selected shape: `circle_radius` for circle / circle_tangent, `fig8_a` (x half-width, path 2a x a) for figure8 / figure8_tangent; the box shows `info[circle_radius]` or `info[fig8_a]`, range from `info[radius_min/max]` |
 | Hold here / Fly to start / Start trajectory / Back to hover | `hold` / `go_to_start` / `start` / `back_to_hover` (`std_srvs/Trigger`) |
 | Status, progress, enabling | `status` (String) and `info` (String JSON: phase, selected, time_scale, at_start, within_limits, t, T, start, hover, path, ...), latched, 2 Hz |
 
@@ -156,8 +158,13 @@ and hover marks) and `display_ccm_err` (error per axis and |e|), plus the one-li
   async with a `CCM_PLANNER_TIMEOUT_S` deadline (`_check_ccm_planner_deadlines()`), and a
   timeout does not claim failure. Service readiness is cached in `_refresh_services_ready()`.
 - **A topic and a service call are not ordered.** "Fly to start" and "Start trajectory"
-  stay disabled until the planner's `info` echoes the dropdown selection and the slider's
-  time scale, so a move can never use a stale selection.
+  stay disabled until the planner's `info` echoes the dropdown selection, the slider's
+  time scale and the radius box, so a move can never use a stale selection. The radius box
+  itself is enabled only when the dropdown and the planner agree on the shape (the planner
+  applies a radius to its own selection) and outside RUNNING / TRANSITION. A new circle
+  radius moves the start point (centre + R), so "Fly to start" is needed again; a figure-8
+  starts at the centre whatever its size. The tangent figure-8's yaw rate does not shrink
+  with the size (the heading along the path is scale-free) -- only the time scale lowers it.
 - The latched planner topics update `CommonData` under a BLOCKING `lock()` (deliberate:
   `available_trajectories` arrives once, and a dropped `tryLock()` sample would leave the
   dropdown empty until the planner restarts). The two streams keep `tryLock()`.
