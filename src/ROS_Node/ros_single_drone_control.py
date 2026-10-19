@@ -3373,8 +3373,9 @@ class SingleDroneRosThread(QObject):
         path = (info or {}).get('path') or []
         start = (info or {}).get('start')
         hover = (info or {}).get('hover')
-        key = (len(path), tuple(path[0]) if path else None, tuple(path[-1]) if path else None,
-               tuple(start or ()), tuple(hover or ()))
+        # The WHOLE path is the key: a figure-8 starts and ends at its centre whatever its size, so its
+        # end points (and its start mark) do not change with the radius.
+        key = (tuple(tuple(p) for p in path), tuple(start or ()), tuple(hover or ()))
         if key == self._ccm_path_key:
             return
         self._ccm_path_key = key
