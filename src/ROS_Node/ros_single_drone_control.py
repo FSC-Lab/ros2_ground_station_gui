@@ -729,6 +729,7 @@ class SingleDroneRosNode(Node, QObject):
         #   geometric_direct_actuation   geometric AM + geometric drone
         #   geometric_l1_direct_actuation   geometric+L1 AM + geometric+L1 drone
         #   whole_body_direct_actuation  whole-body AM
+        #   coordinated_admittance_direct_actuation  Liu et al. CEP 2024 AM (sim comparison rig, 2026-10-10)
         # A fork missing from this list shows up as N/T pies pinned at 0.0%
         # for a whole DIRECT flight with nothing else wrong -- the other two
         # gates below (the "Direct Actuation" substring test on
@@ -749,6 +750,7 @@ class SingleDroneRosNode(Node, QObject):
                 '/uav_0/fsc_autopilot_ros2/geometric_direct_actuation/motors_debug',
                 '/uav_0/fsc_autopilot_ros2/geometric_l1_direct_actuation/motors_debug',
                 '/uav_0/fsc_autopilot_ros2/whole_body_direct_actuation/motors_debug',
+                '/uav_0/fsc_autopilot_ros2/coordinated_admittance_direct_actuation/motors_debug',
             )
         ]
         # Back-compat alias: some code/logging referred to the single handle.
