@@ -104,6 +104,22 @@ WIFI_WEAK_SIGNAL_DBM = -75.0
 WIFI_SLOW_PING_MS = 50.0
 WIFI_BACKLOG_REPORTS = 3          # consecutive reports with packets queued for WiFi
 WIFI_UDP_TXQ_WARN_BYTES = 100_000  # the kernel limit is 212992
+# Raw-mocap safety guard (box pushing, 2026-10-21): fsc_drone_state_estimator_ros2's
+# MocapGuard on the Orin (launched with mocap_guard:=true) publishes its ladder here at
+# 50 Hz, best effort: [0] state, [1] cause, [2] age of the last good sample [s],
+# [12] a test fault is active (layout in its mocap_odom_bridge.hpp). Only the
+# box-pushing stacks run the guard; on any other stack nothing arrives and the alarm
+# stays silent.
+MOCAP_GUARD_TOPIC = '/uav_0/state_estimator/mocap_guard'
+MOCAP_GUARD_CAUSES = ('none', 'stale', 'frozen', 'jump', 'test')
+# No health message for this long -> the guard's state is unknown here. Logged, not
+# spoken: a dead link already sounds as "No WiFi".
+MOCAP_GUARD_STALE_S = 1.0
+# While LOST the takeover call repeats this often, until PX4 reports the pilot has the
+# vehicle (any mode but OFFBOARD) or it is disarmed. One call is the siren (1.2 s) and
+# about 2.5 s of speech.
+MOCAP_GUARD_REPEAT_S = 8.0
+MOCAP_GUARD_TAKEOVER_TEXT = "Mocap lost. Pilot, take over and land."
 # Background colours for the status labels (same green as the rotor pies).
 STATUS_STYLE = {
     'good': 'background-color: #24A148; color: white;',
@@ -215,7 +231,7 @@ from sensor_msgs.msg import CompressedImage
 from rclpy.serialization import deserialize_message
 import json
 # from fsc_autopilot_msgs.msg import TrackingReference
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Float64MultiArray, String
 from std_srvs.srv import SetBool
 
 
@@ -526,6 +542,10 @@ class AudioAnnouncer(QObject):
         "OptiTrack regained" during the siren and then the stale "No OptiTrack" after it.
       * announcements from DIFFERENT sources queue, so a WiFi alarm never cuts off an
         OptiTrack alarm (they tend to fire together when the link drops).
+      * an URGENT announcement (the mocap guard's takeover call) does not queue: it plays
+        next, and one from another source that is playing is cut and played again, from
+        the start, right after it. The pilot hears "take over" first, not after up to
+        two other alarms' sirens.
     """
 
     # A hung player or speech-dispatcher must not stall the queue. A step that overruns
@@ -547,13 +567,24 @@ class AudioAnnouncer(QObject):
         self._watchdog.setSingleShot(True)
         self._watchdog.timeout.connect(self._step_timed_out)
 
-    def announce(self, source, text, siren=False):
+    def announce(self, source, text, siren=False, urgent=False):
         self._queue = deque(item for item in self._queue if item[0] != source)
         if self._current is not None and self._current[0] == source:
             self._stop_current()
-        self._queue.append((source, text, siren))
+        elif urgent and self._current is not None:
+            self._queue.appendleft(self._current)
+            self._stop_current()
+        if urgent:
+            self._queue.appendleft((source, text, siren))
+        else:
+            self._queue.append((source, text, siren))
         if self._current is None:
             self._start_next()
+
+    def siren_sounding(self):
+        """True while a siren plays -- so nothing is speaking that a cut must cancel."""
+        return (self._current is not None and self._current[2]
+                and self._siren is not None and not self._speaking)
 
     def _start_next(self):
         if not self._queue:
@@ -792,6 +823,14 @@ class SingleDroneRosNode(Node, QObject):
             self.system_status_callback,
             self.system_status_qos_profile
         )
+        # Raw-mocap guard health for the mocap-guard alarm. Best effort like its
+        # publisher; depth 1, only the newest state matters.
+        self.mocap_guard_sub = self.create_subscription(
+            Float64MultiArray,
+            MOCAP_GUARD_TOPIC,
+            self.mocap_guard_callback,
+            self.optitrack_qos_profile
+        )
         # Camera snapshots for the VLM look pipeline. RELIABLE both ways: requests are
         # rare and must arrive; a response (~85 kB) is being actively waited for.
         self.snapshot_qos_profile = QoSProfile(
@@ -983,6 +1022,16 @@ class SingleDroneRosNode(Node, QObject):
                 throttle_duration_sec=5.0)
             return
         self.data_struct.update_system_status(status)
+
+    def mocap_guard_callback(self, msg):
+        d = msg.data
+        if len(d) < 13 or not (math.isfinite(d[0]) and math.isfinite(d[1])):
+            self.get_logger().warn(
+                f'Unexpected {MOCAP_GUARD_TOPIC} message ({len(d)} values)',
+                throttle_duration_sec=5.0)
+            return
+        self.data_struct.update_mocap_guard(
+            int(round(d[0])), int(round(d[1])), float(d[2]), d[12] > 0.5)
 
     def vision_image_callback(self, msg):
         # Stored as received; decoding is left to the GUI, which only does it while the
@@ -1342,6 +1391,7 @@ class SingleDroneRosThread(QObject):
         self._setup_camera_view()
         self._setup_optitrack_status()
         self._setup_system_status()
+        self._setup_mocap_guard_alarm()
         self._setup_llm()
         self._setup_controller_switch()
 
@@ -1557,6 +1607,79 @@ class SingleDroneRosThread(QObject):
         elif was_lost:
             self._announcer.announce('wifi', "WiFi regained")
             self.log_message("WiFi regained")
+
+    def _setup_mocap_guard_alarm(self):
+        # Level last announced: 0 nothing (MOCAP, or BRIDGING -- a rejected flip bridges
+        # one sample and must stay quiet), 2 CONFIRMED, 3 LOST.
+        self._mocap_guard_level = 0
+        self._mocap_guard_seen = False    # a fresh health message has ever arrived
+        self._mocap_guard_silent = False  # "no status" logged and nothing heard since
+        self._mocap_guard_called = 0.0    # monotonic time of the last takeover call
+
+    def _update_mocap_guard_alarm(self, state_msg):
+        data = self.ros_object.data_struct
+        if not self.lock.tryLock():
+            return
+        guard = data.current_mocap_guard
+        received = data.last_mocap_guard_time
+        px4_known = 'state' in data.last_update
+        armed, mode = state_msg.armed, state_msg.mode
+        self.lock.unlock()
+        if guard is None:
+            return  # no guard on this stack
+        # Who flies, per PX4. Without vehicle_status the computer is assumed to, so the
+        # takeover call is never withheld for lack of telemetry.
+        disarmed = px4_known and armed is False
+        pilot_flying = disarmed or (px4_known and 'OFFBOARD' not in mode)
+        now = time.monotonic()
+        if now - received < MOCAP_GUARD_STALE_S:
+            if not self._mocap_guard_seen:
+                self._mocap_guard_seen = True
+                self.log_message("Mocap guard active (raw-mocap safety guard on the Orin)")
+            elif self._mocap_guard_silent:
+                self.log_message("Mocap guard: status again")
+            self._mocap_guard_silent = False
+            state, cause, age, test = guard
+            level = state if state >= 2 else 0
+            if level != self._mocap_guard_level:
+                prev = self._mocap_guard_level
+                self._mocap_guard_level = level
+                cause_name = (MOCAP_GUARD_CAUSES[cause]
+                              if 0 <= cause < len(MOCAP_GUARD_CAUSES) else str(cause))
+                why = (f"{cause_name}{', test fault' if test else ''}, "
+                       f"last good sample {age:.2f} s ago")
+                if level == 2:
+                    # The first cue, 0.15 s into a fault: the planner aborts a push in
+                    # contact here. Free flight carries on on the EKF2 bridge.
+                    self._announcer.announce('mocap_guard', "Mocap fault", siren=True)
+                    self.log_message(f"Mocap guard CONFIRMED ({why}): flying on the EKF2 bridge")
+                elif level == 3:
+                    # A siren is usually still sounding (CONFIRMED's, 0.85 s earlier, or
+                    # "No OptiTrack"'s): cut it and speak at once, so the words come ~1 s
+                    # into the fault instead of after a second siren. Nothing is speaking
+                    # then, so no spd-say -C can race the new words.
+                    self._call_mocap_lost(
+                        disarmed, urgent=True, siren=not self._announcer.siren_sounding())
+                    self.log_message(
+                        f"Mocap guard LOST ({why}): EKF2 only, the position drifts"
+                        + ("" if disarmed else " -- pilot, take over and land"))
+                elif prev:
+                    self._announcer.announce('mocap_guard', "Mocap regained")
+                    self.log_message("Mocap guard: mocap healthy again, blending back")
+        elif not self._mocap_guard_silent:
+            self._mocap_guard_silent = True
+            self.log_message(
+                f"Mocap guard: no status for {MOCAP_GUARD_STALE_S:.0f} s on {MOCAP_GUARD_TOPIC}")
+        # On the last state heard, so a link drop during LOST does not silence the call.
+        if (self._mocap_guard_level == 3 and not pilot_flying
+                and now - self._mocap_guard_called >= MOCAP_GUARD_REPEAT_S):
+            self._call_mocap_lost(disarmed, urgent=False)
+
+    def _call_mocap_lost(self, disarmed, urgent, siren=True):
+        # Disarmed there is nobody to take over; the loss is still worth the siren.
+        text = "Mocap lost" if disarmed else MOCAP_GUARD_TAKEOVER_TEXT
+        self._announcer.announce('mocap_guard', text, siren=siren, urgent=urgent)
+        self._mocap_guard_called = time.monotonic()
 
 
     # ------------------------------------------------------------------
@@ -3129,6 +3252,7 @@ class SingleDroneRosThread(QObject):
         self._update_camera_view()
         self._update_optitrack_status()
         self._update_system_status()
+        self._update_mocap_guard_alarm(state_msg)
 
         self.ui.TargROLL_RATE_DISP.display("{:.2f}".format(alttitude_targ_msg.roll_rate, 2))
         self.ui.TargPITCH_RATE_DISP.display("{:.2f}".format(alttitude_targ_msg.pitch_rate, 2))

@@ -35,7 +35,7 @@ Use a ROS 2 environment that provides the workspace's message packages. Importan
 - `fsc_autopilot_ros2_msgs`
 - `geometry_msgs`, `nav_msgs`, `sensor_msgs`, `std_msgs`, `std_srvs`, and `visualization_msgs`
 - `pyqtgraph` (optional): powers the embedded real-time plots in the single-drone GUI (`display_x_y_z` and `display_body_angle` — see "Single-drone telemetry plots"). Import is guarded — the GUI runs without it, printing `[PLOT] pyqtgraph not found` and leaving those plots blank.
-- `spd-say` from speech-dispatcher, and `pacat` (or `aplay`) (all optional): the spoken OptiTrack/WiFi announcements and the siren in front of a loss, in the single-drone GUI (see "Audio alarms"). Without them the GUI prints `[AUDIO] ... not found`, and the indicators still work silently.
+- `spd-say` from speech-dispatcher, and `pacat` (or `aplay`) (all optional): the spoken OptiTrack/WiFi/mocap-guard announcements and the siren in front of a loss, in the single-drone GUI (see "Audio alarms"). Without them the GUI prints `[AUDIO] ... not found`, and the indicators still work silently.
 
 See `docs/prerequisites.md` for the expected ROS 2 workspace layout and upstream packages. In particular, `px4_msgs` and `fsc_autopilot_ros2_msgs` must be available from the sourced workspace.
 
@@ -209,6 +209,55 @@ The formatting and thresholds are the module-level functions `cpu_summary()` and
 - `mocap`/`odom` from this report are not shown. See the OptiTrack section for why
   `mocap.status` is not used for `optitrack_status`.
 
+## Single-drone mocap-guard alarm (box pushing)
+
+Spoken only, no widget: the visual state is the arm GS's Box Pushing tab Mocap lamp.
+Added 2026-10-21 with the Orin-side raw-mocap safety guard
+(`fsc_drone_state_estimator_ros2`, `MocapGuard`, launched with `mocap_guard:=true`
+by the box-pushing stacks only).
+
+| Topic | Type | Rate | GUI reader |
+| --- | --- | --- | --- |
+| `/uav_0/state_estimator/mocap_guard` (`MOCAP_GUARD_TOPIC`) | `std_msgs/Float64MultiArray` (16 values) | 50 Hz, best effort | best-effort, depth 1 |
+
+Used: `[0]` state (0 MOCAP, 1 BRIDGING, 2 CONFIRMED, 3 LOST), `[1]` cause (stale,
+frozen, jump, test), `[2]` age of the last good sample, `[12]` test fault. The full
+layout is in the estimator's `mocap_odom_bridge.hpp`.
+
+| Guard edge | Sound | Flight log |
+| --- | --- | --- |
+| BRIDGING (one rejected sample, e.g. an OptiTrack flip) | nothing | nothing |
+| -> CONFIRMED (0.15 s without a good sample) | siren, then "Mocap fault" | cause and age |
+| -> LOST (1 s) | "Mocap lost. Pilot, take over and land." (disarmed: "Mocap lost") | cause and age |
+| LOST, still armed in OFFBOARD | the takeover call again every `MOCAP_GUARD_REPEAT_S` (8 s), with the siren | -- |
+| -> MOCAP after CONFIRMED or LOST | "Mocap regained" | "healthy again, blending back" |
+| no message for `MOCAP_GUARD_STALE_S` (1 s) | nothing (a dead link is "No WiFi") | "no status", then "status again" |
+
+- **Silent unless the guard runs.** Nothing is announced or logged before the first
+  message, so every non-box-pushing stack is unaffected. The first message logs
+  "Mocap guard active".
+- **The takeover call is URGENT** (`announce(..., urgent=True)`): it plays next instead
+  of queuing, and an announcement from another source that is playing is cut and
+  replayed afterwards. In a Motive pause "No OptiTrack" fires 0.4 s in, between
+  CONFIRMED and LOST; queued, it would have delayed "take over" by a whole siren and
+  sentence.
+- **No second siren.** LOST comes 0.85 s after CONFIRMED, whose siren (or "No
+  OptiTrack"'s) is still sounding. If a siren is sounding (`siren_sounding()`), LOST cuts
+  it and speaks at once, so the words start ~1 s into the fault. Only a siren is ever
+  cut this way, never speech, so no `spd-say -C` can cancel the new words. A short
+  fault plays the CONFIRMED siren, then "Mocap regained" (the words "Mocap fault" are
+  usually superseded).
+- **Repeats** stop when PX4 reports the pilot has the vehicle (any mode but OFFBOARD)
+  or it is disarmed. Before any `vehicle_status` has arrived the computer is assumed
+  to fly, so the call is never withheld for lack of telemetry. Repeats run on the last
+  state heard, so a link drop during LOST does not silence them.
+- Tested 2026-10-21 offscreen (the real `SingleDroneRosThread` on ROS domain 77,
+  stand-in siren/speech players that log, a scripted guard/PX4/OptiTrack/Orin feed):
+  flip silent; short fault siren then "Mocap regained"; Motive pause takeover words
+  0.88 s after CONFIRMED, ahead of "No OptiTrack"; repeat at 8.0 s, none after STAB;
+  disarmed "Mocap lost" without repeats; LOST while "No OptiTrack" sounds speaks
+  at once and replays the OptiTrack alarm afterwards; guard silence logged only.
+
 ## Audio alarms (`AudioAnnouncer`)
 
 Announcements play one at a time: a siren (optional), then speech. Every step is a
@@ -225,7 +274,8 @@ Announcements play one at a time: a siren (optional), then speech. Every step is
   by a quick recovery would play "OptiTrack regained" during the siren and then the
   stale "No OptiTrack" after it. Announcements from different sources queue instead,
   because OptiTrack and WiFi tend to drop together and neither alarm should clip the
-  other.
+  other. The one exception is `urgent=True` (the mocap guard's takeover call), which
+  plays next and cuts another source's playing announcement, replaying it afterwards.
 - **Watchdog.** A step that runs past `STEP_TIMEOUT_MS` (10 s) is killed and the
   announcement continues, so a hung siren player still lets the words through.
 - Tested 2026-09-26 with stand-in players (ordering, supersession, both sources at
