@@ -603,6 +603,33 @@
        <string>Commit Action</string>
       </property>
      </widget>
+     <widget class="QPushButton" name="buttom_LLM_auto">
+      <property name="geometry">
+       <rect>
+        <x>440</x>
+        <y>160</y>
+        <width>211</width>
+        <height>41</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>Allow Auto Task: OFF</string>
+      </property>
+     </widget>
+     <widget class="QPushButton" name="buttom_LLM_stop">
+      <property name="geometry">
+       <rect>
+        <x>660</x>
+        <y>110</y>
+        <width>141</width>
+        <height>91</height>
+       </rect>
+      </property>
+      <property name="text">
+       <string>STOP
+LLM Control</string>
+      </property>
+     </widget>
      <widget class="QPushButton" name="buttom_LLM_commit_2">
       <property name="geometry">
        <rect>

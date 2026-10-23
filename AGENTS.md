@@ -320,7 +320,20 @@ can *propose* small moves, and only the operator's click sends one.
 **Server.** The LLM host's proxy at `LLM_BASE_URL` (a NetBird address), model
 `LLM_MODEL` (`qwen2.5vl:7b`). It exposes `GET /api/health` and `POST /api/chat`. Ollama
 itself stays on loopback on the LLM host. The proxy has **no authentication**, so any
-NetBird peer the access policy allows can use it. Proxy behaviour observed 2026-09-26:
+NetBird peer the access policy allows can use it.
+
+**Per-machine settings (2026-10-22).** `LLM_BASE_URL` and `LLM_MODEL` are not hard-coded:
+they come from `scripts/config/<machine>.conf`, the same `KEY="value"` files as
+fsc_PegasusSimulator and fsc_autopilot_ros2 use, read by `src/Common/machine_config.py`
+(not sourced, so values are literal). Selection: `FSC_GS_MACHINE=<name or path>`, else
+the config whose `HOSTNAME` equals this machine's hostname, else `fsc_lab_machine` with a
+warning. The station prints the chosen file at startup and names it in the chat's
+"Connecting to ..." line. A missing or incomplete config never stops the station; only the
+LLM tab is affected. Current configs: `fsc_lab_machine` (`:8081` on 100.103.237.60) and
+`longhao_home_machine` (`:8080` on 100.103.152.77, `HOSTNAME` still to be filled in). To
+add a machine, copy one and set all three keys.
+
+Proxy behaviour observed 2026-09-26:
 
 - it forwards only `model` and `messages`, and always streams Ollama-format NDJSON
   (one JSON object per line). It ignores `stream` and `options`, so temperature and
@@ -332,13 +345,127 @@ NetBird peer the access policy allows can use it. Proxy behaviour observed 2026-
 
 Rules for this path:
 
-- **Read-only status answers.** The model gets a telemetry snapshot and answers in
-  text; the proxy's `/api/parse` is not used. The only paths from here to the vehicle
-  are the camera search's snapshot request, which is harmless, and its proposed moves.
-  Moves are gated by the operator's click and by the GUI's own checks: geofence, pose,
-  armed, OFFBOARD, yaw alignment and OptiTrack. Any future LLM command path must keep
-  that shape. `/api/parse` returns only what the model said, and the geofence and pose
-  checks live in `nl_commander`, not on this path.
+- **Read-only status answers.** The status model gets a telemetry snapshot and answers
+  in text; nothing it says is turned into a command. The paths from this tab to the
+  vehicle are the camera search (snapshot request + proposed moves) and typed movement
+  commands (below). Every move is gated by the operator's click and by the GUI's own
+  checks: geofence, pose, armed, OFFBOARD, yaw alignment and OptiTrack. Any future LLM
+  command path must keep that shape.
+- **Typed movement commands (2026-10-22).** `is_move_request()` recognises an
+  instruction in code ("move forward 1 m", "climb 0.3 m and slide left 0.5 m",
+  "turn right 90 degrees", "go to position 0, 0, 1", "hold", Chinese like "上升两米"),
+  and imperative operator-only requests ("take off", "land", "arm", "switch to ...");
+  anything else, questions included, goes to the status model. A command goes to the
+  server's `POST /api/parse` (`LlmClient.parse()`, async), which runs `nl_parser` from
+  aerial_robtoics+vlm: the model picks a direction LABEL and an unsigned amount, the sign
+  table is code, and take-off/landing/arming/mode changes come back as refusals. The
+  reply says only what the sentence means; the station then
+  - resolves it from the camera search's base (`_look_move_base()`: same gates, steps
+    from the held setpoint), relative moves in the heading frame (dx forward, dy left,
+    dyaw anticlockwise, like `LOOK_MOVES`);
+  - checks the geofence and `TYPED_MAX_STEP_M` (2.0 m, `nl_commander`'s bound);
+  - with **LLM Control** on, puts the move on **Commit Action** (Stop cancels it; a new
+    command, a camera search, LLM Control off or Disconnect also cancel it); with it off,
+    proposes nothing. Commit re-checks that the drone has not moved, then sends through
+    `_issue_position_command()` and reports arrival or a timeout in the chat;
+  - **"hold" is immediate**: no LLM Control, no Commit, holding the current pose, only
+    while armed in OFFBOARD -- the station's rule that going back to safe is one action.
+  Results go into `recent_typed_commands` in the snapshot and the chat history. A camera
+  action the model emits for the drone itself ("the drone's movement history") is
+  refused by `_LOOK_NOT_OBJECTS` and answered from that record instead (seen
+  2026-10-22). Sim-tested end to end on the T650 baseline stack: moves arrive within
+  2-5 cm, refusals and bounds send nothing. A "fully automatic" mode without Commit is
+  planned but NOT implemented.
+  **Server dependency:** `/api/parse` needs the `openai` Python package on the LLM host;
+  without it every command reports "Could not read the command: ModuleNotFoundError".
+- **Find-object missions (2026-10-22).** "find the red bottle; if not in view check
+  (1,-1,1), (1,1.8,1)" (`parse_mission_request`: a find/search intent plus a location
+  list or a word like check/explore/go to it; "find a bottle" alone stays a single
+  camera check). The chat model extracts `{object, locations}` (`MISSION_SYSTEM_PROMPT`);
+  code refuses any location whose numbers are not literally in the operator's text
+  (`numbers_in`), outside the geofence or below `MISSION_MIN_Z_M`. The plan is shown and
+  **approved once** with Commit Action, which works only while **LLM Control and Allow
+  Auto Task** are both on. The station then flies it alone: look from here (a camera
+  search with `mission=True`: no relocation moves, outcome handed to
+  `_mission_look_done`) -> each location in order -> found: standoff
+  `MISSION_STANDOFF_BACK_M` behind along -x, `MISSION_STANDOFF_UP_M` above, yaw
+  `MISSION_STANDOFF_YAW_DEG` (the 45-deg camera then centres the object) and a final
+  confirming look; nothing found: back to the start pose. Legs follow obstacle-free routes
+  (see "Routes around known obstacles"), gates re-checked every tick. Report in chat, flight log and
+  `recent_missions`. While a mission runs, only "hold"/"stop" are accepted in the chat
+  (they end it); other questions wait, so a status answer cannot take the model a
+  mission look needs.
+- **Buttons (2026-10-22, `.ui` + regenerated):** `buttom_LLM_auto` "Allow Auto Task" under
+  Commit Action -- checkable, OFF at every launch, turning it off ends a mission (with a
+  hold if it had flown). `buttom_LLM_stop` "STOP LLM Control" (red, right of Commit) -- one
+  click, no dialog: ends any mission / camera search / typed command, sends a hold at
+  the current pose IF the LLM was moving the drone (never overrides a manual setpoint
+  otherwise), and turns LLM Control and Allow Auto Task off.
+- **Routes around known obstacles (2026-10-22).** Every setpoint an LLM feature sends --
+  typed moves, camera-search moves, mission legs -- follows a route from
+  `src/Common/obstacle_planner.py`; manual position commands are NOT checked.
+  - Obstacles: upright boxes in `scripts/config/<OBSTACLES_FILE>` (machine config key;
+    override `FSC_GS_OBSTACLES`). Tracked live as OptiTrack rigid bodies on
+    `/vrpn_mocap/<name>/pose` -- the same ENU frame as `/uav_0/mocap` (the processor
+    passes VRPN through unchanged) -- with the pivot on the lid by default
+    (`center_offset`), or fixed (`position`, `yaw_deg`). A tracked obstacle unseen for
+    `stale_s`, or an unreadable file, refuses EVERY LLM route: a missing obstacle must not
+    read as an empty room. `obstacles_lab.json` ships empty with an example;
+    `obstacles_sim.json` matches the emulator's pillar and chair.
+  - Geometry: the drone centre stays `margin_m` (0.7) from each box footprint unless
+    `clearance_m` (0.4, room for the landing gear -- not measured) above/below it; routes
+    are PLANNED a further `tracking_tolerance_m` (0.15) out, horizontally and vertically,
+    while a flight in progress is MONITORED against the true limits
+    (`_obstacle_planner(monitor=True)`), so tracking wobble inside the tolerance never
+    re-plans (a leg ending exactly at a box's height + clearance once re-planned every
+    tick and never arrived). Straight if free, else climb/descend in place then a
+    2-D A* (10 cm grid, cells inflated 0.75 cell) at the target altitude, shortened by line
+    of sight. A start that has drifted inside a margin may leave but never close in
+    (`relaxed_margins`). Fuzzed: 1,067 random 3-D routes, 0 margin violations, 0 spurious
+    "no path"; ~13 ms each.
+  - **Nothing is stepped.** Measured on the T650 sim (baseline controller): a 90 deg yaw
+    setpoint step swings the drone 0.60 m sideways (0.75 m with a mid-turn hold) and a
+    0.75 m position step overshoots ~0.25 m -- the margin eaten by the controller, not
+    the plan. The follower (`_route_step`) therefore turns first at
+    `ROUTE_YAW_RATE_DEG_S` (15), then slides the setpoint along the path at
+    `ROUTE_SPEED_M_S` (0.4), never more than `ROUTE_LEAD_M` / `ROUTE_YAW_LEAD_DEG` ahead of
+    the drone, at 10 Hz (`_issue_position_command(quiet=True)`: logged at start, re-plan
+    and arrival, not per setpoint). The stretch from the drone to the reference is
+    re-checked every tick; a tracked obstacle moving into it triggers a re-plan.
+    Closest approach to the sim pillar over a full test run: 0.31 m (stepped) -> 0.64 m
+    (sliding) -> 0.83 m (sliding + tolerance), margin 0.7 m.
+- **Missions, second pass (2026-10-22).** Locations are read by CODE from the text
+  (`coordinate_tuples`: `(x, y, z[, yaw])`, full-width brackets too); the model only names
+  the object (it once returned `[0, 0, 0]` for "(1,1.8,1)"; its list is logged as
+  `mission_plan_mismatch`). Every viewpoint is scanned at `MISSION_SCAN_HEADINGS_DEG`
+  (6 headings, 60 deg apart, relative) until found -- the camera sees ~70 deg, and 4
+  headings left 20 deg blind wedges (offline: 88% of the floor seen vs 98%). **Object memory**: a
+  sighting with a room position younger than `MISSION_MEMORY_MAX_AGE_S` is flown to and
+  verified first; names must agree word for word ("bottle" recalls "red bottle", never
+  "blue bottle"). **Room search**: "search the room for X" / "find X anywhere" with no
+  locations generates viewpoints over the geofence (`MISSION_ROOM_*`, 9 in the 10x10 m
+  arena), skipping any near an obstacle, nearest first. **Limits**: no start below
+  `MISSION_MIN_BATTERY_START_PCT`; head home below `MISSION_RETURN_BATTERY_PCT` or past
+  `MISSION_MAX_S` (10 min; `MISSION_ROOM_MAX_S` 20 min for room searches) -- never once the
+  object is found; stop sending setpoints if odometry is older than `MISSION_FEED_STALE_S`.
+  Pronouns ("find it") mean the last object searched for (`_resolve_object`), never an
+  object named "it". Sim batch (`test/sim/mission_batch_eval.py`, 8 random placements):
+  8/8 found and confirmed, closest approach 0.84 m; see `docs/llm_mission_experiments.md`.
+- **Audit log (2026-10-22).** `~/.ros/fsc_gs_llm_audit/<session>.jsonl` (override
+  `FSC_GS_AUDIT_DIR`), one JSON line per event: mission plan (with the model's raw reply),
+  start, routes and re-plans, every VLM request (detections, pose) and raw reply, looks,
+  arrivals, every non-route setpoint, STOP. `_audit()` never raises.
+- **Cloud VLM for camera checks (2026-10-22).** `VLM_BACKEND="openrouter"` in the machine
+  config sends each camera check to `OPENROUTER_MODEL` (default
+  `anthropic/claude-sonnet-5.5`, ~$0.004 per check; `claude-haiku-5.5` is ~20x cheaper) via
+  `Common/llm_client.OpenRouterClient` (same interface as `LlmClient.chat`, temperature 0,
+  image as a JPEG data URL). Every check sends the frame off-site. The key is never in the
+  repo: `$OPENROUTER_API_KEY` or `~/.config/fsc_gs/openrouter_key` (chmod 600). Planning,
+  parsing and status stay on the local model.
+- **Simulation:** `isaacsim_vision_emulator` (fsc_autopilot_ws) answers the snapshot
+  topics from Isaac ground truth with a synthetic frame; see its README. Sim-tested
+  2026-10-22: found-at-second-location -> standoff -> confirmed, not-found -> return to
+  start, and STOP mid-leg -> hold, all through this station's real code.
 - **Threading.** `QNetworkAccessManager` runs on the GUI thread
   (`src/Common/llm_client.py`): it is asynchronous, never blocks, and never touches
   rclpy. The snapshot reads `CommonData` with `tryLock(50)`: a bounded wait once per

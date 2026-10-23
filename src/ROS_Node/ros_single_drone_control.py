@@ -43,7 +43,9 @@ from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, 
                          QTextImageFormat)
 from PyQt5.QtWidgets import QAbstractItemView, QMessageBox, QTableWidgetItem, QWidget
 import Common
-from Common.llm_client import LlmClient
+from Common import machine_config
+from Common.llm_client import LlmClient, OpenRouterClient
+from Common.obstacle_planner import ObstacleConfig, Planner, RoutePath
 from geometry_msgs.msg import Point, PoseStamped
 
 try:
@@ -127,9 +129,40 @@ TWO_LINE_FONT = ' font-size: 9pt;'
 # The CPU box sits right of the control tab bar (316 px): its four-core first line needs 8 pt.
 CPU_STATUS_FONT = ' font-size: 8pt;'
 # LLM status assistant (VLM tab). The proxy on the LLM host, reached over NetBird; it has
-# no authentication, so only NetBird peers the access policy allows can reach it.
-LLM_BASE_URL = 'http://100.103.152.77:8080'
-LLM_MODEL = 'qwen2.5vl:7b'
+# no authentication, so only NetBird peers the access policy allows can reach it. The
+# address and model are per machine: scripts/config/<machine>.conf (Common/machine_config).
+MACHINE_CONFIG = machine_config.load()
+LLM_BASE_URL = MACHINE_CONFIG.get('LLM_BASE_URL', '')
+LLM_MODEL = MACHINE_CONFIG.get('LLM_MODEL', '')
+
+
+def _load_obstacle_config():
+    """Known obstacles for LLM routes (Common/obstacle_planner). FSC_GS_OBSTACLES, else the
+    machine config's OBSTACLES_FILE. None = configured but unreadable, and then every LLM
+    route is refused: a broken obstacle list must not read as an empty room."""
+    name = (os.environ.get('FSC_GS_OBSTACLES', '').strip()
+            or MACHINE_CONFIG.get('OBSTACLES_FILE', '').strip())
+    if not name:
+        print("[Obstacles] WARNING: no OBSTACLES_FILE in the machine config; LLM routes "
+              "assume an empty arena")
+        return ObstacleConfig({}, '')
+    path = name if os.path.isabs(name) else os.path.join(machine_config.CONFIG_DIR, name)
+    try:
+        config = ObstacleConfig.load(path)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"[Obstacles] ERROR: cannot use {path} ({exc}); every LLM move will be refused")
+        return None
+    print(f"[Obstacles] {path}: {len(config.entries)} obstacle(s) "
+          f"({', '.join(e['name'] + (' tracked' if e['topic'] else ' fixed') for e in config.entries) or 'none'}), "
+          f"margin {config.margin} m (+{config.tolerance} m tracking tolerance), "
+          f"clearance {config.clearance} m")
+    return config
+
+
+OBSTACLE_CONFIG = _load_obstacle_config()
+# Audit log of LLM decisions and the setpoints they led to (one JSON line each).
+AUDIT_DIR = (os.environ.get('FSC_GS_AUDIT_DIR', '').strip()
+             or os.path.expanduser('~/.ros/fsc_gs_llm_audit'))
 LLM_HEALTH_INTERVAL_MS = 15000  # keeps Api_status honest while connected
 LLM_HISTORY_TURNS = 6           # question/answer pairs resent as context
 LLM_CHATLOG_MAX_BLOCKS = 2000   # bounded, like the flight log
@@ -168,6 +201,81 @@ LOOK_MOVES = {
     'up': (f"climb {LOOK_STEP_UP_M:.1f} m", 0.0, 0.0, LOOK_STEP_UP_M, 0.0),
     'down': (f"descend {LOOK_STEP_UP_M:.1f} m", 0.0, 0.0, -LOOK_STEP_UP_M, 0.0),
 }
+# Typed movement commands in the chat (is_move_request). The LLM host's /api/parse turns
+# the sentence into a command; the station resolves it against the live pose, applies the
+# camera-search move gates plus the geofence and a step bound, and sends it only when the
+# operator clicks Commit Action with LLM Control on. "hold" is the exception: going back
+# to a safe state is one action, never behind a confirmation.
+TYPED_MAX_STEP_M = 2.0          # one command's straight-line move; nl_commander's MAX_STEP_M
+TYPED_SETTLE_POS_M = 0.10       # "arrived": within this of the target...
+TYPED_SETTLE_YAW_DEG = 6.0
+TYPED_SETTLE_HOLD_S = 1.0       # ...for this long
+TYPED_SETTLE_TIMEOUT_S = 30.0   # then report it, without changing the setpoint
+TYPED_COMMANDS_KEPT = 10        # results kept for the status model's snapshot
+# Find-object missions ("find the red bottle; if not in view check (1,1,1), (2,0,1.2)").
+# The LLM turns the task into a plan (object + candidate locations), the operator
+# approves it once with Commit Action (LLM Control AND Allow Auto Task on), and the
+# station then flies it by itself: look here -> found? standoff : next location ... ->
+# nothing found: back to where the mission started, and report. Every leg goes through
+# the same gates as a camera-search move, re-checked before each setpoint.
+MISSION_MAX_LOCATIONS = 8
+# Route following (Common/obstacle_planner.RoutePath): the setpoint SLIDES along the path --
+# turn first at ROUTE_YAW_RATE_DEG_S, then move at ROUTE_SPEED_M_S -- and waits whenever the
+# drone falls more than ROUTE_LEAD_M / ROUTE_YAW_LEAD_DEG behind it. Steps overshoot here.
+ROUTE_SPEED_M_S = 0.4
+ROUTE_LEAD_M = 0.3
+ROUTE_YAW_RATE_DEG_S = 15.0
+ROUTE_YAW_LEAD_DEG = 10.0
+MISSION_LEG_TIMEOUT_S = 20.0    # per leg, plus MISSION_LEG_TIMEOUT_PER_M per metre
+MISSION_LEG_TIMEOUT_PER_M = 10.0
+# Standoff once found: STANDOFF_BACK_M behind the object along -x, STANDOFF_UP_M above it,
+# facing yaw 0 (+x). The camera points ~45 deg down, so the object then sits in the
+# middle of the image; a final look confirms it.
+MISSION_STANDOFF_BACK_M = 1.0
+MISSION_STANDOFF_UP_M = 1.0
+MISSION_STANDOFF_YAW_DEG = 0.0
+MISSION_MIN_Z_M = 0.5           # no mission setpoint below this
+MISSION_RESULTS_KEPT = 10
+# At every viewpoint the drone looks along these headings (deg, relative to the
+# viewpoint's yaw) until it finds the object. The camera sees ~70 deg, so 60 deg steps
+# overlap. Offline coverage of an 8x8 m floor, start + 4 viewpoints (mock camera geometry,
+# 2026-10-22): 1 heading 41%, 4 headings 88% (20 deg blind wedges), 6 headings 98%, 8: 98%.
+MISSION_SCAN_HEADINGS_DEG = (0.0, 60.0, 120.0, 180.0, 240.0, 300.0)
+# Object memory: a sighting younger than this is tried first (fly there and verify).
+MISSION_MEMORY_MAX_AGE_S = 600.0
+# "Search the room" with no locations: viewpoints on a grid over the geofence (inset by
+# MISSION_ROOM_INSET_M), MISSION_ROOM_SPACING_M apart, at MISSION_ROOM_Z_M, skipping any
+# too close to an obstacle, visited nearest-first.
+# 9 points at 1.2 m kept the most coverage when the detection range was cut (mock
+# geometry, 6 headings): 98% / 97% / 91% at 6 / 3.5 / 2.5 m range. A 4-point grid at 1.5 m
+# halves the looks but falls to 84% at 2.5 m -- worth it only once the real range is known.
+MISSION_ROOM_SPACING_M = 4.0
+MISSION_ROOM_INSET_M = 1.0
+MISSION_ROOM_Z_M = 1.2
+MISSION_ROOM_MAX_POINTS = 12
+_ROOM_SEARCH = re.compile(r"\b(?:room|arena|area|everywhere|whole|entire|all\s+around|"
+                          r"anywhere|around\s+the)\b|整个|房间|到处", re.I)
+# Limits: no mission starts under MISSION_MIN_BATTERY_START_PCT; one under
+# MISSION_RETURN_BATTERY_PCT, or past its time cap, heads back to the start.
+MISSION_MIN_BATTERY_START_PCT = 40.0
+MISSION_RETURN_BATTERY_PCT = 25.0
+# A 6-heading look takes ~8 s (60 deg turn at 15 deg/s + the VLM): start + 4 locations is
+# 30 looks, ~4-5 min with the legs (sim batch, 2026-10-22: one find came at 5:00 exactly).
+MISSION_MAX_S = 600.0
+MISSION_ROOM_MAX_S = 1200.0
+MISSION_FEED_STALE_S = 0.5      # no fresh position for this long: stop sending setpoints
+MISSION_SYSTEM_PROMPT = (
+    "You turn a drone operator's search task into a plan. Reply with ONLY one JSON object "
+    "and nothing else:\n"
+    '{"object": "<the object to find, a few words, e.g. red bottle>", '
+    '"locations": [[x, y, z], [x, y, z, yaw], ...]}\n'
+    "- object: what to look for, without articles.\n"
+    "- locations: the places the operator listed to explore, in the order given, copied "
+    "exactly as numbers in metres (x, y, z) with an optional yaw in degrees. If the "
+    "operator listed none, use an empty list. Never invent a location or change a "
+    "number.\n"
+    "If the text is not a search task, reply {\"object\": null, \"locations\": []}."
+)
 # The VLM only judges the image. Tested 2026-09-27: asked for visibility, the index of
 # the matching detector box and a move in one JSON reply, qwen2.5vl:7b answered from the
 # detector list and called a plainly visible bottle "not visible". Describe-first plus
@@ -204,7 +312,15 @@ LLM_SYSTEM_PROMPT = (
     "- px4_status.preflight_checks_pass is PX4's pre-flight check flag. It can stay false "
     "for a whole normal flight on these vehicles; do not call that a fault on its own.\n"
     "- You cannot control the drone: you cannot send commands, arm, move it or change "
-    "modes. If asked to, say that at this stage you can only report status.\n"
+    "modes. Movement instructions typed as a plain command (for example 'move forward 1 "
+    "m', 'climb 0.5 m', 'turn left 30 degrees', 'hold') are handled by the ground station "
+    "before they reach you, and the operator confirms them with Commit Action while LLM "
+    "Control is on. If you are asked to move the drone, say so briefly; you cannot arm, "
+    "take off, land or change modes in any case. Results of typed commands are in "
+    "recent_typed_commands: answer questions about where the drone went or what it did "
+    "from those and last_position_command, never with the camera action below.\n"
+    "- recent_flight_log is HISTORY, oldest first. Never report a mode or event from it as "
+    "the current state: the current flight mode is px4_status.flight_mode.\n"
     "- Exception, the camera: if the operator asks whether something is in the camera's "
     "view, or asks you to look for, find or check for an object, do not answer from the "
     "snapshot. Reply with only this JSON and nothing else: "
@@ -329,7 +445,16 @@ _LOOK_LEADING_WORDS = re.compile(r"^(?:a|an|the|any|my|some)\s+", re.I)
 # "can you see the WiFi status?" is a telemetry question, not a camera request.
 _LOOK_NOT_OBJECTS = re.compile(
     r"\b(?:wifi|battery|cpu|position|status|altitude|height|speed|velocity|mode|signal|"
-    r"ping|telemetry|log|optitrack|mocap|controller|yaw|attitude)\b", re.I)
+    r"ping|telemetry|log|optitrack|mocap|controller|yaw|attitude|drone|uav|vehicle|"
+    r"movements?|moved?|history|commands?|setpoint|target)\b", re.I)
+
+
+# "find it", "can you see that one?": a pronoun names the last object asked about, never
+# an object called "it" (seen 2026-10-22: a search for "it" saw the bottle, and could not
+# match "it" to the detector's "bottle").
+_LOOK_PRONOUN = re.compile(
+    r"^(?:it|that|this|them|those|these|one|that\s+one|this\s+one|the\s+(?:same\s+)?"
+    r"(?:object|thing|one)|same\s+(?:object|thing|one)|the\s+same)$", re.I)
 
 
 def parse_look_request(text):
@@ -342,6 +467,105 @@ def parse_look_request(text):
             if obj and len(obj) <= 40 and not _LOOK_NOT_OBJECTS.search(obj):
                 return obj
     return None
+
+
+# Typed movement commands ("move forward 1 m", "上升两米", "hold"), recognised in code
+# before the chat model is asked -- the same lesson as _LOOK_PATTERNS: a rule decides
+# the route, and the status model never sees a command. Deliberately narrow: a sentence
+# that is not clearly an instruction goes to the status chat, which cannot move the
+# drone, so a miss costs a retype and never a move. Imperative operator-only requests
+# ("take off", "land") are routed here too, so the parser's refusal names the reason.
+_MOVE_POLITE = re.compile(
+    r"^(?:(?:please|ok|okay|now|then|and)\s+|(?:can|could|would|will)\s+you\s+(?:please\s+)?)+",
+    re.I)
+_MOVE_QUESTION = re.compile(
+    r"^(?:what|what's|whats|how|why|when|where|which|who|whose|is|are|was|were|did|does|"
+    r"do|has|have|tell|show|report|explain|describe|list|any|status)\b", re.I)
+_MOVE_HOLD = re.compile(
+    r"^(?:hold|hover|freeze|stop|halt|stay|wait)(?:\s+(?:the\s+drone|position|still|there|"
+    r"here|in\s+place|where\s+you\s+are|right\s+there|now))*$", re.I)
+_MOVE_OPERATOR_ONLY = re.compile(
+    r"^(?:take\s*off|land|arm|disarm|kill|switch\s+to|engage|return\s+to)\b", re.I)
+_MOVE_WORDS = re.compile(
+    r"\b(?:forwards?|ahead|backwards?|back|left|right|up|down|higher|lower|climb|ascend|"
+    r"rise|descend|drop|strafe|slide|shift|sidestep|advance|retreat|reverse|turn|rotate|"
+    r"yaw|spin|clockwise|counter-?clockwise|anti-?clockwise)\b", re.I)
+_MOVE_AMOUNT = re.compile(
+    r"\d|\b(?:half|quarter|one|two|three|four|five|ten|fifteen|twenty|thirty|forty|"
+    r"forty-five|fifty|sixty|ninety)\b", re.I)
+_MOVE_GOTO = re.compile(r"\b(?:go|fly|move|head|return)\s+(?:back\s+)?to\b.*\d", re.I)
+_MOVE_CJK = re.compile(r"[一-鿿]")
+_MOVE_CJK_QUESTION = re.compile(r"吗|多少|什么|怎么|如何|是否|几")
+_MOVE_CJK_STOP = re.compile(r"悬停|停下|停止|别动|起飞|降落|解锁|上锁")
+_MOVE_CJK_MOVE = re.compile(r"[上下前后左右升降转]")
+_MOVE_CJK_AMOUNT = re.compile(r"[\d一二两三四五六七八九十半百]")
+
+
+def is_move_request(text):
+    """Is this chat line a movement instruction (for /api/parse), not a question?"""
+    s = text.strip()
+    polite = bool(_MOVE_POLITE.match(s))
+    s = _MOVE_POLITE.sub('', s).strip()
+    if s.endswith(('?', '？')) and not polite:
+        return False
+    s = s.rstrip('?？.!。！ ').strip()
+    if not s:
+        return False
+    if _MOVE_CJK.search(s):
+        if _MOVE_CJK_QUESTION.search(s):
+            return False
+        return bool(_MOVE_CJK_STOP.search(s)
+                    or (_MOVE_CJK_MOVE.search(s) and _MOVE_CJK_AMOUNT.search(s)))
+    if _MOVE_QUESTION.match(s):
+        return False
+    if _MOVE_HOLD.match(s) or _MOVE_OPERATOR_ONLY.match(s) or _MOVE_GOTO.search(s):
+        return True
+    return bool(_MOVE_WORDS.search(s) and _MOVE_AMOUNT.search(s))
+
+
+# Find-object missions, recognised in code: a find/search intent plus either a location
+# list or a word asking for more than one look ("check", "explore", "go to it", ...).
+# "find a bottle" alone stays a plain camera check (parse_look_request).
+_MISSION_INTENT = re.compile(
+    r"^(?:(?:please|ok|okay)\s+)?(?:(?:mission|task)\s*:\s*)?(?:go\s+)?"
+    r"(?:find|search\s+for|look\s+for|locate|hunt\s+for|scan\s+for)\b", re.I)
+_MISSION_PREFIX = re.compile(r"^(?:mission|task)\s*:", re.I)
+# "search the room for the cup", "look around the arena for a bottle", "find a cup anywhere"
+_MISSION_ROOM_INTENT = re.compile(
+    r"^(?:(?:please|ok|okay)\s+)?(?:find|search|look|locate|hunt|scan|explore)\b", re.I)
+_MISSION_EXTRA = re.compile(
+    r"[(\[]\s*-?\d|\b(?:check|explore|visit|try|then|if\s+not|otherwise|approach|"
+    r"go\s+to\s+it|fly\s+to\s+it|return|come\s+back|locations?|places?|spots?)\b", re.I)
+_MISSION_CJK = re.compile(r"找|寻找|搜索|搜寻")
+_NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def parse_mission_request(text):
+    """Is this chat line a find-object mission (for the planner), not a single look?"""
+    s = text.strip()
+    if _MISSION_PREFIX.match(s):
+        return True
+    if _MISSION_ROOM_INTENT.match(s) and _ROOM_SEARCH.search(s):
+        return True
+    if _MISSION_CJK.search(s):
+        return bool(re.search(r"[(\[（]\s*-?\d", s))
+    return bool(_MISSION_INTENT.match(s) and _MISSION_EXTRA.search(s))
+
+
+_COORD_TUPLE = re.compile(
+    r"[(\[（]\s*(-?\d+(?:\.\d+)?)\s*[,，]\s*(-?\d+(?:\.\d+)?)\s*[,，]\s*"
+    r"(-?\d+(?:\.\d+)?)(?:\s*[,，]\s*(-?\d+(?:\.\d+)?))?\s*[)\]）]")
+
+
+def coordinate_tuples(text):
+    """Every (x, y, z) or (x, y, z, yaw) written in the text, in order. Extracted by
+    code: the planner model once returned [0, 0, 0] for "(1,1.8,1)" (2026-10-22)."""
+    return [[float(v) for v in m.groups() if v is not None] for m in _COORD_TUPLE.finditer(text)]
+
+
+def numbers_in(text):
+    """Every number written in the text, as floats (for checking a plan against it)."""
+    return [float(n) for n in _NUMBER.findall(text)]
 
 
 # Irregular names for COCO labels ("bottles" already contains "bottle").
@@ -830,6 +1054,15 @@ class SingleDroneRosNode(Node, QObject):
         self.mocap_sub = self.create_subscription(
             Mocap, MOCAP_POSE_TOPIC, self.mocap_callback, self.optitrack_qos_profile, raw=True)
         self._snapshot_request_pose = {}  # request id -> pose when it was sent
+        # Tracked obstacles (OBSTACLE_CONFIG): the raw VRPN pose of each rigid body, in the
+        # same frame as /uav_0/mocap. Each entry is replaced whole (one dict store), so
+        # the GUI thread can read it without the data lock.
+        self.obstacle_poses = {}  # name -> (position xyz, quaternion xyzw, monotonic time)
+        for name, topic in (OBSTACLE_CONFIG.topics() if OBSTACLE_CONFIG is not None else []):
+            self.create_subscription(
+                PoseStamped, topic,
+                lambda msg, name=name: self._on_obstacle_pose(name, msg),
+                self.optitrack_qos_profile)
 
         # Torque-mode CCM pipeline: the pair the CCM actually tracks -- x* from the
         # planner and x from the flight node (the message the model loader evaluates
@@ -1031,6 +1264,10 @@ class SingleDroneRosNode(Node, QObject):
 
     def optitrack_callback(self, _serialized_msg):
         self.data_struct.update_optitrack()
+
+    def _on_obstacle_pose(self, name, msg):
+        p, q = msg.pose.position, msg.pose.orientation
+        self.obstacle_poses[name] = ((p.x, p.y, p.z), (q.x, q.y, q.z, q.w), time.monotonic())
 
     def mocap_callback(self, serialized_msg):
         self._mocap_raw = (serialized_msg, time.monotonic())  # one tuple swap, no lock
@@ -1535,6 +1772,23 @@ class SingleDroneRosThread(QObject):
     def start(self):
         self.thread.start()
     
+    def _audit(self, event, **fields):
+        """One JSON line per LLM decision or action in AUDIT_DIR/<session>.jsonl: what the
+        models said, what the station did and why -- enough to replay a mission. Never
+        raises: a full disk must not take the station down."""
+        audit = getattr(self, '_audit_file', None)
+        if audit is None:
+            return
+        try:
+            record = {'t': round(time.time(), 3),
+                      'time': QDateTime.currentDateTime().toString('hh:mm:ss.zzz'),
+                      'event': event, **fields}
+            audit.write(json.dumps(record, default=str, ensure_ascii=False) + '\n')
+            audit.flush()
+        except (OSError, ValueError) as exc:
+            print(f"[Audit] write failed, audit log off: {exc}")
+            self._audit_file = None
+
     def log_message(self, message):
         """Add timestamped message to GUI logging widget"""
         timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
@@ -1752,6 +2006,30 @@ class SingleDroneRosThread(QObject):
         self._llm.health_checked.connect(self._on_llm_health)
         self._llm.chat_delta.connect(self._on_llm_delta)
         self._llm.chat_finished.connect(self._on_llm_finished)
+        self._llm.parse_finished.connect(self._on_typed_parsed)
+        self._audit_file = None
+        try:
+            os.makedirs(AUDIT_DIR, exist_ok=True)
+            path = os.path.join(AUDIT_DIR, QDateTime.currentDateTime().toString(
+                'yyyyMMdd_hhmmss') + '.jsonl')
+            self._audit_file = open(path, 'a', encoding='utf-8')
+            print(f"[Audit] LLM decisions and setpoints -> {path}")
+        except OSError as exc:
+            print(f"[Audit] cannot open the audit log in {AUDIT_DIR}: {exc}")
+        # Camera checks (the VLM verdict) may go to a cloud model instead: VLM_BACKEND in the
+        # machine config. Planning, parsing and status stay on the local LLM.
+        backend = MACHINE_CONFIG.get('VLM_BACKEND', 'local').strip().lower()
+        self._vlm = None  # None = the local LLM (self._llm) judges the image
+        if backend == 'openrouter':
+            model = MACHINE_CONFIG.get('OPENROUTER_MODEL', '').strip() or 'anthropic/claude-sonnet-5.5'
+            self._vlm = OpenRouterClient(model, parent=self)
+            self._vlm.chat_delta.connect(self._on_vlm_delta)
+            self._vlm.chat_finished.connect(self._on_vlm_finished)
+        elif backend != 'local':
+            print(f"[LLM] unknown VLM_BACKEND {backend!r}; using the local model for camera checks")
+        self._vlm_name = (f"OpenRouter {self._vlm.model}" if self._vlm is not None
+                          else f"local {LLM_MODEL}")
+        print(f"[LLM] camera checks: {self._vlm_name}")
         # disconnected | connecting | loading | online | offline
         self._llm_state = 'disconnected'
         self._llm_warmup = False      # the in-flight chat is the model preload, not a question
@@ -1773,6 +2051,20 @@ class SingleDroneRosThread(QObject):
         self._look_settle_timer = QTimer(self)
         self._look_settle_timer.setInterval(100)
         self._look_settle_timer.timeout.connect(self._look_settle_tick)
+        self._typed = None            # the active typed movement command (see _start_typed), or None
+        self._typed_results = []      # finished typed commands, for the status snapshot
+        self._typed_settle_timer = QTimer(self)
+        self._typed_settle_timer.setInterval(100)
+        self._typed_settle_timer.timeout.connect(self._typed_settle_tick)
+        self._last_object = None      # the last object searched for, for "find it"
+        self._object_memory = []      # sightings with room positions (_remember / _recall)
+        self._mission = None          # the active find-object mission (see _start_mission), or None
+        self._mission_results = []    # finished missions, for the status snapshot
+        self._llm_mission_inflight = False  # the in-flight chat is a mission-plan extraction
+        self._mission_reply = ''
+        self._mission_timer = QTimer(self)
+        self._mission_timer.setInterval(100)
+        self._mission_timer.timeout.connect(self._mission_tick)
         self._llm_health_timer = QTimer(self)
         self._llm_health_timer.setInterval(LLM_HEALTH_INTERVAL_MS)
         self._llm_health_timer.timeout.connect(self._llm.check_health)
@@ -1789,13 +2081,15 @@ class SingleDroneRosThread(QObject):
                   "LLM connection state is shown in the chat log only")
         self.ui.LLM_chatlog.document().setMaximumBlockCount(LLM_CHATLOG_MAX_BLOCKS)
         self.ui.LLM_input.setPlaceholderText(
-            "Ask about the drone's status. Enter sends, Shift+Enter adds a line.")
+            "Ask about the drone's status, or type a move (\"move forward 1 m\", \"hold\"). "
+            "Enter sends, Shift+Enter adds a line.")
         self.ui.LLM_input.installEventFilter(self)
         self.ui.buttom_connect_VLM.clicked.connect(self._toggle_llm_connection)
         self.ui.LLM_send.clicked.connect(self._on_llm_send_clicked)
-        # LLM Control (buttom_LLM_commit_2) gates camera-search moves and is OFF at every
-        # launch; Commit Action (buttom_LLM_commit) sends the one pending move. Optional
-        # like Api_status: without them the search still reports, but never moves.
+        # LLM Control (buttom_LLM_commit_2) gates camera-search and typed moves and is OFF
+        # at every launch; Commit Action (buttom_LLM_commit) sends the one pending move.
+        # Optional like Api_status: without them the search still reports and typed
+        # commands are parsed, but nothing but "hold" ever moves.
         self._llm_control_button = getattr(self.ui, 'buttom_LLM_commit_2', None)
         self._llm_commit_button = getattr(self.ui, 'buttom_LLM_commit', None)
         self._llm_control_label = getattr(self.ui, 'LLM_control_status', None)
@@ -1806,8 +2100,27 @@ class SingleDroneRosThread(QObject):
         else:
             self._llm_control_button.setCheckable(True)
             self._llm_control_button.toggled.connect(self._set_llm_control)
-            self._llm_commit_button.clicked.connect(lambda: self._on_look_move_answer(True))
+            self._llm_commit_button.clicked.connect(self._on_commit_clicked)
+        # Allow Auto Task (buttom_LLM_auto): a mission may only be approved and run while
+        # it is on; OFF at every launch. STOP LLM Control (buttom_LLM_stop): one click, no
+        # dialog -- ends every LLM activity, holds the drone if the LLM was moving it, and
+        # turns both gates off. Optional like the others.
+        self._llm_auto_button = getattr(self.ui, 'buttom_LLM_auto', None)
+        self._llm_stop_button = getattr(self.ui, 'buttom_LLM_stop', None)
+        self._llm_auto = False
+        if self._llm_auto_button is not None:
+            self._llm_auto_button.setCheckable(True)
+            self._llm_auto_button.toggled.connect(self._set_llm_auto)
+        else:
+            print("[LLM] no Allow Auto Task button in single_drone_flight.ui; "
+                  "missions cannot run")
+        if self._llm_stop_button is not None:
+            self._llm_stop_button.setStyleSheet(
+                "QPushButton { background-color: #C62828; color: white; font-weight: bold; }"
+                "QPushButton:pressed { background-color: #8E0000; }")
+            self._llm_stop_button.clicked.connect(self._stop_llm_control)
         self._set_llm_control(False)
+        self._set_llm_auto(False)
         self._update_commit_button()
         self._set_llm_state('disconnected')
 
@@ -1843,7 +2156,11 @@ class SingleDroneRosThread(QObject):
         self._update_llm_buttons()
 
     def _update_llm_buttons(self):
-        answering = (self._llm.busy() and not self._llm_warmup) or self._look is not None
+        # A typed move being parsed or awaiting Commit is "answering" (Send -> Stop); one
+        # already flying is not, so Send stays free for the next command or "hold".
+        typed_open = self._typed is not None and self._typed['phase'] in ('parse', 'confirm')
+        answering = ((self._llm.busy() and not self._llm_warmup) or self._look is not None
+                     or typed_open or self._mission is not None)
         self.ui.LLM_send.setText("Stop" if answering else "Send")
         # A question during the preload is fine: it replaces the preload and loads the
         # model itself.
@@ -1852,12 +2169,18 @@ class SingleDroneRosThread(QObject):
     def _toggle_llm_connection(self):
         if self._llm_state == 'disconnected':
             self._set_llm_state('connecting')
-            self._llm_chat_append(f"Connecting to {LLM_BASE_URL} ...", 'info')
+            config_name = os.path.basename(MACHINE_CONFIG['_path']) or 'no machine config'
+            self._llm_chat_append(f"Connecting to {LLM_BASE_URL} ({config_name}) ...", 'info')
             self._llm.check_health()
             self._llm_health_timer.start()
             return
         self._llm_health_timer.stop()
+        if self._mission is not None:
+            self._abort_mission("Mission stopped: disconnected from the LLM.")
         self._abort_look("Camera search stopped: disconnected from the LLM.")
+        if self._typed is not None and self._typed['phase'] in ('parse', 'confirm'):
+            self._llm.abort_parse('disconnected')
+            self._end_typed("Typed command cancelled: disconnected from the LLM. Nothing was sent.")
         self._set_llm_state('disconnected')  # first, so the abort below reports as such
         if self._llm.busy():
             self._llm.abort_chat('disconnected')
@@ -1916,25 +2239,127 @@ class SingleDroneRosThread(QObject):
                                    "LLM control on" if on else "LLM control off",
                                    STATUS_STYLE['good'] if on else "color: #555555;")
         if changed:
-            self.log_message("LLM control on: camera search may propose moves" if on
-                             else "LLM control off")
+            self.log_message("LLM control on: camera search and typed commands may propose moves"
+                             if on else "LLM control off")
             # Off means the LLM stops acting now: no pending move survives it, and a
             # search mid-move ends (the move already sent is not undone).
             if not on and self._look is not None and self._look['phase'] in ('confirm', 'moving'):
                 self._end_look("Camera search stopped: LLM control was turned off.")
+            if not on and self._typed is not None and self._typed['phase'] == 'confirm':
+                self._end_typed("Typed command cancelled: LLM Control was turned off. "
+                                "Nothing was sent.")
+            if not on and self._mission is not None:
+                self._abort_mission("Mission stopped: LLM Control was turned off.")
+
+    def _set_llm_auto(self, on):
+        on = bool(on) and self._llm_auto_button is not None
+        changed = on != self._llm_auto
+        self._llm_auto = on
+        button = self._llm_auto_button
+        if button is not None:
+            if button.isChecked() != on:
+                button.blockSignals(True)
+                button.setChecked(on)
+                button.blockSignals(False)
+            button.setText("Allow Auto Task: ON" if on else "Allow Auto Task: OFF")
+            button.setStyleSheet("QPushButton { background-color: #2E7D32; color: white; }"
+                                 if on else "")
+        if changed:
+            self.log_message("Auto task allowed: an approved mission may fly its legs itself"
+                             if on else "Auto task not allowed")
+            if not on and self._mission is not None:
+                self._abort_mission("Mission stopped: Allow Auto Task was turned off.")
+
+    def _llm_is_moving_drone(self):
+        """Is an LLM-originated setpoint in progress (so a stop must also hold)?"""
+        return ((self._typed is not None and self._typed['phase'] == 'moving')
+                or (self._look is not None and self._look['phase'] == 'moving')
+                or (self._mission is not None
+                    and self._mission['phase'] not in ('plan', 'confirm')))
+
+    def _stop_llm_control(self):
+        """STOP LLM Control: immediate, no dialog. Everything the LLM is doing ends; if it
+        was moving the drone, the drone holds where it is now."""
+        moving = self._llm_is_moving_drone()
+        if self._mission is not None:
+            self._abort_mission("Mission stopped: STOP LLM Control.", hold=False)
+        self._abort_look("Camera search stopped: STOP LLM Control.")
+        if self._typed is not None:
+            if self._typed['phase'] == 'parse':
+                self._llm.abort_parse('stopped')
+            if self._typed is not None:
+                self._end_typed("Typed command stopped: STOP LLM Control.",
+                                sent=self._typed['phase'] == 'moving')
+        if self._llm.busy() and not self._llm_warmup:
+            self._llm.abort_chat('stopped')
+        held = self._hold_here("STOP LLM Control") if moving else None
+        self._set_llm_auto(False)
+        self._set_llm_control(False)
+        self._llm_chat_append(
+            "STOP LLM Control: LLM control and auto task are off."
+            + (f" Holding at {held}." if held else
+               " The drone was not being moved by the LLM; its setpoint is unchanged."
+               if not moving else " Could not send a hold: use the flight controls."),
+            'error')
+        self.log_message("STOP LLM Control pressed")
+
+    def _hold_here(self, source):
+        """Send the current pose as the setpoint. Returns 'x=.. y=.. z=.. yaw=..' or None."""
+        data = self.ros_object.data_struct
+        if not self.lock.tryLock(50):
+            return None
+        try:
+            odom_time = data.last_update.get('odom', 0.0)
+            pos = (data.current_local_pos.x, data.current_local_pos.y, data.current_local_pos.z)
+            yaw = ((data.current_imu.yaw + 180.0) % 360.0) - 180.0
+        finally:
+            self.lock.unlock()
+        if not odom_time or time.monotonic() - odom_time > 0.5 or pos[2] <= 0.0:
+            return None
+        x, y, z = (round(v, 2) for v in pos)
+        yaw = round(yaw, 1)
+        self._issue_position_command(x, y, z, yaw, source=f"{source} (hold)")
+        return f"x={x:.2f} y={y:.2f} z={z:.2f} yaw={yaw:.1f}"
 
     def _update_commit_button(self):
         button = self._llm_commit_button
         if button is None:
             return
         look = self._look
+        typed = self._typed
+        mission = self._mission
+        if mission is not None and mission['phase'] == 'confirm':
+            button.setEnabled(True)
+            button.setText(f"Commit mission ({len(mission['locations'])} loc)")
+            return
+        if typed is not None and typed['phase'] == 'confirm':
+            button.setEnabled(True)
+            button.setText(f"Commit: {typed['describe']}")
+            return
         pending = look is not None and look['phase'] == 'confirm'
         button.setEnabled(pending)
         button.setText(f"Commit: {look['pending_move'][1]}" if pending else "Commit Action")
 
+    def _on_commit_clicked(self):
+        if self._mission is not None and self._mission['phase'] == 'confirm':
+            self._commit_mission()
+        elif self._typed is not None and self._typed['phase'] == 'confirm':
+            self._commit_typed()
+        else:
+            self._on_look_move_answer(True)
+
     def _on_llm_send_clicked(self):
-        if self._look is not None:
+        if self._mission is not None:
+            # Stop during a mission: end it; if it was flying, hold where the drone is.
+            if self._mission['phase'] == 'plan' and self._llm.busy():
+                self._llm.abort_chat('stopped')
+            self._abort_mission("Mission stopped by the operator.")
+        elif self._look is not None:
             self._abort_look("Camera search stopped by the operator.")
+        elif self._typed is not None and self._typed['phase'] == 'parse':
+            self._llm.abort_parse('stopped')
+        elif self._typed is not None and self._typed['phase'] == 'confirm':
+            self._end_typed("Typed command cancelled by the operator. Nothing was sent.")
         elif self._llm.busy() and not self._llm_warmup:
             self._llm.abort_chat('stopped')
         else:
@@ -1943,6 +2368,34 @@ class SingleDroneRosThread(QObject):
     def _send_llm_question(self):
         text = self.ui.LLM_input.toPlainText().strip()
         if not text or self._llm_state not in ('online', 'loading') or self._look is not None:
+            return
+        if self._typed is not None and self._typed['phase'] == 'parse':
+            return  # the last command is still being parsed
+        if self._mission is not None and self._mission['phase'] != 'confirm':
+            # A mission owns the LLM and the drone. "hold"/"stop" end it here and now;
+            # anything else waits, so a status answer cannot take the model a mission
+            # look needs.
+            self.ui.LLM_input.clear()
+            self._llm_chat_append(f"You: {text}", 'user', bold=True)
+            if _MOVE_HOLD.match(_MOVE_POLITE.sub('', text).strip().rstrip('?.! ')):
+                self._abort_mission("Mission stopped by the operator (hold).")
+            else:
+                self._llm_chat_append("A mission is running. Type \"hold\" or press STOP to "
+                                      "end it; other questions can wait until it finishes.",
+                                      'info')
+            return
+        if parse_mission_request(text):
+            if self._llm.busy():
+                if not self._llm_warmup:
+                    return  # an answer is still streaming
+                self._llm.abort_chat('superseded')
+            self._start_mission(text)
+            return
+        if is_move_request(text):
+            if self._llm.busy() and not self._llm_warmup:
+                return  # an answer is still streaming
+            # Straight to /api/parse; the status model never sees a command.
+            self._start_typed(text)
             return
         if self._llm.busy():
             if not self._llm_warmup:
@@ -1955,6 +2408,10 @@ class SingleDroneRosThread(QObject):
             self.ui.LLM_input.clear()
             self._llm_chat_append(f"You: {text}", 'user', bold=True)
             self._llm_chat_append("LLM: ", 'llm', bold=True)
+            look_object = self._resolve_object(look_object)
+            if look_object is None:
+                self._llm_chat_insert("Which object? Name it, e.g. \"find the red bottle\".")
+                return
             self._start_look(look_object, text)
             return
         snapshot = self._llm_telemetry_snapshot()
@@ -1976,6 +2433,9 @@ class SingleDroneRosThread(QObject):
 
     def _on_llm_delta(self, chunk):
         if self._llm_warmup:
+            return
+        if self._llm_mission_inflight:
+            self._mission_reply += chunk  # a plan is JSON for the GUI, not for display
             return
         if self._llm_look_inflight:
             self._look_reply += chunk  # a verdict is JSON for the GUI, not for display
@@ -2009,6 +2469,12 @@ class SingleDroneRosThread(QObject):
                 self._llm_chat_append(f"Could not load {LLM_MODEL}: {error}", 'error')
                 self._set_llm_state('offline', error)
             return
+        if self._llm_mission_inflight:
+            self._llm_mission_inflight = False
+            if self._mission is not None and self._mission['phase'] == 'plan':
+                self._on_mission_plan(ok, error)
+            self._update_llm_buttons()
+            return
         if self._llm_look_inflight:
             self._llm_look_inflight = False
             if self._look is not None and self._look['phase'] == 'analyze':
@@ -2021,8 +2487,16 @@ class SingleDroneRosThread(QObject):
             action = parse_json_object(self._llm_answer)
             obj = action.get('object') if action and action.get('action') == 'look' else None
             if isinstance(obj, str) and obj.strip():
-                self._start_look(obj.strip()[:60], self._llm_question)
-                return
+                resolved = self._resolve_object(obj.strip()[:60])
+                if resolved is not None and not _LOOK_NOT_OBJECTS.search(resolved):
+                    self._start_look(resolved, self._llm_question)
+                    return
+                # The model routed a question about the drone itself to the camera
+                # (seen 2026-10-22: "did the drone move forward earlier?" -> look for
+                # "the drone's movement history"). Answer from the station's own record.
+                self._llm_answer = self._typed_history_answer()
+                self._llm_pending = self._llm_answer
+                held = False
         if held:
             self._llm_pending = self._llm_answer  # not an action after all: show it as text
         self._flush_llm_text()
@@ -2223,6 +2697,20 @@ class SingleDroneRosThread(QObject):
             snap['recent_camera_checks'] = self._camera_checks[-5:]
         if self._found_objects:
             snap['found_objects'] = self._found_objects[-5:]
+        if self._typed_results:
+            snap['recent_typed_commands'] = self._typed_results[-5:]
+        if self._mission_results:
+            snap['recent_missions'] = self._mission_results[-3:]
+        if self._object_memory:
+            snap['object_memory'] = [
+                {'object': m['object'], 'room_xyz_m': m['room_xyz_m'], 'seen_at': m['time'],
+                 'seen_s_ago': round(now - m['seen'])} for m in self._object_memory[-8:]]
+        if OBSTACLE_CONFIG is not None and OBSTACLE_CONFIG.entries:
+            obstacles, problems = OBSTACLE_CONFIG.resolve(self.ros_object.obstacle_poses, now)
+            snap['known_obstacles'] = {
+                'boxes': [{'name': o.name, 'centre_m': [round(float(v), 2) for v in o.center],
+                           'size_m': [round(float(v), 2) for v in o.size]} for o in obstacles],
+                'problems': problems or None}
         log = self.ui.list_cmd_log
         snap['recent_flight_log'] = [log.item(i).text()
                                      for i in range(max(0, log.count() - 8), log.count())]
@@ -2247,14 +2735,23 @@ class SingleDroneRosThread(QObject):
     # (back to baseline included) stays usable while a move is pending.
     # ------------------------------------------------------------------
 
-    def _start_look(self, obj, question):
+    def _start_look(self, obj, question, mission=False):
+        """A camera search. With mission=True it is one look for a mission: it never
+        proposes moves, and its outcome ('found' / 'not_found' / 'unrecognised' / an
+        error) is handed to _mission_look_done instead of ending in the chat."""
+        if self._typed is not None and self._typed['phase'] == 'confirm':
+            self._end_typed("Typed command cancelled: a camera search started. Nothing was sent.")
+        self._last_object = obj
         self._look = {
             'object': obj, 'question': question, 'moves': 0, 'snapshots': 0,
             'phase': None, 'request_id': None, 'snapshot': None, 'image': None,
             'pending_move': None, 'target': None, 'move_started': None,
-            'settled_since': None,
+            'settled_since': None, 'mission': mission, 'outcome': None, 'record': None,
         }
-        self._llm_chat_insert(f"checking the camera for: {obj}.")
+        if mission:
+            self._llm_chat_append(f"Mission: checking the camera for the {obj} ...", 'info')
+        else:
+            self._llm_chat_insert(f"checking the camera for: {obj}.")
         self._look_capture()
         self._update_llm_buttons()
 
@@ -2295,16 +2792,35 @@ class SingleDroneRosThread(QObject):
         messages = [{'role': 'system', 'content': LOOK_SYSTEM_PROMPT},
                     {'role': 'user', 'content': f"Object to look for: {look['object']}",
                      'images': [response['jpeg_b64']]}]
-        if not self._llm.chat(messages):
-            self._end_look("The LLM is busy; ask again in a moment.", error=True)
-            return
+        client = self._vlm or self._llm
         look['phase'] = 'analyze'
         self._look_reply = ''
-        self._llm_look_inflight = True
-        self._llm_chat_append("VLM: looking at the image ...", 'info')
+        self._llm_look_inflight = self._vlm is None
+        if not client.chat(messages):
+            look['phase'] = 'capture'
+            self._llm_look_inflight = False
+            self._end_look("The LLM is busy; ask again in a moment.", error=True)
+            return
+        self._audit('vlm_request', model=self._vlm_name, object=look['object'],
+                    request_id=look['request_id'],
+                    detections=[{k: d.get(k) for k in ('label', 'confidence', 'position_body')}
+                                for d in response.get('detections') or []],
+                    pose=response.get('_pose_at_request'))
+        self._llm_chat_append(f"VLM ({self._vlm_name}): looking at the image ...", 'info')
+
+    def _on_vlm_delta(self, chunk):
+        if self._look is not None and self._look['phase'] == 'analyze':
+            self._look_reply += chunk
+
+    def _on_vlm_finished(self, ok, error):
+        if self._look is not None and self._look['phase'] == 'analyze':
+            self._on_look_verdict(ok, error)
+        self._update_llm_buttons()
 
     def _on_look_verdict(self, ok, error):
         look = self._look
+        self._audit('vlm_reply', model=self._vlm_name, ok=ok, error=error,
+                    request_id=look['request_id'], reply=self._look_reply)
         if not ok:
             self._end_look(f"The VLM request failed: {error}.", error=True)
             return
@@ -2328,6 +2844,17 @@ class SingleDroneRosThread(QObject):
             self._look_found(match, confirmed=visible)
             return
         classes = snapshot.get('detector_classes') or []
+        if look['mission']:
+            # A mission explores its own list of locations: no relocation moves here.
+            if any(object_matches_label(look['object'], c) for c in classes):
+                look['outcome'] = 'not_found'
+                self._end_look(f"Not in view here (detector saw: "
+                               f"{self._describe_detections(detections)}).")
+            else:
+                look['outcome'] = 'unrecognised'
+                self._end_look(f"The detector cannot recognise a {look['object']} (it detects: "
+                               f"{', '.join(classes) or 'unknown'}), so it cannot be localised.")
+            return
         if not any(object_matches_label(look['object'], c) for c in classes):
             self._end_look(
                 f"The {look['object']} is {'in view' if visible else 'not in view'} "
@@ -2353,6 +2880,14 @@ class SingleDroneRosThread(QObject):
             return
         self._propose_look_move(move, "it sees it, but it is not detected yet" if visible
                                 else "not in view yet")
+
+    def _resolve_object(self, obj):
+        """A pronoun ("it", "that one") means the last object searched for; None if
+        there is none yet. Any other name is returned unchanged."""
+        name = _LOOK_LEADING_WORDS.sub('', obj.strip()).strip() if obj else ''
+        if _LOOK_PRONOUN.match(obj.strip()) or _LOOK_PRONOUN.match(name):
+            return self._last_object
+        return obj
 
     @staticmethod
     def _match_detection(obj, detections):
@@ -2413,6 +2948,9 @@ class SingleDroneRosThread(QObject):
                      f" {abs(up):.2f} m {'above' if up >= 0 else 'below'} the drone.")
         if note:
             text += f" Note: {note}."
+        look['outcome'] = 'found'
+        look['record'] = record
+        self._remember(look['object'], record)
         self._end_look(text, found=True)
 
     @staticmethod
@@ -2466,6 +3004,15 @@ class SingleDroneRosThread(QObject):
         yaw = round(((yaw0 + d_yaw + 180.0) % 360.0) - 180.0, 1)
         if not self._within_geofence(x, y, z):
             self._end_look(f"The VLM suggests to {desc}, but that would leave the geofence.")
+            return
+        planner, problem = self._obstacle_planner()
+        blocker = (None if planner is None
+                   else planner.segment_blocker((x0, y0, z0), (x, y, z)))
+        if planner is None or blocker is not None:
+            self._end_look(f"The VLM suggests to {desc}, but "
+                           + (problem if planner is None else
+                              f"that would come within {planner.margin:.1f} m of "
+                              f"{blocker.describe()}") + ".")
             return
         look['phase'] = 'confirm'
         look['pending_move'] = (move, desc, (x, y, z, yaw), base)
@@ -2592,6 +3139,11 @@ class SingleDroneRosThread(QObject):
         self._camera_checks = (self._camera_checks + [{
             'object': look['object'], 'time': QDateTime.currentDateTime().toString('hh:mm:ss'),
             'result': text}])[-10:]
+        if look['mission']:
+            # The mission keeps its own history entry; it decides what happens next.
+            self._update_llm_buttons()
+            self._mission_look_done(look, text)
+            return
         # History keeps what the model actually replied (the action), so it keeps routing
         # repeat questions to the camera; the result reaches it via recent_camera_checks.
         # (With the result text as its reply, 'did you find a person earlier?' got
@@ -2607,8 +3159,892 @@ class SingleDroneRosThread(QObject):
             return
         analyzing = self._look['phase'] == 'analyze'
         self._end_look(reason)
-        if analyzing and self._llm.busy():
-            self._llm.abort_chat('stopped')  # its finish is ignored: no search is active
+        client = self._vlm or self._llm
+        if analyzing and client.busy():
+            client.abort_chat('stopped')  # its finish is ignored: no search is active
+
+    # ------------------------------------------------------------------
+    # Typed movement commands ("move forward 1 m")
+    #
+    # is_move_request() routes the line here instead of to the status model. Then:
+    #   1. parse: the LLM host's /api/parse (nl_parser on the server) says what the
+    #      sentence means -- a relative move in the drone's heading frame, an absolute
+    #      room position, hold, or a refusal (take off, land, arm, mode changes, anything
+    #      that is not a position change). It knows nothing about the vehicle;
+    #   2. resolve and check, here: from the same base a camera-search move uses (armed,
+    #      OFFBOARD, yaw aligned, OptiTrack, fresh odometry), then the geofence and a
+    #      TYPED_MAX_STEP_M bound;
+    #   3. confirm: with LLM Control on, the move waits on Commit Action; with it off,
+    #      nothing is proposed. "hold" skips both: it holds where the drone is now;
+    #   4. commit re-checks that the drone has not moved since, sends the setpoint, and
+    #      reports arrival or a timeout in the chat. The setpoint is never withdrawn.
+    # ------------------------------------------------------------------
+
+    def _start_typed(self, text):
+        previous = self._typed
+        if previous is not None:
+            # A new command replaces a pending one; a move already flying keeps its
+            # setpoint until this one is sent, but is no longer watched.
+            moving = previous['phase'] == 'moving'
+            self._end_typed("No longer watching the previous move (new command)." if moving
+                            else "Superseded by a new command.", sent=moving)
+        if not self._llm.parse(text):
+            return
+        self._typed = {'text': text, 'phase': 'parse', 'describe': '', 'target': None,
+                       'base': None, 'started': None, 'settled_since': None}
+        self.ui.LLM_input.clear()
+        self._llm_chat_append(f"You: {text}", 'user', bold=True)
+        self._llm_chat_append("LLM: ", 'llm', bold=True)
+        self._llm_chat_insert("reading this as a movement command ...")
+        self._update_llm_buttons()
+
+    def _on_typed_parsed(self, ok, error, result):
+        typed = self._typed
+        if typed is None or typed['phase'] != 'parse':
+            return
+        if not ok:
+            if error in ('stopped', 'disconnected'):
+                self._end_typed("Typed command stopped. Nothing was sent.")
+            else:
+                self._end_typed(f"Could not read the command: {error}. Nothing was sent.",
+                                error=True)
+                self._llm.check_health()
+            return
+        latency = result.get('latency_s')
+        took = f" ({latency:.1f} s)" if isinstance(latency, (int, float)) else ""
+        if result.get('outcome') != 'command':
+            reason = result.get('reason') or 'not a position command'
+            self._end_typed(f"Refused{took}: {reason}. Nothing was sent.")
+            return
+        ctype = result.get('type')
+        fields = result.get('fields') if isinstance(result.get('fields'), dict) else {}
+        describe = str(result.get('describe') or ctype)
+        typed['describe'] = describe
+        try:
+            fields = {k: float(v) for k, v in fields.items()}
+        except (TypeError, ValueError):
+            self._end_typed(f"Refused: the parser returned a non-numeric value ({fields}).",
+                            error=True)
+            return
+        if not all(math.isfinite(v) for v in fields.values()):
+            self._end_typed(f"Refused: the parser returned a non-finite value ({fields}).",
+                            error=True)
+            return
+        if ctype == 'hold':
+            self._typed_hold(took)
+            return
+        if ctype not in ('goto_relative', 'goto_absolute'):
+            # Never guess at a command type this station does not know.
+            self._end_typed(f"Refused: unknown command type {ctype!r}. Nothing was sent.",
+                            error=True)
+            return
+        if not self._llm_control:
+            self._end_typed(f"Understood{took}: {describe}. LLM Control is off, so nothing was "
+                            "proposed. Turn LLM Control on and send the command again.")
+            return
+        base, problem = self._look_move_base()
+        if problem:
+            self._end_typed(f"Understood{took}: {describe}, but {problem}. Nothing was sent.")
+            return
+        x0, y0, z0, yaw0 = base
+        if ctype == 'goto_relative':
+            # Body frame from the parser: dx along the nose, dy to the left, dyaw
+            # anticlockwise -- the same convention as LOOK_MOVES.
+            heading = math.radians(yaw0)
+            d_ahead, d_left = fields.get('dx', 0.0), fields.get('dy', 0.0)
+            x = x0 + d_ahead * math.cos(heading) - d_left * math.sin(heading)
+            y = y0 + d_ahead * math.sin(heading) + d_left * math.cos(heading)
+            z = z0 + fields.get('dz', 0.0)
+            yaw = yaw0 + fields.get('dyaw', 0.0)
+        else:
+            x, y = fields.get('x', x0), fields.get('y', y0)
+            z, yaw = fields.get('z', z0), fields.get('yaw', yaw0)
+        x, y, z = round(x, 2), round(y, 2), round(z, 2)
+        yaw = round(((yaw + 180.0) % 360.0) - 180.0, 1)
+        if not self._within_geofence(x, y, z):
+            self._end_typed(f"Understood{took}: {describe}, but the target x={x:.2f} y={y:.2f} "
+                            f"z={z:.2f} is outside the geofence. Nothing was sent.")
+            return
+        step = math.dist((x0, y0, z0), (x, y, z))
+        if step > TYPED_MAX_STEP_M:
+            self._end_typed(f"Understood{took}: {describe}, but that is a {step:.2f} m move; "
+                            f"one command may move at most {TYPED_MAX_STEP_M:.1f} m. "
+                            "Break it up. Nothing was sent.")
+            return
+        path, waypoints, why = self._route_points(base, (x, y, z, yaw))
+        if path is None:
+            self._end_typed(f"Understood{took}: {describe}, but {why}. Nothing was sent.")
+            return
+        typed['phase'] = 'confirm'
+        typed['target'] = (x, y, z, yaw)
+        typed['base'] = base
+        detour = (f" The route goes around obstacles ({len(waypoints)} waypoints)."
+                  if len(waypoints) > 1 else "")
+        self._llm_chat_append(
+            f"Understood{took}: {describe}. From x={x0:.2f} y={y0:.2f} z={z0:.2f} "
+            f"yaw={yaw0:.1f} to x={x:.2f} y={y:.2f} z={z:.2f} yaw={yaw:.1f}.{detour} "
+            "Click Commit Action to fly it, or Stop.", 'info')
+        self._update_commit_button()
+        self._update_llm_buttons()
+
+    def _typed_hold(self, took):
+        """Hold where the drone is now. No LLM Control or Commit: an abort you have to
+        confirm is an abort you cannot use. Still only while armed and in OFFBOARD."""
+        data = self.ros_object.data_struct
+        if not self.lock.tryLock(50):
+            self._end_typed("Hold not sent: telemetry is busy. Use the flight controls.",
+                            error=True)
+            return
+        try:
+            armed = data.current_state.armed
+            mode = data.current_state.mode or ''
+            odom_time = data.last_update.get('odom', 0.0)
+            pos = (data.current_local_pos.x, data.current_local_pos.y, data.current_local_pos.z)
+            yaw = ((data.current_imu.yaw + 180.0) % 360.0) - 180.0
+        finally:
+            self.lock.unlock()
+        if armed is not True or 'OFFBOARD' not in mode:
+            self._end_typed(f"Hold not sent: the drone is not armed in OFFBOARD "
+                            f"({mode or 'unknown'}).")
+            return
+        if not odom_time or time.monotonic() - odom_time > 0.5:
+            self._end_typed("Hold not sent: there is no current position. Use the flight "
+                            "controls.", error=True)
+            return
+        x, y, z = (round(v, 2) for v in pos)
+        yaw = round(yaw, 1)
+        self._issue_position_command(x, y, z, yaw, source="Typed command (HOLD)")
+        self._end_typed(f"Holding{took} at x={x:.2f} y={y:.2f} z={z:.2f} yaw={yaw:.1f}.",
+                        sent=True)
+
+    def _commit_typed(self):
+        typed = self._typed
+        if typed is None or typed['phase'] != 'confirm':
+            return
+        if not self._llm_control:
+            self._end_typed("Not moving: LLM Control is off.")
+            return
+        # The confirmation may have been open a while: re-check before anything is
+        # sent, and never send a target computed from a pose the drone has since left.
+        now_base, problem = self._look_move_base()
+        if problem:
+            self._end_typed(f"Not moving: {problem}.")
+            return
+        base = typed['base']
+        drift = math.dist(now_base[:3], base[:3])
+        turned = abs(((now_base[3] - base[3] + 180.0) % 360.0) - 180.0)
+        if drift > 0.2 or turned > 10.0:
+            self._end_typed("Not moving: the drone moved while the command was waiting. "
+                            "Send it again for a fresh target.")
+            return
+        # Re-planned from the pose now: a tracked obstacle may have moved since.
+        route = self._start_route(now_base, typed['target'],
+                                  f"Typed command ({typed['describe']})")
+        if isinstance(route, str):
+            self._end_typed(f"Not moving: {route}.")
+            return
+        typed.update(route)
+        typed['phase'] = 'moving'
+        self._llm_chat_append(f"Moving: {typed['describe']} ...", 'info')
+        self._typed_settle_timer.start()
+        self._update_commit_button()
+        self._update_llm_buttons()
+
+    def _typed_settle_tick(self):
+        typed = self._typed
+        if typed is None or typed['phase'] != 'moving':
+            self._typed_settle_timer.stop()
+            return
+        if self._optitrack_ok is False:
+            self._end_typed("OptiTrack was lost during the move. The setpoint is still in "
+                            "force; check the drone.", error=True, sent=True)
+            return
+        state = self._drone_state()
+        if state is None:
+            return  # next tick
+        status = self._route_step(typed, state, f"Typed command ({typed['describe']})")
+        if status == 'arrived':
+            self._end_typed(f"Arrived: {typed['describe']} ({typed['error_m'] * 100:.0f} cm, "
+                            f"{typed['yaw_error']:.0f}° off the target, "
+                            f"{time.monotonic() - typed['started']:.1f} s).", sent=True)
+        elif status is not None:
+            held = self._hold_here("Typed command stopped")
+            self._end_typed(f"Stopped: {status}." + (f" Holding at {held}." if held else ""),
+                            error=True, sent=True)
+
+    # -- routes around known obstacles (typed moves and missions) -----------------
+
+    def _obstacle_planner(self, monitor=False):
+        """(Planner for the arena as it is now, None) or (None, why it is unknown).
+        monitor=True: the true margins only, for checking a flight in progress."""
+        if OBSTACLE_CONFIG is None:
+            return None, "the obstacle file could not be read, so no route can be trusted"
+        obstacles, problems = OBSTACLE_CONFIG.resolve(self.ros_object.obstacle_poses,
+                                                      time.monotonic())
+        if problems:
+            return None, '; '.join(problems)
+        fence = tuple(float(v) for v in self.ros_object.config[:3])
+        return Planner(obstacles, fence, OBSTACLE_CONFIG.margin, OBSTACLE_CONFIG.clearance,
+                       0.0 if monitor else OBSTACLE_CONFIG.tolerance), None
+
+    def _route_points(self, base, target):
+        """A path from base to target around known obstacles: (RoutePath, waypoints, None),
+        or (None, None, why not)."""
+        planner, problem = self._obstacle_planner()
+        if planner is None:
+            return None, None, problem
+        waypoints, why = planner.route(base[:3], target[:3])
+        if waypoints is None:
+            return None, None, why
+        return RoutePath(base, waypoints, target[3]), waypoints, None
+
+    def _start_route(self, base, target, source):
+        """Plan a route and start sliding the setpoint along it. Returns the route state
+        for _route_step, or a string saying why not."""
+        path, waypoints, why = self._route_points(base, target)
+        if path is None:
+            return why
+        self._audit('route', source=source, start=base, target=target, waypoints=waypoints)
+        self.log_message(f"{source}: route to {target[0]:.2f}, {target[1]:.2f}, {target[2]:.2f} "
+                         f"yaw {target[3]:.0f}, {path.length:.2f} m, turn {path.turn:.0f} deg"
+                         + (f", {len(waypoints)} waypoints" if len(waypoints) > 1 else ""))
+        now = time.monotonic()
+        route = {'path': path, 'turned': 0.0, 's': 0.0, 'target': tuple(target),
+                 'settled_since': None, 'started': now, 'last_t': now,
+                 'error_m': None, 'yaw_error': None, 'waypoints': len(waypoints),
+                 'timeout': (MISSION_LEG_TIMEOUT_S + path.length / ROUTE_SPEED_M_S
+                             + abs(path.turn) / ROUTE_YAW_RATE_DEG_S)}
+        self._issue_position_command(*self._route_setpoint(route), source=source, quiet=True)
+        return route
+
+    @staticmethod
+    def _route_setpoint(route):
+        path = route['path']
+        x, y, z = path.point_at(route['s'])
+        yaw = path.heading_at(route['turned'])
+        return round(x, 3), round(y, 3), round(z, 3), round(yaw, 1)
+
+    def _drone_state(self):
+        """(position, yaw) without blocking, or None if the data lock is busy."""
+        data = self.ros_object.data_struct
+        if not self.lock.tryLock():
+            return None
+        pos = (data.current_local_pos.x, data.current_local_pos.y, data.current_local_pos.z)
+        yaw = ((data.current_imu.yaw + 180.0) % 360.0) - 180.0
+        self.lock.unlock()
+        return pos, yaw
+
+    def _route_step(self, route, state, source):
+        """Advance a route one tick: None while flying, 'arrived', or a string saying why it
+        must stop. The reference turns, then slides along the path, and waits for the drone;
+        the stretch from the drone to the reference is re-checked against the obstacles
+        every tick, so one that moves into it (tracked live) triggers a re-plan from here."""
+        pos, yaw = state
+        now = time.monotonic()
+        dt = min(0.5, now - route['last_t'])
+        route['last_t'] = now
+        if now - route['started'] > route['timeout']:
+            return f"the drone did not reach the target within {route['timeout']:.0f} s"
+        planner, problem = self._obstacle_planner(monitor=True)
+        if planner is None:
+            return problem
+        reference = self._route_setpoint(route)
+        if planner.segment_blocker(pos, reference[:3]) is not None:
+            path, waypoints, why = self._route_points((*pos, yaw), route['target'])
+            if path is None:
+                return f"the way ahead is blocked and cannot be re-planned ({why})"
+            self._audit('replan', source=source, at=pos, waypoints=waypoints)
+            self.log_message(f"{source}: re-planned from {pos[0]:.2f}, {pos[1]:.2f}")
+            route.update(path=path, turned=0.0, s=0.0, settled_since=None)
+            self._issue_position_command(*self._route_setpoint(route), source=source, quiet=True)
+            return None
+        path = route['path']
+        if route['turned'] < abs(path.turn):
+            # Turn first, in place; wait while the drone lags the reference heading.
+            if abs(((yaw - reference[3] + 180.0) % 360.0) - 180.0) <= ROUTE_YAW_LEAD_DEG:
+                route['turned'] = min(abs(path.turn), route['turned'] + ROUTE_YAW_RATE_DEG_S * dt)
+            self._issue_position_command(*self._route_setpoint(route), source=source, quiet=True)
+            return None
+        if route['s'] < path.length:
+            if math.dist(pos, reference[:3]) <= ROUTE_LEAD_M:
+                route['s'] = min(path.length, route['s'] + ROUTE_SPEED_M_S * dt)
+            self._issue_position_command(*self._route_setpoint(route), source=source, quiet=True)
+            return None
+        x, y, z, target_yaw = route['target']
+        distance = math.dist(pos, (x, y, z))
+        yaw_error = abs(((yaw - target_yaw + 180.0) % 360.0) - 180.0)
+        if distance <= TYPED_SETTLE_POS_M and yaw_error <= TYPED_SETTLE_YAW_DEG:
+            if route['settled_since'] is None:
+                route['settled_since'] = now
+            elif now - route['settled_since'] >= TYPED_SETTLE_HOLD_S:
+                route['error_m'], route['yaw_error'] = distance, yaw_error
+                self._audit('arrived', source=source, at=pos, error_m=round(distance, 3))
+                return 'arrived'
+            return None
+        route['settled_since'] = None
+        return None
+
+    def _typed_history_answer(self):
+        """Plain-text answer from the station's record of typed commands."""
+        if not self._typed_results:
+            return "No typed movement commands have been sent this session."
+        lines = [f"{r['time']} \"{r['command']}\": {r['result']}" for r in self._typed_results[-3:]]
+        return "From the ground station's record of typed commands: " + " ".join(lines)
+
+    def _end_typed(self, text, error=False, sent=False):
+        typed = self._typed
+        if typed is None:
+            return
+        self._typed = None
+        self._typed_settle_timer.stop()
+        self._update_commit_button()
+        self._llm_chat_append(text, 'error' if error else 'llm')
+        self.log_message(f"Typed command ({typed['text']}): {text}")
+        result = {'command': typed['text'], 'understood_as': typed['describe'] or None,
+                  'sent_to_drone': sent,
+                  'time': QDateTime.currentDateTime().toString('hh:mm:ss'), 'result': text}
+        self._typed_results = (self._typed_results + [result])[-TYPED_COMMANDS_KEPT:]
+        # The status model sees the exchange as plain text, so "did it move?" has an
+        # answer; the details are in recent_typed_commands.
+        self._llm_history += [{'role': 'user', 'content': typed['text']},
+                              {'role': 'assistant', 'content': f"(ground station) {text}"}]
+        self._llm_history = self._llm_history[-2 * LLM_HISTORY_TURNS:]
+        self._update_llm_buttons()
+
+    # ------------------------------------------------------------------
+    # Find-object missions ("find the red bottle; if not in view check (1,1,1), (2,0,1)")
+    #
+    #   plan     the chat model extracts {object, locations} (MISSION_SYSTEM_PROMPT); code
+    #            refuses any location whose numbers are not literally in the operator's
+    #            text, outside the geofence or below MISSION_MIN_Z_M;
+    #   confirm  the plan is shown; Commit Action approves it ONCE, and only while LLM
+    #            Control and Allow Auto Task are both on;
+    #   look     a camera search with mission=True (no relocation moves) from here, then
+    #            from each location in order;
+    #   fly      legs flown along an obstacle-free route (RoutePath: turn, then slide); gates re-checked
+    #            every tick; found -> standoff (MISSION_STANDOFF_*), then a final
+    #            look ('verify'); nothing found -> back to the start pose ('return');
+    #   report   in the chat, the flight log and recent_missions.
+    # Stop / "hold" / STOP LLM Control / LLM Control off / Allow Auto Task off / Disconnect
+    # end it at any stage; once it has flown, ending it also holds the drone where it is.
+    # ------------------------------------------------------------------
+
+    def _start_mission(self, text):
+        if self._typed is not None and self._typed['phase'] == 'confirm':
+            self._end_typed("Typed command cancelled: a mission was requested. Nothing was sent.")
+        if self._mission is not None:
+            self._abort_mission("Superseded by a new mission request.", hold=False)
+        messages = [{'role': 'system', 'content': MISSION_SYSTEM_PROMPT},
+                    {'role': 'user', 'content': text}]
+        if not self._llm.chat(messages):
+            return
+        self._llm_mission_inflight = True
+        self._mission_reply = ''
+        self._mission = {'text': text, 'phase': 'plan', 'object': None, 'locations': [],
+                         'index': -1, 'start': None, 'leg': None, 'found': None, 'log': []}
+        self.ui.LLM_input.clear()
+        self._llm_chat_append(f"You: {text}", 'user', bold=True)
+        self._llm_chat_append("LLM: ", 'llm', bold=True)
+        self._llm_chat_insert("planning the search ...")
+        self._update_llm_buttons()
+
+    def _on_mission_plan(self, ok, error):
+        mission = self._mission
+        if not ok:
+            self._end_mission(f"Could not plan the mission: {error}. Nothing was sent.",
+                              error=True, outcome='not started')
+            return
+        plan = parse_json_object(self._mission_reply)
+        obj = plan.get('object') if plan else None
+        if not isinstance(obj, str) or not obj.strip():
+            self._end_mission("The planner did not read this as a search task. Nothing was sent.",
+                              outcome='not started')
+            return
+        named = obj.strip()[:60]
+        obj = self._resolve_object(named)
+        if obj is None:
+            self._end_mission(f"Which object is \"{named}\"? Name it, e.g. \"find the red bottle; "
+                              "check (1,1,1)\". Nothing was sent.", outcome='not started')
+            return
+        if _LOOK_NOT_OBJECTS.search(obj):
+            self._end_mission(f"Refused: \"{obj}\" is not an object the camera can look for. "
+                              "Nothing was sent.", outcome='not started')
+            return
+        # Locations come from the operator's text, read by code; the model's list is only
+        # a cross-check (logged), never the source.
+        raw = coordinate_tuples(mission['text'])
+        model_locations = plan.get('locations') or []
+        if model_locations != raw:
+            self._audit('mission_plan_mismatch', model_locations=model_locations, text_locations=raw)
+        if len(raw) > MISSION_MAX_LOCATIONS:
+            self._end_mission(f"Refused: the plan must list at most {MISSION_MAX_LOCATIONS} "
+                              "locations. Nothing was sent.", outcome='not started')
+            return
+        written = numbers_in(mission['text'])
+        locations = []
+        for i, loc in enumerate(raw, 1):
+            try:
+                values = [float(v) for v in loc]
+            except (TypeError, ValueError):
+                values = []
+            if len(values) not in (3, 4) or not all(math.isfinite(v) for v in values):
+                self._end_mission(f"Refused: location {i} ({loc}) is not (x, y, z[, yaw]). "
+                                  "Nothing was sent.", outcome='not started')
+                return
+            # The planner only copies; a number the operator never wrote is an invention.
+            invented = [v for v in values if not any(abs(v - w) < 1e-6 for w in written)]
+            if invented:
+                self._end_mission(f"Refused: location {i} {values} contains numbers that are "
+                                  f"not in your text ({invented}). Nothing was sent.",
+                                  error=True, outcome='not started')
+                return
+            x, y, z = (round(v, 2) for v in values[:3])
+            yaw = values[3] if len(values) == 4 else MISSION_STANDOFF_YAW_DEG
+            yaw = round(((yaw + 180.0) % 360.0) - 180.0, 1)
+            if z < MISSION_MIN_Z_M or not self._within_geofence(x, y, z):
+                self._end_mission(f"Refused: location {i} ({x}, {y}, {z}) is outside the "
+                                  f"geofence or below {MISSION_MIN_Z_M} m. Nothing was sent.",
+                                  outcome='not started')
+                return
+            locations.append((x, y, z, yaw))
+        planner, problem = self._obstacle_planner()
+        if planner is None:
+            self._end_mission(f"Refused: {problem}. Nothing was sent.", outcome='not started')
+            return
+        for i, loc in enumerate(locations, 1):
+            ob = planner.blocker(loc[:3])
+            if ob is not None:
+                self._end_mission(f"Refused: location {i} ({loc[0]}, {loc[1]}, {loc[2]}) is "
+                                  f"within {planner.margin:.1f} m of {ob.describe()}. "
+                                  "Nothing was sent.", outcome='not started')
+                return
+        room = not locations and bool(_ROOM_SEARCH.search(mission['text']))
+        if room:
+            locations, why = self._room_viewpoints(planner)
+            if why:
+                self._end_mission(f"Refused: {why}. Nothing was sent.", outcome='not started')
+                return
+        recall = self._recall(obj)
+        mission.update(object=obj, locations=locations, phase='confirm', room=room,
+                       recall=recall)
+        self._audit('mission_plan', task=mission['text'], model_reply=self._mission_reply,
+                    object=obj, locations=locations, room_search=room, recall=recall)
+        scan = ', '.join(f"{h:.0f}" for h in MISSION_SCAN_HEADINGS_DEG)
+        steps = []
+        if recall is not None:
+            rx, ry, rz = recall['room_xyz_m']
+            steps.append(f"{len(steps) + 1}. Seen {recall['age_s']:.0f} s ago at x={rx:.2f} "
+                         f"y={ry:.2f} z={rz:.2f}: fly to its standoff point and check there first.")
+        steps.append(f"{len(steps) + 1}. Look for the {obj} from where the drone is now.")
+        for x, y, z, yaw in locations:
+            steps.append(f"{len(steps) + 1}. If not found: fly to x={x:.2f} y={y:.2f} z={z:.2f} "
+                         f"and look.")
+        limit = MISSION_ROOM_MAX_S if room else MISSION_MAX_S
+        self._llm_chat_append(
+            f"Mission plan: find the {obj}"
+            + (f" ({len(locations)} viewpoints generated over the arena)" if room else "")
+            + ".\n" + "\n".join(steps) + "\n"
+            f"Each look scans headings {scan} deg (relative to the location's yaw) until it "
+            "finds it. Legs go around known obstacles.\n"
+            f"If found: fly {MISSION_STANDOFF_BACK_M:.1f} m behind it (-x) and "
+            f"{MISSION_STANDOFF_UP_M:.1f} m above it, facing yaw "
+            f"{MISSION_STANDOFF_YAW_DEG:.0f}, and look again to confirm.\n"
+            "If it is not found anywhere: return to where the mission started and report.\n"
+            f"Limits: {limit / 60:.0f} min, return below {MISSION_RETURN_BATTERY_PCT:.0f}% "
+            "battery.\n"
+            "Approve with Commit Action (LLM Control and Allow Auto Task must both be ON). "
+            "Stop, \"hold\" or STOP LLM Control end it at any time.", 'info')
+        self._update_commit_button()
+        self._update_llm_buttons()
+
+    def _room_viewpoints(self, planner):
+        """Viewpoints over the geofence for "search the room": (list, None) or (None, why)."""
+        fx, fy = (float(v) for v in self.ros_object.config[:2])
+        xs = np.linspace(-(fx - MISSION_ROOM_INSET_M), fx - MISSION_ROOM_INSET_M,
+                         max(1, int(math.ceil(2 * (fx - MISSION_ROOM_INSET_M)
+                                              / MISSION_ROOM_SPACING_M)) + 1))
+        ys = np.linspace(-(fy - MISSION_ROOM_INSET_M), fy - MISSION_ROOM_INSET_M,
+                         max(1, int(math.ceil(2 * (fy - MISSION_ROOM_INSET_M)
+                                              / MISSION_ROOM_SPACING_M)) + 1))
+        points = [(round(float(x), 2), round(float(y), 2), MISSION_ROOM_Z_M)
+                  for x in xs for y in ys]
+        points = [p for p in points if planner.blocker(p) is None
+                  and self._within_geofence(*p)]
+        if not points:
+            return None, "no viewpoint in the arena is clear of obstacles"
+        if len(points) > MISSION_ROOM_MAX_POINTS:
+            return None, (f"the room search would need {len(points)} viewpoints (limit "
+                          f"{MISSION_ROOM_MAX_POINTS}); list the places to check instead")
+        base, problem = self._look_move_base()
+        here = base[:3] if base else (0.0, 0.0, MISSION_ROOM_Z_M)
+        ordered = []
+        while points:  # nearest first
+            nxt = min(points, key=lambda p: math.dist(here, p))
+            points.remove(nxt)
+            ordered.append(nxt + (MISSION_STANDOFF_YAW_DEG,))
+            here = nxt
+        return ordered, None
+
+    def _remember(self, obj, record):
+        """Keep a sighting with a room position (object memory)."""
+        if record.get('room_xyz_m') is None:
+            return
+        self._object_memory = ([m for m in self._object_memory if m['object'] != obj]
+                               + [{'object': obj, 'label': record.get('detector_label'),
+                                   'room_xyz_m': record['room_xyz_m'],
+                                   'seen': time.monotonic(), 'time': record.get('time')}])[-20:]
+
+    def _recall(self, obj):
+        """The latest sighting of this object younger than MISSION_MEMORY_MAX_AGE_S, or None.
+        Names must agree word for word ("bottle" recalls "red bottle", never "blue bottle")."""
+        words = set(obj.lower().split())
+        now = time.monotonic()
+        for m in reversed(self._object_memory):
+            if now - m['seen'] > MISSION_MEMORY_MAX_AGE_S:
+                continue
+            if words <= set(m['object'].lower().split()) or m['object'].lower() == obj.lower():
+                return {'object': m['object'], 'room_xyz_m': m['room_xyz_m'],
+                        'age_s': round(now - m['seen'], 1)}
+        return None
+
+    def _forget(self, obj):
+        self._object_memory = [m for m in self._object_memory if m['object'] != obj]
+
+    def _battery_pct(self):
+        """PX4 battery remaining in %, or None if unknown."""
+        data = self.ros_object.data_struct
+        if not self.lock.tryLock(50):
+            return None
+        try:
+            if 'battery' not in data.last_update:
+                return None
+            fraction = data.current_battery_status.percentage
+        finally:
+            self.lock.unlock()
+        return None if fraction is None or fraction < 0 else fraction * 100.0
+
+    def _mission_gate(self):
+        """None if the mission may send its next setpoint, else why not."""
+        if not self._llm_control:
+            return "LLM Control is off"
+        if not self._llm_auto:
+            return "Allow Auto Task is off"
+        _, problem = self._look_move_base()
+        return problem
+
+    def _commit_mission(self):
+        mission = self._mission
+        if mission is None or mission['phase'] != 'confirm':
+            return
+        if not (self._llm_control and self._llm_auto):
+            self._llm_chat_append("Not started: turn on LLM Control and Allow Auto Task, then "
+                                  "click Commit Action again.", 'info')
+            return
+        base, problem = self._look_move_base()
+        if problem:
+            self._end_mission(f"Not started: {problem}. Nothing was sent.", outcome='not started')
+            return
+        battery = self._battery_pct()
+        if battery is not None and battery < MISSION_MIN_BATTERY_START_PCT:
+            self._end_mission(f"Not started: battery {battery:.0f}% is below "
+                              f"{MISSION_MIN_BATTERY_START_PCT:.0f}%. Nothing was sent.",
+                              outcome='not started')
+            return
+        mission['start'] = base
+        mission['started'] = time.monotonic()
+        mission['limit_s'] = MISSION_ROOM_MAX_S if mission.get('room') else MISSION_MAX_S
+        mission['returning'] = False
+        # Viewpoints to explore: here first, then the locations. Each is scanned through
+        # MISSION_SCAN_HEADINGS_DEG starting from the heading the drone already faces there.
+        mission['viewpoints'] = [tuple(base)] + list(mission['locations'])
+        mission['vp'] = -1
+        self.log_message(f"Mission approved: find the {mission['object']}, "
+                         f"{len(mission['locations'])} location(s)")
+        self._audit('mission_start', object=mission['object'], start=base, battery_pct=battery,
+                    viewpoints=mission['viewpoints'], recall=mission.get('recall'))
+        self._llm_chat_append(f"Mission started. Start point x={base[0]:.2f} y={base[1]:.2f} "
+                              f"z={base[2]:.2f} yaw={int(round(base[3]))}"
+                              + (f", battery {battery:.0f}%" if battery is not None else "")
+                              + ".", 'info')
+        self._update_commit_button()
+        recall = mission.get('recall')
+        if recall is not None:
+            self._mission_fly(self._standoff_of(recall['room_xyz_m']), 'recall')
+        else:
+            self._mission_next_viewpoint()
+
+    @staticmethod
+    def _standoff_of(xyz):
+        return (round(xyz[0] - MISSION_STANDOFF_BACK_M, 2), round(xyz[1], 2),
+                round(max(MISSION_MIN_Z_M, xyz[2] + MISSION_STANDOFF_UP_M), 2),
+                MISSION_STANDOFF_YAW_DEG)
+
+    def _mission_next_viewpoint(self):
+        mission = self._mission
+        mission['vp'] += 1
+        if mission['vp'] >= len(mission['viewpoints']):
+            self._mission_return(f"not found at the start or any of the "
+                                 f"{len(mission['locations'])} location(s)")
+            return
+        x, y, z, yaw = mission['viewpoints'][mission['vp']]
+        mission['headings'] = [((yaw + h + 180.0) % 360.0) - 180.0 for h in MISSION_SCAN_HEADINGS_DEG]
+        mission['h'] = 0
+        if mission['vp'] == 0:
+            # Here: start with the heading the drone already faces, then the others.
+            mission['headings'][0] = round(yaw, 1)
+            self._mission_look('look')
+        else:
+            self._mission_fly((x, y, z, mission['headings'][0]), 'location')
+
+    def _mission_next_heading(self):
+        mission = self._mission
+        mission['h'] += 1
+        if mission['h'] >= len(mission['headings']):
+            self._mission_next_viewpoint()
+            return
+        x, y, z, _ = mission['viewpoints'][mission['vp']]
+        if mission['vp'] == 0:
+            x, y, z = mission['start'][:3]
+        self._mission_fly((x, y, z, round(mission['headings'][mission['h']], 1)), 'turn')
+
+    def _mission_look(self, phase):
+        mission = self._mission
+        mission['phase'] = phase
+        self._start_look(mission['object'], mission['text'], mission=True)
+        self._update_llm_buttons()
+
+    def _mission_where(self):
+        mission = self._mission
+        if mission['phase'] == 'verify':
+            return 'standoff'
+        if mission['phase'] == 'recall':
+            return 'remembered spot'
+        vp = mission.get('vp', -1)
+        place = 'start' if vp <= 0 else f"location {vp}"
+        headings = mission.get('headings')
+        return f"{place}, heading {headings[mission['h']]:.0f}" if headings else place
+
+    def _mission_look_done(self, look, text):
+        mission = self._mission
+        if mission is None or mission['phase'] not in ('look', 'verify', 'recall'):
+            return  # the mission ended while this look was running
+        outcome = look['outcome']
+        where = self._mission_where()
+        mission['log'].append(f"{where}: {outcome or 'error'}")
+        self._audit('mission_look', where=where, outcome=outcome, text=text,
+                    record=look.get('record'))
+        if outcome is None:
+            self._abort_mission(f"Mission stopped: the camera check failed ({text}).")
+            return
+        obj = mission['object']
+        if outcome == 'found' and look['record']:
+            self._remember(obj, look['record'])
+        if mission['phase'] == 'verify':
+            xyz = mission['found']
+            confirmed = outcome == 'found'
+            self._end_mission(
+                f"Mission complete: found the {obj} at room x={xyz[0]:.2f} y={xyz[1]:.2f} "
+                f"z={xyz[2]:.2f}. The drone is holding at the standoff point; the final look "
+                + ("confirmed it." if confirmed else f"did NOT confirm it ({text})."),
+                outcome='found' if confirmed else 'found, not confirmed', found=True)
+            return
+        if outcome == 'unrecognised':
+            self._mission_return(f"the detector cannot recognise a {obj}")
+            return
+        if outcome == 'found':
+            xyz = (look['record'] or {}).get('room_xyz_m')
+            if xyz is None:
+                note = (look['record'] or {}).get('note', 'no room position')
+                self._end_mission(f"Found the {obj} at the {where}, but without a room position "
+                                  f"({note}). Holding here.", error=True,
+                                  outcome='found, no position', found=True)
+                return
+            mission['found'] = xyz
+            standoff = self._standoff_of(xyz)
+            if not self._within_geofence(*standoff[:3]):
+                self._end_mission(f"Found the {obj} at room x={xyz[0]:.2f} y={xyz[1]:.2f} "
+                                  f"z={xyz[2]:.2f}, but the standoff point is outside the "
+                                  "geofence. Holding here.", outcome='found, no standoff',
+                                  found=True)
+                return
+            self._mission_fly(standoff, 'standoff')
+            return
+        if mission['phase'] == 'recall':
+            self._forget(obj)
+            self._llm_chat_append(f"Mission: the {obj} is no longer at the remembered spot; "
+                                  "searching.", 'info')
+            # Explore from here: this spot replaces the start as the first viewpoint.
+            mission['viewpoints'][0] = tuple(self._look_move_base()[0] or mission['start'])
+            mission['vp'] = -1
+            self._mission_next_viewpoint()
+            return
+        self._mission_next_heading()
+
+    def _mission_return(self, why):
+        mission = self._mission
+        mission['why'] = why
+        mission['returning'] = True
+        self._llm_chat_append(f"Mission: {why}; returning to the start.", 'info')
+        self._mission_fly(mission['start'], 'return')
+
+    def _mission_fly(self, target, purpose):
+        mission = self._mission
+        problem = self._mission_gate()
+        if problem:
+            self._abort_mission(f"Mission stopped before the next leg: {problem}.")
+            return
+        base, _ = self._look_move_base()
+        label = {'location': f"location {mission.get('vp', 0)}", 'turn': 'the next heading',
+                 'standoff': 'the standoff point', 'recall': 'the remembered spot',
+                 'return': 'the start'}[purpose]
+        route = self._start_route(base, target, f"Mission leg to {label}")
+        if isinstance(route, str):
+            if purpose in ('location', 'turn'):
+                self._llm_chat_append(f"Mission: cannot reach {label} ({route}); skipping it.",
+                                      'info')
+                if purpose == 'location':
+                    self._mission_next_viewpoint()
+                else:
+                    self._mission_next_heading()
+            elif purpose == 'recall':
+                self._llm_chat_append(f"Mission: cannot reach the remembered spot ({route}); "
+                                      "searching instead.", 'info')
+                self._mission_next_viewpoint()
+            elif purpose == 'standoff':
+                xyz = mission['found']
+                self._end_mission(f"Found the {mission['object']} at room x={xyz[0]:.2f} "
+                                  f"y={xyz[1]:.2f} z={xyz[2]:.2f}, but cannot reach the standoff "
+                                  f"point ({route}). Holding here.", outcome='found, no standoff',
+                                  found=True)
+            else:
+                self._abort_mission(f"Mission stopped: cannot route back to the start ({route}).")
+            return
+        route['purpose'] = purpose
+        mission['leg'] = route
+        mission['phase'] = 'fly'
+        if purpose != 'turn':
+            x, y, z, yaw = target
+            via = (f", around obstacles via {route['waypoints']} waypoints"
+                   if route['waypoints'] > 1 else "")
+            self._llm_chat_append(f"Mission: flying to {label} (x={x:.2f} y={y:.2f} z={z:.2f} "
+                                  f"yaw={yaw:.0f}{via}) ...", 'info')
+        self._mission_timer.start()
+        self._update_llm_buttons()
+
+    def _mission_limit(self):
+        """Why the mission must head home now (time cap, battery), or None."""
+        mission = self._mission
+        if mission.get('returning') or mission.get('found') is not None:
+            return None  # going home already, or found: finish the standoff and the check
+        elapsed = time.monotonic() - mission['started']
+        if elapsed > mission['limit_s']:
+            return f"the {mission['limit_s'] / 60:.0f}-minute limit was reached"
+        battery = self._battery_pct()
+        if battery is not None and battery < MISSION_RETURN_BATTERY_PCT:
+            return f"battery is at {battery:.0f}%"
+        return None
+
+    def _mission_tick(self):
+        mission = self._mission
+        if mission is None or mission['phase'] != 'fly':
+            self._mission_timer.stop()
+            return
+        if self._optitrack_ok is False:
+            self._abort_mission("Mission stopped: OptiTrack was lost.")
+            return
+        if not (self._llm_control and self._llm_auto):
+            self._abort_mission("Mission stopped: LLM Control or Allow Auto Task was turned off.")
+            return
+        data = self.ros_object.data_struct
+        if not self.lock.tryLock():
+            return  # next tick
+        armed = data.current_state.armed
+        mode = data.current_state.mode or ''
+        odom_time = data.last_update.get('odom', 0.0)
+        pos = (data.current_local_pos.x, data.current_local_pos.y, data.current_local_pos.z)
+        yaw = ((data.current_imu.yaw + 180.0) % 360.0) - 180.0
+        self.lock.unlock()
+        if armed is not True or 'OFFBOARD' not in mode:
+            self._abort_mission(f"Mission stopped: the drone left armed OFFBOARD "
+                                f"({mode or 'unknown'}).", hold=False)
+            return
+        if not odom_time or time.monotonic() - odom_time > MISSION_FEED_STALE_S:
+            # The station no longer sees the drone: stop sending setpoints. The drone keeps
+            # its last one, at most ROUTE_LEAD_M ahead of where it was.
+            self._abort_mission("Mission stopped: the drone's position feed went stale.",
+                                hold=False)
+            return
+        limit = self._mission_limit()
+        if limit is not None:
+            self._mission_timer.stop()
+            self._mission_return(limit)
+            return
+        leg = mission['leg']
+        status = self._route_step(leg, (pos, yaw), f"Mission leg ({leg['purpose']})")
+        if status == 'arrived':
+            self._mission_timer.stop()
+            self._mission_arrived(leg)
+        elif status is not None:
+            self._abort_mission(f"Mission stopped: {status}.")
+
+    def _mission_arrived(self, leg):
+        mission = self._mission
+        limit = self._mission_limit()
+        if limit is not None and leg['purpose'] != 'return':
+            self._mission_return(limit)
+            return
+        purpose = leg['purpose']
+        if purpose in ('location', 'turn'):
+            self._mission_look('look')
+        elif purpose == 'recall':
+            self._mission_look('recall')
+        elif purpose == 'standoff':
+            self._mission_look('verify')
+        else:
+            start = mission['start']
+            self._end_mission(
+                f"Mission finished without the {mission['object']}: "
+                f"{mission.get('why', 'not found')}. "
+                f"Back at the start (x={start[0]:.2f} y={start[1]:.2f} z={start[2]:.2f}).",
+                outcome='not found')
+
+    def _abort_mission(self, reason, hold=True):
+        mission = self._mission
+        if mission is None:
+            return
+        flown = mission['phase'] not in ('plan', 'confirm')
+        # Cleared first: the look aborted below then finds no mission to report to.
+        self._mission = None
+        self._mission_timer.stop()
+        if mission['phase'] == 'plan' and self._llm_mission_inflight and self._llm.busy():
+            self._llm.abort_chat('stopped')
+        self._abort_look("Mission camera check stopped.")
+        held = self._hold_here("Mission stopped") if hold and flown else None
+        text = reason + (f" Holding at {held}." if held else
+                         ("" if flown else " Nothing was sent."))
+        self._finish_mission(mission, text, error=True, outcome='stopped')
+
+    def _end_mission(self, text, error=False, outcome='', found=False):
+        mission = self._mission
+        if mission is None:
+            return
+        self._mission = None
+        self._mission_timer.stop()
+        self._finish_mission(mission, text, error=error, outcome=outcome, found=found)
+
+    def _finish_mission(self, mission, text, error=False, outcome='', found=False):
+        self._update_commit_button()
+        self._llm_chat_append(text, 'error' if error else 'llm', bold=found)
+        self.log_message(f"Mission ({mission['object'] or mission['text']}): {text}")
+        self._mission_results = (self._mission_results + [{
+            'task': mission['text'], 'object': mission['object'], 'outcome': outcome,
+            'found_room_xyz_m': mission['found'], 'looks': mission['log'],
+            'time': QDateTime.currentDateTime().toString('hh:mm:ss'), 'result': text,
+        }])[-MISSION_RESULTS_KEPT:]
+        self._llm_history += [{'role': 'user', 'content': mission['text']},
+                              {'role': 'assistant', 'content': f"(ground station) {text}"}]
+        self._llm_history = self._llm_history[-2 * LLM_HISTORY_TURNS:]
+        self._update_llm_buttons()
 
     # ------------------------------------------------------------------
     # Controller tab
@@ -3954,12 +5390,14 @@ class SingleDroneRosThread(QObject):
                 and abs(y) <= float(self.ros_object.config[1])
                 and abs(z) <= float(self.ros_object.config[2]) and z > 0)
 
-    def _issue_position_command(self, x, y, z, yaw, source="Position command sent"):
+    def _issue_position_command(self, x, y, z, yaw, source="Position command sent", quiet=False):
         """The one way a position setpoint leaves the GUI (operator or camera search)."""
         # Queued, not published inline: this runs on the Qt thread and must not touch
         # rclpy. It is issued by _drain_requests() on the next ROS tick (<=33 ms).
         self.ros_object.queue_coordinates(x, y, z, yaw)
-        self.log_message(f"{source}: {x}, {y}, {z}, {yaw}")
+        if not quiet:  # route followers stream at 10 Hz and log their start and end instead
+            self.log_message(f"{source}: {x}, {y}, {z}, {yaw}")
+            self._audit('setpoint', source=source, x=x, y=y, z=z, yaw=yaw)
 
         # Update the dashed command lines in the X/Y/Z plot to the setpoint sent.
         self._last_x_cmd = x

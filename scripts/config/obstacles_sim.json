@@ -1,0 +1,15 @@
+{
+  "_readme": [
+    "Isaac test arena: tracked through /vrpn_mocap/<name>/pose, which the",
+    "isaacsim_vision_emulator publishes from its config/objects.yaml (pivot on the top",
+    "centre, like markers on a lid). Sizes MUST match that file's."
+  ],
+  "margin_m": 0.7,
+  "tracking_tolerance_m": 0.15,
+  "clearance_m": 0.4,
+  "stale_s": 1.0,
+  "obstacles": [
+    {"name": "pillar", "topic": "/vrpn_mocap/pillar/pose", "size": [0.3, 0.3, 1.6]},
+    {"name": "chair", "topic": "/vrpn_mocap/chair/pose", "size": [0.5, 0.5, 0.9]}
+  ]
+}

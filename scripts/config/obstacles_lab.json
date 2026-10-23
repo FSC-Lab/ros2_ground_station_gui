@@ -1,0 +1,28 @@
+{
+  "_readme": [
+    "Known obstacles in the OptiTrack arena, for the LLM features' route planning",
+    "(typed moves, camera-search moves, missions). Manual position commands are not checked.",
+    "Each obstacle is an upright box. Track it live: make a Motive rigid body for it",
+    "(markers on the lid), stream it, and give its name as /vrpn_mocap/<name>/pose.",
+    "size = [x, y, z] of the box in metres, in the rigid body's own (yaw) frame.",
+    "center_offset = vector from the rigid body pivot to the box centre, same frame;",
+    "default [0, 0, -size_z/2] = pivot on the top centre (set the pivot there in Motive).",
+    "Fixed boxes instead: give \"position\" (box centre) and \"yaw_deg\" in place of topic.",
+    "A tracked obstacle with no pose for stale_s seconds blocks every LLM route.",
+    "margin_m: how far the drone centre stays from a box footprint (T650 ~0.65 m tip to tip).",
+    "clearance_m: drone centre over (or under) a box's top; 0.4 leaves room for the landing gear",
+    "  (gear height NOT measured -- check it on the real T650 and raise this if needed).",
+    "tracking_tolerance_m: routes are planned this much beyond margin_m, for the controller's",
+    "tracking error (sim: 0.12 m overshoot measured); what is flown then stays outside margin_m.",
+    "margin_m 0.7 from the drone centre leaves ~0.19 m between the T650's prop tips and the box."
+  ],
+  "margin_m": 0.7,
+  "tracking_tolerance_m": 0.15,
+  "clearance_m": 0.4,
+  "stale_s": 1.0,
+  "obstacles": [],
+  "_example_obstacles": [
+    {"name": "box1", "topic": "/vrpn_mocap/box1/pose", "size": [0.6, 0.4, 0.8]},
+    {"name": "net_pole", "position": [-4.5, 4.5, 1.5], "yaw_deg": 0, "size": [0.1, 0.1, 3.0]}
+  ]
+}

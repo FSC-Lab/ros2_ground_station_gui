@@ -27,8 +27,9 @@ Everything here runs on the Qt GUI thread without blocking it: QNetworkAccessMan
 is asynchronous and reports through signals. Nothing in this module touches rclpy.
 """
 import json
+import os
 
-from PyQt5.QtCore import QObject, QUrl, pyqtSignal
+from PyQt5.QtCore import QObject, QTimer, QUrl, pyqtSignal
 from PyQt5.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
 
@@ -44,8 +45,11 @@ class LlmClient(QObject):
     health_checked = pyqtSignal(bool, str, dict)  # ok, error text, parsed /api/health
     chat_delta = pyqtSignal(str)                   # next chunk of the answer
     chat_finished = pyqtSignal(bool, str)          # ok, error text ("" on success)
+    parse_finished = pyqtSignal(bool, str, dict)   # ok, error text, parsed /api/parse reply
 
     HEALTH_TIMEOUT_MS = 5000
+    # /api/parse answers in one piece (~0.5 s warm); the bound covers a model reload.
+    PARSE_TIMEOUT_MS = 30000
     # Inactivity timeout: Qt restarts it whenever bytes arrive, so it bounds a stall,
     # not the length of an answer. The first token takes 5-10 s when the model has to
     # reload (it unloads after 5 min idle).
@@ -61,9 +65,14 @@ class LlmClient(QObject):
         self._chat_buffer = b''
         self._chat_error = ''
         self._chat_done = False
+        self._parse_reply = None
+        self._parse_error = ''
 
     def busy(self):
         return self._chat_reply is not None
+
+    def parse_busy(self):
+        return self._parse_reply is not None
 
     # -- health ------------------------------------------------------------------
 
@@ -93,6 +102,62 @@ class LlmClient(QObject):
             self.health_checked.emit(False, 'server reports it is down', health)
         else:
             self.health_checked.emit(True, '', health)
+
+    # -- parse -------------------------------------------------------------------
+
+    def parse(self, utterance):
+        """Start a /api/parse request (sentence -> drone command); False if one is
+        already running. The server runs nl_parser (aerial_robtoics+vlm): the model
+        picks a direction label and an unsigned amount, the sign table is code. The
+        reply only says what the sentence means -- resolving it against the vehicle's
+        pose and every safety check stay with the caller.
+        """
+        if self._parse_reply is not None:
+            return False
+        request = QNetworkRequest(QUrl(self.base_url + '/api/parse'))
+        request.setHeader(QNetworkRequest.ContentTypeHeader, 'application/json')
+        request.setTransferTimeout(self.PARSE_TIMEOUT_MS)
+        body = json.dumps({'utterance': utterance, 'model': self.model,
+                           'schema': 'enum', 'constrain': True})
+        reply = self._nam.post(request, body.encode('utf-8'))
+        self._parse_reply = reply
+        self._parse_error = ''
+        reply.finished.connect(lambda: self._on_parse_finished(reply))
+        return True
+
+    def abort_parse(self, reason='stopped'):
+        reply = self._parse_reply
+        if reply is None:
+            return
+        self._parse_error = reason
+        reply.abort()
+        if self._parse_reply is reply:
+            self._on_parse_finished(reply)
+
+    def _on_parse_finished(self, reply):
+        reply.deleteLater()
+        if reply is not self._parse_reply:
+            return
+        self._parse_reply = None
+        if self._parse_error:
+            self.parse_finished.emit(False, self._parse_error, {})
+            return
+        # The server answers errors with a JSON body too (HTTP 502 for a parser that
+        # could not run), so read the body before looking at the HTTP status.
+        result = None
+        if reply.isOpen():
+            try:
+                result = json.loads(bytes(reply.readAll()))
+            except ValueError:
+                result = None
+        if isinstance(result, dict) and result.get('outcome') in ('command', 'refusal'):
+            self.parse_finished.emit(True, '', result)
+        elif isinstance(result, dict) and (result.get('reason') or result.get('error')):
+            self.parse_finished.emit(False, str(result.get('reason') or result.get('error')), result)
+        elif reply.error() != QNetworkReply.NoError:
+            self.parse_finished.emit(False, self._describe_error(reply), {})
+        else:
+            self.parse_finished.emit(False, 'unreadable reply from /api/parse', {})
 
     # -- chat --------------------------------------------------------------------
 
@@ -180,3 +245,124 @@ class LlmClient(QObject):
         if status:
             return f'HTTP {status}'
         return reply.errorString()
+
+
+OPENROUTER_KEY_FILE = os.path.expanduser('~/.config/fsc_gs/openrouter_key')
+
+
+def openrouter_key():
+    """The OpenRouter API key: $OPENROUTER_API_KEY, else the first line of
+    ~/.config/fsc_gs/openrouter_key. Never kept in the repo or the machine config."""
+    key = os.environ.get('OPENROUTER_API_KEY', '').strip()
+    if key:
+        return key
+    try:
+        with open(OPENROUTER_KEY_FILE) as fh:
+            return fh.readline().strip()
+    except OSError:
+        return ''
+
+
+class OpenRouterClient(QObject):
+    """A cloud VLM for camera checks, with LlmClient's chat interface (chat, busy,
+    abort_chat, chat_delta, chat_finished) so the camera search can use either.
+
+    OpenRouter's OpenAI-compatible /chat/completions, not streamed (a verdict is two short
+    lines). Messages come in Ollama form -- an 'images' list of base64 JPEGs -- and are
+    converted to OpenAI content parts here. temperature 0: the same frame should get the
+    same verdict. Every call sends the camera frame off-site.
+    """
+
+    chat_delta = pyqtSignal(str)
+    chat_finished = pyqtSignal(bool, str)
+    TIMEOUT_MS = 30000
+    BASE_URL = 'https://openrouter.ai/api/v1'
+
+    def __init__(self, model, base_url=None, parent=None):
+        super().__init__(parent)
+        self.model = model
+        self.base_url = (base_url or self.BASE_URL).rstrip('/')
+        self._nam = QNetworkAccessManager(self)
+        self._reply = None
+        self._error = ''
+
+    def busy(self):
+        return self._reply is not None
+
+    @staticmethod
+    def _convert(messages):
+        out = []
+        for m in messages:
+            images = m.get('images') or []
+            if not images:
+                out.append({'role': m['role'], 'content': m['content']})
+                continue
+            parts = [{'type': 'text', 'text': m['content']}]
+            parts += [{'type': 'image_url',
+                       'image_url': {'url': 'data:image/jpeg;base64,' + img}} for img in images]
+            out.append({'role': m['role'], 'content': parts})
+        return out
+
+    def chat(self, messages):
+        if self._reply is not None:
+            return False
+        key = openrouter_key()
+        if not key:
+            # Report through the normal finish path, after the caller has set its state.
+            QTimer.singleShot(0, lambda: self.chat_finished.emit(
+                False, 'no OpenRouter API key (set OPENROUTER_API_KEY or put it in '
+                       f'{OPENROUTER_KEY_FILE})'))
+            return True
+        request = QNetworkRequest(QUrl(self.base_url + '/chat/completions'))
+        request.setHeader(QNetworkRequest.ContentTypeHeader, 'application/json')
+        request.setRawHeader(b'Authorization', f'Bearer {key}'.encode())
+        request.setRawHeader(b'X-Title', b'FSC ground station')
+        request.setTransferTimeout(self.TIMEOUT_MS)
+        body = json.dumps({'model': self.model, 'messages': self._convert(messages),
+                           'temperature': 0, 'max_tokens': 300})
+        reply = self._nam.post(request, body.encode('utf-8'))
+        self._reply = reply
+        self._error = ''
+        reply.finished.connect(lambda: self._on_finished(reply))
+        return True
+
+    def abort_chat(self, reason='stopped'):
+        reply = self._reply
+        if reply is None:
+            return
+        self._error = reason
+        reply.abort()
+        if self._reply is reply:
+            self._on_finished(reply)
+
+    def _on_finished(self, reply):
+        reply.deleteLater()
+        if reply is not self._reply:
+            return
+        self._reply = None
+        if self._error:
+            self.chat_finished.emit(False, self._error)
+            return
+        result = None
+        if reply.isOpen():
+            try:
+                result = json.loads(bytes(reply.readAll()))
+            except ValueError:
+                result = None
+        if isinstance(result, dict) and result.get('error'):
+            err = result['error']
+            self.chat_finished.emit(False, 'OpenRouter: ' + str(
+                err.get('message') if isinstance(err, dict) else err))
+            return
+        if reply.error() != QNetworkReply.NoError:
+            self.chat_finished.emit(False, LlmClient._describe_error(reply))
+            return
+        try:
+            text = result['choices'][0]['message']['content'] or ''
+        except (TypeError, KeyError, IndexError):
+            self.chat_finished.emit(False, 'unreadable reply from OpenRouter')
+            return
+        if isinstance(text, list):  # content parts
+            text = ''.join(p.get('text', '') for p in text if isinstance(p, dict))
+        self.chat_delta.emit(text)
+        self.chat_finished.emit(True, '')
