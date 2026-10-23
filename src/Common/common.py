@@ -67,6 +67,12 @@ class CommonData(): # store the data from the ROS nodes
         self.current_system_status = None
         self.system_status_seq = 0
         self.last_system_status_time = 0.0
+        # Latest raw-mocap guard health from the Orin's estimator, for the mocap-guard
+        # alarm: (state, cause, age of the last good sample [s], test fault active), and
+        # its monotonic receive time. None until the first message -- only the
+        # box-pushing stacks run the guard.
+        self.current_mocap_guard = None
+        self.last_mocap_guard_time = 0.0
 
         # Onboard camera + detector (VLM tab). The frame is kept as the compressed
         # bytes exactly as received; the GUI decodes it only while the view is on
@@ -389,6 +395,14 @@ class CommonData(): # store the data from the ROS nodes
         self.current_system_status = status
         self.system_status_seq += 1
         self.last_system_status_time = time.monotonic()
+        self.lock.unlock()
+        return
+
+    def update_mocap_guard(self, state, cause, age, test):
+        if not self.lock.tryLock():
+            return
+        self.current_mocap_guard = (state, cause, age, test)
+        self.last_mocap_guard_time = time.monotonic()
         self.lock.unlock()
         return
 
